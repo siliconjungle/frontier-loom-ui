@@ -647,6 +647,12 @@ tr.risk-review td:first-child { color: var(--review); }
 .goal-status small {
   color: var(--muted);
 }
+.goal-reliability {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  text-align: right;
+}
 .work-kpis,
 .performance-summary,
 .testing-summary,

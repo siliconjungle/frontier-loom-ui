@@ -718,8 +718,10 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
 }): Node {
   const health = dashboardHealthSummary(dashboard, jobs, attention);
   const contribution = contributionGrid(dashboard, jobs, dashboard.events);
-  const successfulJobCount = successLikeJobCount(jobs);
-  const progressRatio = health.jobCount ? successfulJobCount / health.jobCount : 0;
+  const resolvedWorkCount = resolvedWorkJobCount(jobs);
+  const workerSuccessCount = successLikeJobCount(jobs);
+  const progressRatio = health.jobCount ? resolvedWorkCount / health.jobCount : 0;
+  const workerReliabilityRatio = health.jobCount ? workerSuccessCount / health.jobCount : 0;
   const progressLabel = formatPercent(progressRatio);
   const progressWidth = Math.max(0, Math.min(100, progressRatio * 100));
   const cost = workCostSummary(dashboard, jobs);
@@ -731,16 +733,17 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
       <div>
         <span>Goal</span>
         <h3>{currentGoalTitle(dashboard)}</h3>
-        <p>{goalProgressText(health, successfulJobCount)}</p>
+        <p>{goalProgressText(jobs, health, resolvedWorkCount)}</p>
       </div>
       <div className="goal-progress">
         <div className="goal-progress-head">
           <b>{progressLabel}</b>
-          <span>{text(successfulJobCount)} of {text(health.jobCount)} tasks completed successfully</span>
+          <span>{text(resolvedWorkCount)} of {text(health.jobCount)} tasks resolved</span>
         </div>
-        <div className="goal-progress-track" role="img" aria-label={`${progressLabel} successful task progress`}>
-          <span className={`goal-progress-fill ${health.tone}`} style={`width:${progressWidth}%`} />
+        <div className="goal-progress-track" role="img" aria-label={`${progressLabel} resolved work progress`}>
+          <span className={`goal-progress-fill ${progressTone(progressRatio, workerReliabilityRatio)}`} style={`width:${progressWidth}%`} />
         </div>
+        <small className="goal-reliability">Worker reliability {formatPercent(workerReliabilityRatio)} · {text(workerSuccessCount)} clean completions</small>
       </div>
     </section>
 
@@ -785,17 +788,25 @@ function sentenceCaseIdentifier(value: string): string {
   return spaced[0].toUpperCase() + spaced.slice(1);
 }
 
-function goalProgressText(health: ReturnType<typeof dashboardHealthSummary>, successfulJobCount: number): string {
+function goalProgressText(jobs: Array<Record<string, unknown>>, health: ReturnType<typeof dashboardHealthSummary>, resolvedWorkCount: number): string {
   if (!health.jobCount) return 'No active swarm work is loaded yet.';
-  const attentionCount = health.failedJobCount + health.blockedJobCount + health.warningJobCount;
-  if (successfulJobCount >= health.jobCount) return 'Every tracked task has completed successfully.';
+  const unresolvedAttentionCount = jobs.filter(isCoordinatorReviewJob).length;
+  if (resolvedWorkCount >= health.jobCount) return 'Every tracked task has either completed or been resolved by the coordinator.';
   if (health.runningJobCount) {
     return `The swarm is working through ${text(health.jobCount)} tracked tasks. ${text(health.runningJobCount)} are still running.`;
   }
   if (health.terminalJobCount >= health.jobCount) {
-    return `Execution has finished, but ${text(attentionCount)} tasks still need review or fixes.`;
+    return unresolvedAttentionCount
+      ? `Execution has finished, but ${text(unresolvedAttentionCount)} tasks still need coordinator action.`
+      : 'Execution has finished and coordinator decisions have collapsed the open review queue.';
   }
-  return `No agents are running right now. ${text(Math.max(0, health.jobCount - health.terminalJobCount))} tasks remain queued and ${text(attentionCount)} need review or fixes.`;
+  return `No agents are running right now. ${text(Math.max(0, health.jobCount - health.terminalJobCount))} tasks remain queued and ${text(unresolvedAttentionCount)} need coordinator action.`;
+}
+
+function progressTone(progressRatio: number, workerReliabilityRatio: number): ChartTone {
+  if (progressRatio >= 0.8 && workerReliabilityRatio >= 0.5) return 'good';
+  if (progressRatio >= 0.5) return 'warn';
+  return 'bad';
 }
 
 function workCostSummary(dashboard: Dashboard, jobs: Array<Record<string, unknown>>): {
@@ -2855,6 +2866,10 @@ function priorityRank(priority: HumanActionRow['priority']): number {
 
 function successLikeJobCount(jobs: Array<Record<string, unknown>>): number {
   return jobs.filter((job) => isCompletedJob(job) && !isFailedJob(job) && !isStaleJob(job)).length;
+}
+
+function resolvedWorkJobCount(jobs: Array<Record<string, unknown>>): number {
+  return jobs.filter((job) => isResolvedCoordinatorReviewJob(job) || (isCompletedJob(job) && !isFailedJob(job) && !isStaleJob(job))).length;
 }
 
 function laneLoadTone(lane: LaneRollup): ChartTone {

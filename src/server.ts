@@ -535,13 +535,43 @@ async function discoverLifetimeDashboardSources(cwd: string): Promise<LifetimeDa
 
 function dedupeLifetimeDashboardSources(sources: LifetimeDashboardSource[]): LifetimeDashboardSource[] {
   const collections = new Set(sources.filter((source) => source.kind === 'collection').map(lifetimeRunFamilyKey));
+  const preferredCollections = preferredLifetimeCollectionsByFamily(sources);
   const runs = new Set(sources.filter((source) => source.kind === 'run').map(lifetimeRunFamilyKey));
   return sources.filter((source) => {
     const family = lifetimeRunFamilyKey(source);
     if (source.kind === 'run' && collections.has(family)) return false;
+    if (source.kind === 'collection' && preferredCollections.get(family) !== source) return false;
     if (source.kind === 'collection' && source.path.endsWith('/collected-missing') && runs.has(family)) return false;
     return true;
   });
+}
+
+function preferredLifetimeCollectionsByFamily(sources: LifetimeDashboardSource[]): Map<string, LifetimeDashboardSource> {
+  const out = new Map<string, LifetimeDashboardSource>();
+  for (const source of sources) {
+    if (source.kind !== 'collection') continue;
+    const family = lifetimeRunFamilyKey(source);
+    const current = out.get(family);
+    if (!current || compareLifetimeCollectionPreference(source, current) > 0) out.set(family, source);
+  }
+  return out;
+}
+
+function compareLifetimeCollectionPreference(left: LifetimeDashboardSource, right: LifetimeDashboardSource): number {
+  return lifetimeCollectionPreference(left) - lifetimeCollectionPreference(right)
+    || left.mtimeMs - right.mtimeMs
+    || right.path.localeCompare(left.path);
+}
+
+function lifetimeCollectionPreference(source: LifetimeDashboardSource): number {
+  const pathLabel = normalized(source.path);
+  if (pathLabel.endsWith('/collected-resolved') || pathLabel.includes('/collected-resolved-')) return 60;
+  if (pathLabel.endsWith('/collected-with-decisions') || pathLabel.includes('/collected-with-decisions-')) return 55;
+  if (pathLabel.endsWith('/collected')) return 50;
+  if (pathLabel.includes('/collected-current')) return 30;
+  if (pathLabel.includes('/collected-partial')) return 20;
+  if (pathLabel.includes('/collected-missing')) return 10;
+  return 40;
 }
 
 function lifetimeRunFamilyKey(source: LifetimeDashboardSource): string {

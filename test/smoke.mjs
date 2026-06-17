@@ -9,10 +9,14 @@ const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'frontier-loom-ui-'));
 const collectionDir = path.join(tmp, 'collected');
 const continuationDir = path.join(tmp, 'continuation');
 const activeRunDir = path.join(tmp, 'active-run');
+const lifetimeCurrentDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-current');
+const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-resolved');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
 await fs.mkdir(path.join(activeRunDir, 'active-live', 'evidence'), { recursive: true });
 await fs.mkdir(path.join(activeRunDir, 'active-done', 'evidence'), { recursive: true });
+await fs.mkdir(lifetimeCurrentDir, { recursive: true });
+await fs.mkdir(lifetimeResolvedDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
   'export const oldBoard = true;',
@@ -128,6 +132,55 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     'stale-against-head': []
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeCurrentDir, 'collection.json'), JSON.stringify({
+  ok: false,
+  generatedAt: Date.now() - 1000,
+  summary: {
+    total: 1,
+    'needs-human-port': 1,
+    'failed-evidence': 0
+  },
+  buckets: {
+    'needs-human-port': [{
+      bucket: 'needs-human-port',
+      jobId: 'dedupe-job',
+      bundle: {
+        jobId: 'dedupe-job',
+        taskId: 'dedupe-task',
+        lane: 'dedupe',
+        status: 'completed',
+        mergeReadiness: 'patch-candidate',
+        disposition: 'needs-port',
+        evidencePaths: []
+      }
+    }]
+  }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.stringify({
+  ok: true,
+  generatedAt: Date.now(),
+  summary: {
+    total: 1,
+    'resolved-review': 1,
+    'needs-human-port': 0,
+    'failed-evidence': 0
+  },
+  buckets: {
+    'resolved-review': [{
+      bucket: 'resolved-review',
+      jobId: 'dedupe-job',
+      bundle: {
+        jobId: 'dedupe-job',
+        taskId: 'dedupe-task',
+        lane: 'dedupe',
+        status: 'completed',
+        mergeReadiness: 'patch-candidate',
+        disposition: 'accepted-applied',
+        evidencePaths: []
+      }
+    }]
+  }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(continuationDir, 'continuation.json'), JSON.stringify({
   ok: true,
   nextRoutingPolicy: { id: 'policy', defaultMode: 'fill' },
@@ -208,6 +261,19 @@ try {
     assert.match(activeDashboard.sources.activeRun, /pids\.json$/);
   } finally {
     await activeServer.close();
+  }
+  const lifetimeServer = await startLoomUiServer({ cwd: tmp });
+  try {
+    const lifetimeDashboard = await fetchJson(new URL('/api/dashboard', lifetimeServer.url));
+    assert.equal(lifetimeDashboard.kind, 'frontier.loom-ui.lifetime-dashboard');
+    assert.equal(lifetimeDashboard.sources.sourceCount, 1);
+    assert.equal(lifetimeDashboard.sources.loadedSourceCount, 1);
+    assert.equal(lifetimeDashboard.summary.jobCount, 1);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
+    assert.equal(lifetimeDashboard.jobs[0].originalJobId, 'dedupe-job');
+    assert.match(lifetimeDashboard.jobs[0].sourceLabel, /collected-resolved/);
+  } finally {
+    await lifetimeServer.close();
   }
   assert.deepEqual(dashboard.lanes.map((lane) => lane.id), ['review', 'runtime', 'ui']);
   assert.equal(dashboard.jobs.find((job) => job.id === 'runtime-job').bucket, 'needs-coordinator-review');
