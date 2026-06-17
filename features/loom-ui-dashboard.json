@@ -1,0 +1,28 @@
+{
+  "id": "loom-ui-dashboard",
+  "title": "Dark Loom swarm dashboard",
+  "packages": ["@shapeshift-labs/frontier-loom-ui", "@shapeshift-labs/frontier-swarm-codex", "@shapeshift-labs/loom"],
+  "ui": {
+    "theme": "dark",
+    "surface": "read-only-swarm-dashboard",
+    "renderer": "@shapeshift-labs/frontier-dom/jsx-runtime"
+  },
+  "acceptance": [
+    "Dashboard loads from a run, collection, or continuation artifact",
+    "Overview presents the current goal, progress percentage, daily contribution chart, and token cost metrics without lane-level clutter",
+    "Daily contribution dots show an immediate hover popover with date, activity, done, and event counts, including gap-tolerant nearest-dot hover behavior",
+    "Board tab presents AI-managed tasks in opinionated read-only columns including Backlog, To do, Active, Review, Ready, Done, and Blocked",
+    "Board content is horizontally scrollable while each column is vertically scrollable",
+    "Board cards expose stable copyable ticket IDs",
+    "Clicking a board card opens a read-only task detail dialog with higher-level summary, status, reasons, expandable per-file diffs, results, and evidence",
+    "Diffs render as structured color-coded rows with old/new line numbers and lightweight syntax token highlighting",
+    "Changed-file and evidence path names reveal the local file or folder in Finder through a bounded artifact endpoint without an embedded artifact viewer",
+    "Swarm tab shows only active agents, using stable generated description-plus-animal names, compact identity colors, model labels, current ticket assignments, token usage, touched files, and evidence artifacts",
+    "Performance tab presents chart-first token, runtime, cache-hit, waste, and optimization-signal views over time without adding steering controls",
+    "Tab and ticket state is deep-linked in the URL hash so refresh preserves the selected tab and open task dialog",
+    "Questions tab presents only agent questions that need human answers and supports copying question codes without extra explanatory copy",
+    "Dashboard updates from a server-sent event stream with a polling fallback for runtimes without EventSource",
+    "The UI service is read-only: users steer swarms by talking to Codex, not by posting dashboard commands",
+    "Dark mode is the default and only shipped theme"
+  ]
+}

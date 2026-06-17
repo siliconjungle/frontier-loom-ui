@@ -1,0 +1,6 @@
+node_modules/
+dist/
+agent-runs/
+agent-worktrees/
+.DS_Store
+.loom/

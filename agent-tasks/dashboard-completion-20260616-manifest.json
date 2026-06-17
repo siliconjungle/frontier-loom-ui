@@ -1,0 +1,58 @@
+{
+  "id": "dashboard-completion-20260616",
+  "title": "Frontier Loom UI dashboard completion",
+  "defaultWorkspace": "copy",
+  "lanes": [
+    { "id": "history-graph", "maxConcurrency": 6 },
+    { "id": "performance", "maxConcurrency": 4 },
+    { "id": "testing", "maxConcurrency": 3 },
+    { "id": "product-ux", "maxConcurrency": 4 },
+    { "id": "verification", "maxConcurrency": 3 }
+  ],
+  "compute": [
+    {
+      "id": "codex.fast",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "reasoningEffort": "medium",
+      "metadata": { "modelTier": "fast" }
+    },
+    {
+      "id": "codex.deep",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "reasoningEffort": "xhigh",
+      "metadata": { "modelTier": "deep" }
+    }
+  ],
+  "policy": {
+    "defaultCompute": "codex.fast",
+    "defaultConcurrency": 20
+  },
+  "defaults": {
+    "allowedPaths": [
+      "src",
+      "public",
+      "test",
+      "features",
+      "README.md",
+      "package.json",
+      "tsconfig.json",
+      "build.mjs",
+      "research"
+    ],
+    "verification": [
+      {
+        "command": "bash",
+        "args": ["-lc", "npm run typecheck"],
+        "required": true
+      }
+    ],
+    "expectedEvidence": [
+      "last-message.md",
+      "merge.json",
+      "changes.patch",
+      "semantic-imports.json"
+    ]
+  }
+}

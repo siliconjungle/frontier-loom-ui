@@ -1,0 +1,61 @@
+{
+  "id": "human-questions-dashboard-20260616",
+  "title": "Human-question-first Frontier Loom dashboard redesign",
+  "defaultWorkspace": "copy",
+  "lanes": [
+    { "id": "human-questions", "maxConcurrency": 6 },
+    { "id": "information-architecture", "maxConcurrency": 5 },
+    { "id": "charts-research", "maxConcurrency": 4 },
+    { "id": "data-contract", "maxConcurrency": 3 },
+    { "id": "verification", "maxConcurrency": 2 }
+  ],
+  "compute": [
+    {
+      "id": "codex.fast",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "reasoningEffort": "medium",
+      "metadata": { "modelTier": "fast" }
+    },
+    {
+      "id": "codex.deep",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "reasoningEffort": "xhigh",
+      "metadata": { "modelTier": "deep" }
+    }
+  ],
+  "policy": {
+    "defaultCompute": "codex.fast",
+    "defaultConcurrency": 20
+  },
+  "defaults": {
+    "allowedPaths": [
+      "frontier-loom-ui/src",
+      "frontier-loom-ui/public",
+      "frontier-loom-ui/test",
+      "frontier-loom-ui/features",
+      "frontier-loom-ui/research",
+      "frontier-loom-ui/README.md",
+      "frontier-loom-ui/package.json",
+      "frontier-loom-ui/tsconfig.json",
+      "frontier-loom-ui/build.mjs",
+      "frontier-swarm-codex/src/dashboard-ui.ts",
+      "frontier-swarm-codex/src/types-dashboard.ts",
+      "frontier-swarm-codex/test/smoke/dashboard-ui.mjs"
+    ],
+    "verification": [
+      {
+        "command": "bash",
+        "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"],
+        "required": true
+      }
+    ],
+    "expectedEvidence": [
+      "last-message.md",
+      "merge.json",
+      "changes.patch",
+      "semantic-imports.json"
+    ]
+  }
+}

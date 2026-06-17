@@ -1,0 +1,222 @@
+[
+  {
+    "id": "human-question-language-model",
+    "lane": "human-questions",
+    "compute": "codex.deep",
+    "title": "Plain-language human question model",
+    "objective": "You are not alone in the codebase; do not revert other changes. Redesign the Human action queue copy and row model so it represents explicit questions agents ask a human, not coordinator merge-review workload. Prefer clear title, why it matters, what answer is needed, and short code. Keep the UI read-only.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css", "frontier-loom-ui/test/smoke.mjs"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "human-question-ux",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "human-question-empty-and-sample-states",
+    "lane": "human-questions",
+    "compute": "codex.fast",
+    "title": "Human question empty and sample states",
+    "objective": "You are not alone in the codebase; do not revert other changes. Improve empty states and sample/fallback rendering so a human sees either real open questions or a calm explanation that no one has asked them anything yet. Do not show internal needs-port items as human questions.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/test/smoke.mjs"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "empty-state",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "human-question-copy-affordance",
+    "lane": "human-questions",
+    "compute": "codex.fast",
+    "title": "Copy-code affordance polish",
+    "objective": "You are not alone in the codebase; do not revert other changes. Make the short-code copy affordance obvious but minimal. Consider copied feedback that does not mutate swarm state, keyboard focus, button text, and screen-reader labels. Keep it read-only.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "workKind": "accessibility",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "human-question-lane-context",
+    "lane": "human-questions",
+    "compute": "codex.fast",
+    "title": "Question lane context",
+    "objective": "You are not alone in the codebase; do not revert other changes. Make lane filtering understandable for human questions: when a lane is selected, show only questions actually scoped to that lane and explain when workspace-wide questions are hidden or shown.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/test/smoke.mjs"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "filtering",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "human-question-answer-lifecycle",
+    "lane": "human-questions",
+    "compute": "codex.deep",
+    "title": "Answered/resolved lifecycle semantics",
+    "objective": "You are not alone in the codebase; do not revert other changes. Review how answered/resolved/dismissed human questions should disappear from the read-only queue. Patch client filtering and tests if needed so coordinator-consumed answers are no longer shown.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/src/types-dashboard.ts"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/src/types-dashboard.ts", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "lifecycle",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck && cd ../frontier-swarm-codex && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "human-question-user-story-review",
+    "lane": "human-questions",
+    "compute": "codex.fast",
+    "title": "Human question user-story review",
+    "objective": "You are not alone in the codebase; do not revert other changes. Review the Actions tab as a human user. Patch wording or layout only where it directly makes questions easier to answer in chat. Avoid adding controls or settings.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "workKind": "ux-review",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "ia-high-level-priorities",
+    "lane": "information-architecture",
+    "compute": "codex.deep",
+    "title": "Task-first information architecture",
+    "objective": "You are not alone in the codebase; do not revert other changes. Reassess the top-level hierarchy from a human operator perspective: goal, epics/tasks, actual human questions, quality/testing, cost/performance, semantic merge, cadence, evidence. Patch labels/order/details if they still feel AI-internal.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "workKind": "information-architecture",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "ia-work-overview-reduction",
+    "lane": "information-architecture",
+    "compute": "codex.fast",
+    "title": "Work overview reduction",
+    "objective": "You are not alone in the codebase; do not revert other changes. Reduce the Work tab to the smallest useful human overview. Avoid repeating telemetry from other tabs. Keep epics/tasks and next true human questions prominent.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "workKind": "overview-simplification",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "ia-mobile-legibility",
+    "lane": "information-architecture",
+    "compute": "codex.fast",
+    "title": "Mobile legibility and overflow",
+    "objective": "You are not alone in the codebase; do not revert other changes. Improve mobile and narrow desktop legibility for tabs, lane rail, action rows, and metric cards. Do not introduce dense new content. Run or describe a browser overflow check.",
+    "sourceRefs": ["frontier-loom-ui/public/styles.css", "frontier-loom-ui/src/client.tsx"],
+    "ownedFiles": ["frontier-loom-ui/public/styles.css", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "responsive-ui",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "ia-minimal-color-system",
+    "lane": "information-architecture",
+    "compute": "codex.fast",
+    "title": "Minimal color and chrome pass",
+    "objective": "You are not alone in the codebase; do not revert other changes. Audit CSS color/chrome intensity. Keep the dashboard dark, calm, and minimal. Patch excessive borders, accent stripes, or competing status colors only if they reduce readability.",
+    "sourceRefs": ["frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/public/styles.css"],
+    "workKind": "visual-design",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "ia-raw-evidence-drilldown",
+    "lane": "information-architecture",
+    "compute": "codex.fast",
+    "title": "Raw evidence containment",
+    "objective": "You are not alone in the codebase; do not revert other changes. Keep raw jobs/events/sources available but clearly secondary. Patch Evidence tab wording/layout if it still reads like the primary dashboard.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "workKind": "evidence-drilldown",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "charts-research-library-fit",
+    "lane": "charts-research",
+    "compute": "codex.deep",
+    "title": "Charting library fit research",
+    "objective": "You are not alone in the codebase; do not revert other changes. Research current open-source charting libraries suitable for a dark read-only operations dashboard. Compare bundle cost, React/DOM fit, accessibility, tree/graph support, heatmap support, and no-build complexity. Write concise findings; patch production only if very low risk.",
+    "sourceRefs": ["frontier-loom-ui/package.json", "frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/research/charting-library-fit.md", "frontier-loom-ui/README.md"],
+    "workKind": "research",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "charts-research-git-tree",
+    "lane": "charts-research",
+    "compute": "codex.fast",
+    "title": "Semantic merge graph visualization research",
+    "objective": "You are not alone in the codebase; do not revert other changes. Research lightweight ways to visualize semantic merge/version trees: CSS/SVG, vis-network, cytoscape, d3-dag, mermaid-like syntax, or custom DOM. Recommend what fits the dashboard and why.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/research/semantic-merge-graph-options.md"],
+    "workKind": "research",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "charts-research-cadence-heatmap",
+    "lane": "charts-research",
+    "compute": "codex.fast",
+    "title": "Cadence heatmap research",
+    "objective": "You are not alone in the codebase; do not revert other changes. Research GitHub-contribution-style heatmap options for cadence/progress: CSS grid, calendar-heatmap libraries, d3, uPlot, Observable Plot. Recommend a minimal path for this package.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/research/cadence-heatmap-options.md"],
+    "workKind": "research",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "charts-prototype-native",
+    "lane": "charts-research",
+    "compute": "codex.fast",
+    "title": "Native CSS chart prototype",
+    "objective": "You are not alone in the codebase; do not revert other changes. Prototype, if low risk, a tiny native DOM/CSS cadence or merge visualization improvement without adding dependencies. Otherwise write why a dependency is needed.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css", "frontier-loom-ui/research/native-chart-prototype.md"],
+    "workKind": "prototype",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "data-contract-human-action-schema",
+    "lane": "data-contract",
+    "compute": "codex.deep",
+    "title": "Human action schema contract",
+    "objective": "You are not alone in the codebase; do not revert other changes. Refine FrontierCodexDashboardHumanAction so it models agent-authored human questions: prompt, context, requested answer shape, options/choices, status, answer/resolution, and source refs. Keep it additive and typed.",
+    "sourceRefs": ["frontier-swarm-codex/src/types-dashboard.ts", "frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/test/smoke/dashboard-ui.mjs"],
+    "ownedFiles": ["frontier-swarm-codex/src/types-dashboard.ts", "frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/test/smoke/dashboard-ui.mjs"],
+    "workKind": "api-contract",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-swarm-codex && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "data-contract-board-question-mapping",
+    "lane": "data-contract",
+    "compute": "codex.fast",
+    "title": "Board entry to human question mapping",
+    "objective": "You are not alone in the codebase; do not revert other changes. Review mapping from board-like entries to dashboard human actions. Ensure only explicit review-question/escalation/decision entries intended for humans become human questions; needs-port worker output should not automatically become a human question.",
+    "sourceRefs": ["frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/src/types-dashboard.ts"],
+    "ownedFiles": ["frontier-swarm-codex/src/dashboard-ui.ts", "frontier-swarm-codex/test/smoke/dashboard-ui.mjs"],
+    "workKind": "mapping",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-swarm-codex && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "data-contract-answer-resolution-tests",
+    "lane": "data-contract",
+    "compute": "codex.fast",
+    "title": "Answer and resolution tests",
+    "objective": "You are not alone in the codebase; do not revert other changes. Add or propose smoke tests proving answered/resolved human questions are hidden from open queues while unresolved explicit questions remain visible in the snapshot.",
+    "sourceRefs": ["frontier-swarm-codex/test/smoke/dashboard-ui.mjs", "frontier-swarm-codex/src/dashboard-ui.ts"],
+    "ownedFiles": ["frontier-swarm-codex/test/smoke/dashboard-ui.mjs", "frontier-swarm-codex/src/dashboard-ui.ts"],
+    "workKind": "tests",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-swarm-codex && npm run typecheck"], "required": true }]
+  },
+  {
+    "id": "verification-playwright-human-queue",
+    "lane": "verification",
+    "compute": "codex.fast",
+    "title": "Browser verification of human queue",
+    "objective": "You are not alone in the codebase; do not revert other changes. Use the existing UI and tests to verify the human question queue is legible on desktop/mobile and does not show coordinator-internal merge-review rows as human requests. Patch smoke checks if useful.",
+    "sourceRefs": ["frontier-loom-ui/test/smoke.mjs", "frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css"],
+    "ownedFiles": ["frontier-loom-ui/test/smoke.mjs", "frontier-loom-ui/public/styles.css"],
+    "workKind": "verification",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm test"], "required": true }]
+  },
+  {
+    "id": "verification-adversarial-product-review",
+    "lane": "verification",
+    "compute": "codex.deep",
+    "title": "Adversarial product review",
+    "objective": "You are not alone in the codebase; do not revert other changes. Review the whole dashboard as a human-facing product. Identify whether the page answers: what is happening, what needs me, what changed, what is risky, what is next. Patch only focused issues; otherwise leave exact findings.",
+    "sourceRefs": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css", "frontier-loom-ui/test/smoke.mjs"],
+    "ownedFiles": ["frontier-loom-ui/src/client.tsx", "frontier-loom-ui/public/styles.css", "frontier-loom-ui/test/smoke.mjs"],
+    "workKind": "product-review",
+    "verification": [{ "command": "bash", "args": ["-lc", "cd frontier-loom-ui && npm test"], "required": true }]
+  }
+]

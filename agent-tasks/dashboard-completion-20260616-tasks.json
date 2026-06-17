@@ -1,0 +1,206 @@
+[
+  {
+    "id": "history-git-lane-graph-structure",
+    "lane": "history-graph",
+    "compute": "codex.deep",
+    "title": "Replace History with git-style lane graph structure",
+    "objective": "Implement a true git-style history visualization, not a stage pipeline. Use SVG or DOM/CSS lanes with vertical colored rails, nodes per task/event, merge arcs back to trunk, and readable task rows. Keep it read-only and dark/minimal.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "implementation"
+  },
+  {
+    "id": "history-graph-data-model",
+    "lane": "history-graph",
+    "compute": "codex.deep",
+    "title": "History graph data model",
+    "objective": "Build or review the data shaping for History so jobs/events become graph rows with stable lanes, timestamps, status tones, merge/readiness state, and hover tooltips. Prefer deterministic output from sparse run data.",
+    "sourceRefs": ["src/client.tsx"],
+    "ownedFiles": ["src/client.tsx"],
+    "workKind": "implementation"
+  },
+  {
+    "id": "history-graph-svg-css",
+    "lane": "history-graph",
+    "compute": "codex.fast",
+    "title": "History graph SVG/CSS polish",
+    "objective": "Make the git-style graph visually legible at desktop width: compact left graph gutter, clear colored lanes, no text overlap, subtle dark mode chrome, and no excessive color.",
+    "sourceRefs": ["public/styles.css", "src/client.tsx"],
+    "ownedFiles": ["public/styles.css", "src/client.tsx"],
+    "workKind": "visual-design"
+  },
+  {
+    "id": "history-graph-hover-a11y",
+    "lane": "history-graph",
+    "compute": "codex.fast",
+    "title": "History graph hover and accessibility",
+    "objective": "Ensure History graph nodes have immediate hover popovers with ticket, title, lane, status, files, runtime, and timing. Add aria labels and keyboard-friendly row affordances where low risk.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css"],
+    "workKind": "accessibility"
+  },
+  {
+    "id": "history-empty-demo-states",
+    "lane": "history-graph",
+    "compute": "codex.fast",
+    "title": "History empty and demo states",
+    "objective": "Review empty/sparse History rendering. It should show a useful graph shell or calm empty state, and it should not confuse demo fixture data with live run data.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css"],
+    "workKind": "empty-state"
+  },
+  {
+    "id": "history-browser-visual-review",
+    "lane": "history-graph",
+    "compute": "codex.fast",
+    "title": "History browser visual review",
+    "objective": "After implementation, run the local UI or inspect the built output and review the History tab against a git graph mental model: lanes, nodes, merges, readable rows, no overflow. Patch smoke checks or report exact issues.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["test/smoke.mjs", "public/styles.css"],
+    "workKind": "verification",
+    "verification": [{ "command": "bash", "args": ["-lc", "npm test"], "required": true }]
+  },
+  {
+    "id": "performance-axis-tooltip-polish",
+    "lane": "performance",
+    "compute": "codex.fast",
+    "title": "Performance chart axis and tooltip polish",
+    "objective": "Review the Performance charts for explicit X/Y meaning and hover popovers on bars. Ensure the popover target is only bars/grid cells, not unrelated chart padding.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "implementation"
+  },
+  {
+    "id": "performance-openai-cost-table",
+    "lane": "performance",
+    "compute": "codex.deep",
+    "title": "OpenAI model cost estimate review",
+    "objective": "Review the OpenAI model price table and cost calculation. Ensure cached/uncached input and optional output tokens are handled honestly, model matching supports 4.1/5/o4/codex variants, and copy says estimate where appropriate.",
+    "sourceRefs": ["src/client.tsx", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "test/smoke.mjs", "README.md"],
+    "workKind": "cost-model"
+  },
+  {
+    "id": "performance-optimization-signals",
+    "lane": "performance",
+    "compute": "codex.fast",
+    "title": "Panel/tournament/RSI performance signals",
+    "objective": "Make the Performance tab communicate whether panel, tournament, and RSI/routing feedback are improving workflow behavior over time. Use existing routing/summary fields; do not invent data.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css"],
+    "workKind": "performance-ui"
+  },
+  {
+    "id": "performance-overflow-review",
+    "lane": "performance",
+    "compute": "codex.fast",
+    "title": "Performance overflow review",
+    "objective": "Review Performance tab responsive behavior and overflow. Patch obvious text clipping/overlap in chart cards, metric rows, and top cost drivers while keeping the view compact.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["public/styles.css", "test/smoke.mjs"],
+    "workKind": "responsive-ui"
+  },
+  {
+    "id": "testing-quality-view",
+    "lane": "testing",
+    "compute": "codex.fast",
+    "title": "Testing tab quality view",
+    "objective": "Review and improve the Testing tab so it reads as quality/testing/fuzzing/oracle status, not raw evidence. Show passing/failing checks, browser evidence, fuzzing, oracles, and open failures clearly.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "implementation"
+  },
+  {
+    "id": "testing-evidence-classifier",
+    "lane": "testing",
+    "compute": "codex.fast",
+    "title": "Testing evidence classifier",
+    "objective": "Review the evidence classifier for commands and evidence paths. Ensure test/fuzz/oracle/browser labels are derived conservatively from actual fields and copy is honest when metadata is missing.",
+    "sourceRefs": ["src/client.tsx"],
+    "ownedFiles": ["src/client.tsx", "test/smoke.mjs"],
+    "workKind": "data-classification"
+  },
+  {
+    "id": "testing-empty-and-active-work",
+    "lane": "testing",
+    "compute": "codex.fast",
+    "title": "Testing empty and active-work states",
+    "objective": "Ensure Testing handles active work and sparse data without pretending everything is verified. Empty states should distinguish no metadata from passing tests.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css"],
+    "workKind": "empty-state"
+  },
+  {
+    "id": "product-tabs-source-label",
+    "lane": "product-ux",
+    "compute": "codex.fast",
+    "title": "Demo/live source label",
+    "objective": "Make the demo fixture vs live run distinction obvious but quiet. The user should not mistake populated demo agents for real running agents. Patch source strip copy and smoke markers if needed.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "product-ux"
+  },
+  {
+    "id": "product-minimal-dashboard-review",
+    "lane": "product-ux",
+    "compute": "codex.deep",
+    "title": "Human-first dashboard product review",
+    "objective": "Review Overview, Board, Swarm, Performance, History, Testing, and Questions as a human-facing read-only product. Patch only concrete readability/IA issues; avoid adding new dense metrics.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "product-review"
+  },
+  {
+    "id": "product-questions-answer-loop",
+    "lane": "product-ux",
+    "compute": "codex.fast",
+    "title": "Questions answer loop UI review",
+    "objective": "Review Questions tab input/submit/copy behavior and live resolution. Keep it focused on explicit agent questions, with one textarea per question and no steering/settings UI.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "workKind": "questions-ui"
+  },
+  {
+    "id": "product-board-swarm-regression",
+    "lane": "product-ux",
+    "compute": "codex.fast",
+    "title": "Board and Swarm regression review",
+    "objective": "Ensure Board horizontal scrolling, ticket IDs, closed-by-default diffs, active-agent rows, model tags, token usage, and file tags still work after dashboard tab changes.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["test/smoke.mjs", "public/styles.css"],
+    "workKind": "regression-review"
+  },
+  {
+    "id": "verification-smoke-coverage",
+    "lane": "verification",
+    "compute": "codex.fast",
+    "title": "Smoke coverage for new tabs",
+    "objective": "Add or review smoke checks that cover History graph markers, Testing quality markers, Performance chart tooltips/axes, and demo/live source labels without brittle generated-code assumptions.",
+    "sourceRefs": ["test/smoke.mjs", "src/client.tsx", "public/styles.css"],
+    "ownedFiles": ["test/smoke.mjs"],
+    "workKind": "tests",
+    "verification": [{ "command": "bash", "args": ["-lc", "npm test"], "required": true }]
+  },
+  {
+    "id": "verification-desktop-mobile-browser",
+    "lane": "verification",
+    "compute": "codex.fast",
+    "title": "Desktop and mobile browser verification",
+    "objective": "Verify the dashboard visually at wide desktop and narrow/mobile sizes. Focus on History graph, Performance charts, Testing tab, and Swarm rows. Patch CSS if obvious overflow is found, otherwise report exact screenshots/checks.",
+    "sourceRefs": ["src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["public/styles.css", "test/smoke.mjs"],
+    "workKind": "browser-verification",
+    "verification": [{ "command": "bash", "args": ["-lc", "npm test"], "required": true }]
+  },
+  {
+    "id": "verification-build-release-surface",
+    "lane": "verification",
+    "compute": "codex.fast",
+    "title": "Build and package surface review",
+    "objective": "Run or inspect build/typecheck/test behavior after dashboard changes. Ensure no new dependency is introduced accidentally and package surface remains small.",
+    "sourceRefs": ["package.json", "build.mjs", "src/client.tsx", "public/styles.css", "test/smoke.mjs"],
+    "ownedFiles": ["test/smoke.mjs", "README.md"],
+    "workKind": "verification",
+    "verification": [{ "command": "bash", "args": ["-lc", "npm test && npm pack --dry-run"], "required": true }]
+  }
+]
