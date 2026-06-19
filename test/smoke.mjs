@@ -11,12 +11,14 @@ const continuationDir = path.join(tmp, 'continuation');
 const activeRunDir = path.join(tmp, 'active-run');
 const lifetimeCurrentDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-current');
 const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-resolved');
+const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
 await fs.mkdir(path.join(activeRunDir, 'active-live', 'evidence'), { recursive: true });
 await fs.mkdir(path.join(activeRunDir, 'active-done', 'evidence'), { recursive: true });
 await fs.mkdir(lifetimeCurrentDir, { recursive: true });
 await fs.mkdir(lifetimeResolvedDir, { recursive: true });
+await fs.mkdir(queueDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
   'export const oldBoard = true;',
@@ -160,10 +162,12 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
   ok: true,
   generatedAt: Date.now(),
   summary: {
-    total: 1,
+    total: 4,
     'resolved-review': 1,
-    'needs-human-port': 0,
-    'failed-evidence': 0
+    'ready-to-apply': 1,
+    'stale-against-head': 1,
+    'failed-evidence': 1,
+    'needs-human-port': 0
   },
   buckets: {
     'resolved-review': [{
@@ -178,8 +182,54 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
         disposition: 'accepted-applied',
         evidencePaths: []
       }
+    }],
+    'ready-to-apply': [{
+      bucket: 'ready-to-apply',
+      jobId: 'historical-ready',
+      bundle: {
+        jobId: 'historical-ready',
+        taskId: 'historical-ready-task',
+        lane: 'dedupe',
+        status: 'completed',
+        mergeReadiness: 'ready-to-apply',
+        disposition: 'ready',
+        evidencePaths: []
+      }
+    }],
+    'stale-against-head': [{
+      bucket: 'stale-against-head',
+      jobId: 'historical-stale',
+      bundle: {
+        jobId: 'historical-stale',
+        taskId: 'historical-stale-task',
+        lane: 'dedupe',
+        status: 'completed',
+        mergeReadiness: 'stale-against-head',
+        disposition: 'stale',
+        evidencePaths: []
+      }
+    }],
+    'failed-evidence': [{
+      bucket: 'failed-evidence',
+      jobId: 'historical-failed',
+      bundle: {
+        jobId: 'historical-failed',
+        taskId: 'historical-failed-task',
+        lane: 'dedupe',
+        status: 'failed',
+        mergeReadiness: 'blocked',
+        disposition: 'failed',
+        evidencePaths: []
+      }
     }]
   }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(tmp, 'agent-runs', '.loom-ui-review-decisions.json'), JSON.stringify({
+  decisions: [
+    { jobId: 'historical-ready', taskId: 'historical-ready-task', status: 'applied', decidedAt: new Date().toISOString() },
+    { jobId: 'historical-stale', taskId: 'historical-stale-task', status: 'rerun', decidedAt: new Date().toISOString() },
+    { jobId: 'historical-failed', taskId: 'historical-failed-task', status: 'rejected', decidedAt: new Date().toISOString() }
+  ]
 }, null, 2) + '\n');
 await fs.writeFile(path.join(continuationDir, 'continuation.json'), JSON.stringify({
   ok: true,
@@ -196,6 +246,20 @@ await fs.writeFile(path.join(continuationDir, 'continuation.json'), JSON.stringi
     tournamentRecommendationCount: 1
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(queueDir, 'manifest.high-concurrency.json'), JSON.stringify({
+  id: 'capacity-proof-manifest',
+  title: 'Capacity proof manifest',
+  compute: [{ id: 'codex.proof', model: 'gpt-5.5', maxConcurrency: 6 }],
+  policy: { defaultCompute: 'codex.proof', defaultConcurrency: 6 },
+  lanes: [
+    { id: 'dedupe', title: 'Dedupe lane', layer: 'review', compute: 'codex.proof', maxConcurrency: 2 },
+    { id: 'queued', title: 'Queued lane', layer: 'implementation', compute: 'codex.proof', maxConcurrency: 4 }
+  ]
+}, null, 2) + '\n');
+await fs.writeFile(path.join(queueDir, 'tasks.remaining-proof.json'), JSON.stringify([
+  { id: 'queued-task', title: 'Queued task', lane: 'queued', status: 'todo' },
+  { id: 'dedupe-task', title: 'Dedupe follow-up', lane: 'dedupe', status: 'todo' }
+], null, 2) + '\n');
 const activeWorker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codex', 'active-live'], { stdio: 'ignore' });
 assert.ok(activeWorker.pid);
 await fs.writeFile(path.join(activeRunDir, 'pids.json'), JSON.stringify({
@@ -268,10 +332,27 @@ try {
     assert.equal(lifetimeDashboard.kind, 'frontier.loom-ui.lifetime-dashboard');
     assert.equal(lifetimeDashboard.sources.sourceCount, 1);
     assert.equal(lifetimeDashboard.sources.loadedSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 1);
+    assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
+    assert.equal(lifetimeDashboard.summary.jobCount, 4);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
-    assert.equal(lifetimeDashboard.jobs[0].originalJobId, 'dedupe-job');
-    assert.match(lifetimeDashboard.jobs[0].sourceLabel, /collected-resolved/);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['ready-to-apply'] ?? 0, 0);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['failed-evidence'] ?? 0, 0);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 4);
+    assert.equal(lifetimeDashboard.health.summary.readyToApplyJobCount, 0);
+    assert.equal(lifetimeDashboard.health.summary.failedJobCount, 0);
+    const dedupeJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dedupe-job');
+    assert.ok(dedupeJob);
+    assert.match(dedupeJob.sourceLabel, /collected-resolved/);
+    assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-ready').bucket, 'review-resolved');
+    assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-stale').bucket, 'review-resolved');
+    assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-failed').bucket, 'review-resolved');
+    assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
+    assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);
+    assert.equal(lifetimeDashboard.capacity.openLaneCount, 1);
+    assert.equal(lifetimeDashboard.capacity.queuedTaskCount, 1);
+    assert.equal(lifetimeDashboard.capacity.lanes.find((lane) => lane.id === 'dedupe').completedCount, 4);
+    assert.equal(lifetimeDashboard.capacity.lanes.find((lane) => lane.id === 'queued').queuedTaskCount, 1);
   } finally {
     await lifetimeServer.close();
   }
@@ -395,8 +476,12 @@ try {
   assert.match(styles, /diff-line-add/);
   assert.match(styles, /diff-token\.keyword/);
   assert.match(styles, /artifact-link/);
-  assert.match(styles, /agent-work-layout/);
-  assert.match(styles, /agent-roster-panel/);
+	  assert.match(styles, /agent-work-layout/);
+	  assert.match(styles, /swarm-capacity-panel/);
+	  assert.match(styles, /swarm-capacity-summary/);
+	  assert.match(styles, /swarm-lane-strip/);
+	  assert.match(styles, /swarm-lane-row/);
+	  assert.match(styles, /agent-roster-panel/);
   assert.match(styles, /agent-roster-head/);
   assert.match(styles, /agent-worker-card/);
   assert.match(styles, /agent-cell-agent/);

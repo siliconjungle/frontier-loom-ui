@@ -21,6 +21,8 @@ const LIFETIME_DASHBOARD_MAX_SOURCES = 80;
 const LIFETIME_DASHBOARD_MAX_JOBS = 800;
 const LIFETIME_DASHBOARD_SCAN_MAX_FILES = 600;
 const LIFETIME_DASHBOARD_SCAN_MAX_DEPTH = 5;
+const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
+const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const dashboardStreamListeners = new Set<() => void>();
@@ -91,6 +93,8 @@ interface CodexEventUsageSummary {
   uncachedInputTokens: number;
   outputTokens: number;
   reasoningOutputTokens: number;
+  estimatedInputTokens: number;
+  estimatedFromEventBytes: number;
   eventCount: number;
 }
 
@@ -218,7 +222,11 @@ async function handleRequest(
   } else if (request.method === 'GET' && url.pathname === '/api/dashboard') {
     writeJson(response, 200, await readDashboardSnapshot(options));
   } else if (request.method === 'GET' && url.pathname === '/api/task-details') {
-    writeJson(response, 200, await readTaskDetails(options, textValue(url.searchParams.get('id'), '')));
+    writeJson(response, 200, await readTaskDetails(
+      options,
+      textValue(url.searchParams.get('id'), ''),
+      textValue(url.searchParams.get('sourceRun'), '')
+    ));
   } else if (request.method === 'GET' && url.pathname === '/api/artifact') {
     writeJson(response, 200, await readArtifact(options, textValue(url.searchParams.get('path'), '')));
   } else if (request.method === 'GET' && url.pathname === '/api/artifact/raw') {
@@ -353,6 +361,8 @@ async function dashboardWatchRoots(options: NormalizedLoomUiServerOptions): Prom
   if (!inputs.length) {
     const agentRuns = path.join(options.cwd, 'agent-runs');
     if (await fileExists(agentRuns)) roots.push(agentRuns);
+    const loomQueues = path.join(options.cwd, '.loom', 'queues');
+    if (await fileExists(loomQueues)) roots.push(loomQueues);
   }
   return uniquePaths(roots);
 }
@@ -455,7 +465,14 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
       continue;
     }
   }
-  return combineLifetimeDashboardSnapshots(options, sources, snapshots, await readCoordinatorReviewDecisions(options.cwd));
+  const lifetime = combineLifetimeDashboardSnapshots(
+    options,
+    sources,
+    snapshots,
+    await readCoordinatorReviewDecisions(options.cwd),
+    await readLifetimeQueueBacklog(options.cwd)
+  );
+  return mergeLifetimeDrainCoordinatorSnapshot(lifetime, await readLatestDrainCoordinatorSnapshot(options.cwd));
 }
 
 interface LifetimeDashboardSource {
@@ -534,12 +551,10 @@ async function discoverLifetimeDashboardSources(cwd: string): Promise<LifetimeDa
 }
 
 function dedupeLifetimeDashboardSources(sources: LifetimeDashboardSource[]): LifetimeDashboardSource[] {
-  const collections = new Set(sources.filter((source) => source.kind === 'collection').map(lifetimeRunFamilyKey));
   const preferredCollections = preferredLifetimeCollectionsByFamily(sources);
   const runs = new Set(sources.filter((source) => source.kind === 'run').map(lifetimeRunFamilyKey));
   return sources.filter((source) => {
     const family = lifetimeRunFamilyKey(source);
-    if (source.kind === 'run' && collections.has(family)) return false;
     if (source.kind === 'collection' && preferredCollections.get(family) !== source) return false;
     if (source.kind === 'collection' && source.path.endsWith('/collected-missing') && runs.has(family)) return false;
     return true;
@@ -565,6 +580,8 @@ function compareLifetimeCollectionPreference(left: LifetimeDashboardSource, righ
 
 function lifetimeCollectionPreference(source: LifetimeDashboardSource): number {
   const pathLabel = normalized(source.path);
+  if (pathLabel.endsWith('/post-coordinator-collected') || pathLabel.includes('/post-coordinator-collected')) return 80;
+  if (pathLabel.endsWith('/coordinator-collected') || pathLabel.includes('/coordinator-collected')) return 70;
   if (pathLabel.endsWith('/collected-resolved') || pathLabel.includes('/collected-resolved-')) return 60;
   if (pathLabel.endsWith('/collected-with-decisions') || pathLabel.includes('/collected-with-decisions-')) return 55;
   if (pathLabel.endsWith('/collected')) return 50;
@@ -580,6 +597,259 @@ function lifetimeRunFamilyKey(source: LifetimeDashboardSource): string {
   const agentRunsIndex = parts.lastIndexOf('agent-runs');
   const start = agentRunsIndex >= 0 ? agentRunsIndex + 1 : 0;
   return parts[start] ?? source.path;
+}
+
+function collapseSupersededLifetimeReviewJobs(jobs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const resolvedAtByJob = new Map<string, number>();
+  for (const job of jobs) {
+    if (!isResolvedCoordinatorReviewRecord(job)) continue;
+    const key = lifetimeReviewDedupeKey(job);
+    if (!key) continue;
+    resolvedAtByJob.set(key, Math.max(resolvedAtByJob.get(key) ?? 0, numberValue(job.generatedAt)));
+  }
+  return jobs.filter((job) => {
+    if (!isOpenCoordinatorReviewRecord(job)) return true;
+    const key = lifetimeReviewDedupeKey(job);
+    if (!key) return true;
+    return (resolvedAtByJob.get(key) ?? 0) < numberValue(job.generatedAt);
+  });
+}
+
+function dedupeLifetimeDashboardJobs(jobs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const byTask = new Map<string, Record<string, unknown>>();
+  for (const job of jobs) {
+    const key = lifetimeJobDedupeKey(job);
+    if (!key) continue;
+    const current = byTask.get(key);
+    if (!current || compareLifetimeJobPreference(job, current) > 0) byTask.set(key, job);
+  }
+  return Array.from(byTask.values()).sort((left, right) => {
+    return numberValue(right.generatedAt) - numberValue(left.generatedAt)
+      || textValue(left.lane, '').localeCompare(textValue(right.lane, ''))
+      || textValue(left.title, '').localeCompare(textValue(right.title, ''));
+  });
+}
+
+function lifetimeJobDedupeKey(job: Record<string, unknown>): string {
+  return textValue(job.originalJobId ?? job.taskId ?? job.id ?? job.jobId, '').trim();
+}
+
+function compareLifetimeJobPreference(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return lifetimeJobPreference(left) - lifetimeJobPreference(right)
+    || numberValue(left.generatedAt) - numberValue(right.generatedAt)
+    || textValue(right.sourceLabel, '').localeCompare(textValue(left.sourceLabel, ''));
+}
+
+function lifetimeJobPreference(job: Record<string, unknown>): number {
+  const status = normalized(job.status);
+  const bucket = normalized(job.bucket);
+  const liveness = normalized(job.liveness);
+  let score = 0;
+  if (status === 'running') score += 120;
+  else if (status === 'completed') score += 100;
+  else if (status === 'failed' || status === 'blocked') score += 70;
+  else if (['queued', 'pending', 'todo', 'open'].includes(status) || ['queued', 'todo'].includes(bucket)) score += 40;
+  if (liveness === 'missing' || status === 'planned') score -= 60;
+  if (numberValue(job.changedPathCount)) score += 12;
+  if (numberValue(job.evidencePathCount)) score += 8;
+  if (numberValue(job.actualInputTokens) || numberValue(job.estimatedInputTokens)) score += 4;
+  return score;
+}
+
+function lifetimeReviewDedupeKey(job: Record<string, unknown>): string {
+  return textValue(job.originalJobId ?? job.jobId ?? job.taskId, '').trim();
+}
+
+function isOpenCoordinatorReviewRecord(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewRecord(job)) return false;
+  return isCoordinatorPortBucket(job.bucket)
+    || isCoordinatorPortBucket(job.disposition)
+    || isCoordinatorPortBucket(job.mergeReadiness)
+    || normalized(job.status) === 'needs-review';
+}
+
+function isResolvedCoordinatorReviewRecord(job: Record<string, unknown>): boolean {
+  const bucket = normalized(job.bucket);
+  if (bucket === 'review-resolved' || bucket === 'resolved-review' || job.reviewResolved === true) return true;
+  const status = textValue(job.coordinatorDecisionStatus ?? recordValue(job.coordinatorDecision).status, '');
+  return Boolean(status) && isResolvedCoordinatorDecision(status);
+}
+
+interface LifetimeQueueBacklog {
+  entries: Array<Record<string, unknown>>;
+  manifests: LifetimeQueueCapacityManifest[];
+  sourceCount: number;
+  paths: string[];
+  generatedAt: number;
+}
+
+interface LifetimeQueueCapacityManifest {
+  path: string;
+  id: string;
+  title: string;
+  defaultConcurrency: number;
+  computeMaxConcurrency: number;
+  maxConcurrency: number;
+  lanes: LifetimeQueueCapacityManifestLane[];
+}
+
+interface LifetimeQueueCapacityManifestLane {
+  id: string;
+  title: string;
+  layer: string;
+  compute: string;
+  model: string;
+  maxConcurrency: number;
+}
+
+async function readLifetimeQueueBacklog(cwd: string): Promise<LifetimeQueueBacklog> {
+  const root = path.join(cwd, '.loom', 'queues');
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) return { entries: [], manifests: [], sourceCount: 0, paths: [], generatedAt: 0 };
+  const queueDirs = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const entriesById = new Map<string, Record<string, unknown>>();
+  const manifests: LifetimeQueueCapacityManifest[] = [];
+  const paths: string[] = [];
+  let generatedAt = 0;
+  for (const queueDir of queueDirs) {
+    if (!queueDir.isDirectory()) continue;
+    const dir = path.join(root, queueDir.name);
+    const manifestFile = await preferredQueueManifestFile(dir);
+    if (manifestFile) {
+      const manifestStat = await fs.stat(manifestFile).catch(() => undefined);
+      generatedAt = Math.max(generatedAt, manifestStat?.mtimeMs ?? 0);
+      const manifest = await readQueueCapacityManifest(cwd, manifestFile);
+      if (manifest) manifests.push(manifest);
+    }
+    for (const taskFile of await queueTaskFiles(dir)) {
+      const fileStat = await fs.stat(taskFile).catch(() => undefined);
+      generatedAt = Math.max(generatedAt, fileStat?.mtimeMs ?? 0);
+      paths.push(path.relative(cwd, taskFile));
+      const tasks = await readQueueTaskFile(taskFile);
+      for (const task of tasks) {
+        const id = textValue(task.id ?? task.taskId ?? task.title, '');
+        if (!id) continue;
+        entriesById.set(id, normalizeQueueBacklogEntry(cwd, queueDir.name, taskFile, task));
+        if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
+      }
+      if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
+    }
+    if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
+  }
+  return {
+    entries: Array.from(entriesById.values()),
+    manifests,
+    sourceCount: paths.length,
+    paths,
+    generatedAt
+  };
+}
+
+async function queueTaskFiles(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const candidates: Array<{ file: string; mtimeMs: number; preferred: number }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^tasks(?:\.(?:remaining|backlog)-[\w.-]+)?\.json$/.test(entry.name)) continue;
+    const file = path.join(dir, entry.name);
+    const stat = await fs.stat(file).catch(() => undefined);
+    candidates.push({
+      file,
+      mtimeMs: stat?.mtimeMs ?? 0,
+      preferred: entry.name.startsWith('tasks.backlog-') ? 2 : entry.name.startsWith('tasks.remaining-') ? 1 : 0
+    });
+  }
+  return candidates
+    .sort((left, right) => left.mtimeMs - right.mtimeMs || left.preferred - right.preferred || left.file.localeCompare(right.file))
+    .map((candidate) => candidate.file);
+}
+
+async function preferredQueueManifestFile(dir: string): Promise<string | undefined> {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const candidates: Array<{ file: string; mtimeMs: number; preferred: number }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^manifest(?:\.[\w.-]+)?\.json$/.test(entry.name)) continue;
+    const file = path.join(dir, entry.name);
+    const stat = await fs.stat(file).catch(() => undefined);
+    candidates.push({
+      file,
+      mtimeMs: stat?.mtimeMs ?? 0,
+      preferred: entry.name.includes('high-concurrency') ? 2 : entry.name === 'manifest.json' ? 1 : 0
+    });
+  }
+  return candidates.sort((left, right) => right.preferred - left.preferred || right.mtimeMs - left.mtimeMs || left.file.localeCompare(right.file))[0]?.file;
+}
+
+async function readQueueCapacityManifest(cwd: string, file: string): Promise<LifetimeQueueCapacityManifest | undefined> {
+  const raw = recordValue(await readJsonFile(file));
+  if (!Object.keys(raw).length) return undefined;
+  const computeRows = recordArray(raw.compute);
+  const computeById = new Map(computeRows.map((entry) => [textValue(entry.id, ''), entry]));
+  const defaultComputeId = textValue(recordValue(raw.policy).defaultCompute, textValue(computeRows[0]?.id, ''));
+  const defaultCompute = recordValue(computeById.get(defaultComputeId) ?? computeRows[0]);
+  const defaultConcurrency = numberValue(recordValue(raw.policy).defaultConcurrency);
+  const computeMaxConcurrency = computeRows.reduce((max, entry) => Math.max(max, numberValue(entry.maxConcurrency)), 0);
+  const manifestMaxConcurrency = numberValue(raw.maxConcurrency);
+  const lanes = recordArray(raw.lanes).map((lane) => {
+    const computeId = textValue(lane.compute, defaultComputeId);
+    const compute = recordValue(computeById.get(computeId) ?? defaultCompute);
+    return {
+      id: textValue(lane.id, 'lane'),
+      title: textValue(lane.title ?? lane.id, 'Lane'),
+      layer: textValue(lane.layer, ''),
+      compute: computeId,
+      model: textValue(compute.model, textValue(compute.id, '')),
+      maxConcurrency: numberValue(lane.maxConcurrency) || 1
+    };
+  });
+  return {
+    path: path.relative(cwd, file),
+    id: textValue(raw.id, path.basename(file, '.json')),
+    title: textValue(raw.title, 'Swarm manifest'),
+    defaultConcurrency,
+    computeMaxConcurrency,
+    maxConcurrency: manifestMaxConcurrency || defaultConcurrency || computeMaxConcurrency || lanes.reduce((sum, lane) => sum + lane.maxConcurrency, 0),
+    lanes
+  };
+}
+
+async function readQueueTaskFile(file: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readJsonFile(file);
+  if (Array.isArray(raw)) return raw.map(recordValue).filter((entry) => Object.keys(entry).length);
+  const record = recordValue(raw);
+  return recordArray(record.tasks ?? record.entries ?? record.items);
+}
+
+function normalizeQueueBacklogEntry(cwd: string, queueId: string, file: string, task: Record<string, unknown>): Record<string, unknown> {
+  const id = textValue(task.id ?? task.taskId ?? task.title, 'task');
+  const queueStatus = textValue(task.status ?? task.state, 'open');
+  const status = ['done', 'completed', 'failed', 'blocked'].includes(normalized(queueStatus)) ? queueStatus : 'todo';
+  const sourceRefs = stringArray(task.sourceRefs);
+  const targetRefs = stringArray(task.targetRefs);
+  const allowedWrites = stringArray(task.allowedWrites);
+  const files = uniquePaths([...targetRefs, ...allowedWrites, ...sourceRefs]).slice(0, 40);
+  return {
+    id,
+    taskId: id,
+    title: textValue(task.title ?? task.objective ?? id, id),
+    objective: textValue(task.objective ?? task.summary, ''),
+    status,
+    queueStatus,
+    ready: status === 'todo',
+    lane: textValue(task.lane ?? task.groupId ?? task.epicId, queueId),
+    group: textValue(task.groupId ?? task.epicId, queueId),
+    epicId: textValue(task.epicId, ''),
+    priority: numberValue(task.priority),
+    changedPaths: files,
+    changedPathCount: files.length,
+    sourceRefs,
+    targetRefs,
+    allowedWrites,
+    acceptance: stringArray(task.acceptance),
+    verification: recordArray(task.verification),
+    tags: stringArray(task.tags),
+    sourceLabel: path.relative(cwd, file),
+    sourceQueue: queueId
+  };
 }
 
 async function readLifetimeDashboardResetCutoff(root: string): Promise<number> {
@@ -620,9 +890,10 @@ function combineLifetimeDashboardSnapshots(
   options: NormalizedLoomUiServerOptions,
   discoveredSources: LifetimeDashboardSource[],
   snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }>,
-  reviewDecisions: CoordinatorReviewDecision[]
+  reviewDecisions: CoordinatorReviewDecision[],
+  queueBacklog: LifetimeQueueBacklog
 ): Record<string, unknown> {
-  const jobs = applyCoordinatorReviewDecisions(snapshots.flatMap(({ source, snapshot }) => {
+  const jobs = dedupeLifetimeDashboardJobs(collapseSupersededLifetimeReviewJobs(applyCoordinatorReviewDecisions(snapshots.flatMap(({ source, snapshot }) => {
     return recordArray(snapshot.jobs).map((job) => ({
       ...job,
       id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
@@ -633,10 +904,10 @@ function combineLifetimeDashboardSnapshots(
       sourceLabel: source.label,
       generatedAt: numberValue(job.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
     }));
-  }), reviewDecisions).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
+  }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = recordArray(awaitNoop([]));
   const summary = lifetimeDashboardSummary(jobs);
-  const latestGeneratedAt = Math.max(Date.now(), ...snapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
+  const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...snapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
   const events = snapshots.flatMap(({ source, snapshot }) => recordArray(snapshot.events).map((event) => ({
     ...event,
     sourceLabel: source.label,
@@ -646,14 +917,16 @@ function combineLifetimeDashboardSnapshots(
   return {
     kind: 'frontier.loom-ui.lifetime-dashboard',
     version: 1,
-    ok: snapshots.some(({ snapshot }) => Boolean(snapshot.ok)),
+    ok: true,
     generatedAt: latestGeneratedAt,
     cwd: options.cwd,
     sources: {
       workspace: options.cwd,
       lifetimeRoot: path.join(options.cwd, 'agent-runs'),
+      queueRoot: path.join(options.cwd, '.loom', 'queues'),
       sourceCount: discoveredSources.length,
       loadedSourceCount: snapshots.length,
+      queueSourceCount: queueBacklog.sourceCount,
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
     summary,
@@ -662,6 +935,7 @@ function combineLifetimeDashboardSnapshots(
     quality: {},
     timeSeries: lifetimeTimeSeries(jobs, events),
     lanes: lifetimeLaneRows(jobs),
+    capacity: lifetimeCapacitySummary(queueBacklog, jobs),
     jobs,
     humanActions: snapshots.flatMap(({ snapshot }) => recordArray(snapshot.humanActions)).slice(-100),
     humanActionAnswers,
@@ -669,15 +943,18 @@ function combineLifetimeDashboardSnapshots(
     routing: lifetimeRoutingSummary(snapshots.map((entry) => entry.snapshot)),
     backlog: {
       id: 'workspace-lifetime',
-      entryCount: snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).entryCount), 0),
-      readyCount: snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).readyCount), 0)
+      entryCount: queueBacklog.entries.length + snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).entryCount), 0),
+      readyCount: queueBacklog.entries.filter((entry) => textValue(entry.status, '') === 'todo').length + snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).readyCount), 0),
+      entries: queueBacklog.entries
     },
     raw: {
       lifetime: {
         mode: 'workspace',
         sourceCount: discoveredSources.length,
         loadedSourceCount: snapshots.length,
-        sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES)
+        sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
+        manifests: queueBacklog.manifests,
+        queueSources: queueBacklog.paths
       }
     }
   };
@@ -685,6 +962,327 @@ function combineLifetimeDashboardSnapshots(
 
 function lifetimeScopedId(source: LifetimeDashboardSource, id: string): string {
   return `${source.id}:${id}`.replaceAll(/[^\w:.-]+/g, '-');
+}
+
+async function readLatestDrainCoordinatorSnapshot(cwd: string): Promise<Record<string, unknown> | undefined> {
+  const root = path.join(cwd, 'agent-runs', 'frontier-swarm-codex');
+  const drains = await findDrainCoordinatorRunDirs(root);
+  const activeDrainRoot = drains[0] ? drainRootForRunDir(drains[0]) : '';
+  const runDirs = drains
+    .filter((runDir) => drainRootForRunDir(runDir) === activeDrainRoot)
+    .slice(0, LIFETIME_DASHBOARD_MAX_DRAIN_RUNS);
+  const jobs: Array<Record<string, unknown>> = [];
+  for (const runDir of runDirs) jobs.push(...await readDrainCoordinatorJobs(cwd, runDir));
+  if (!jobs.length) return undefined;
+  const generatedAt = Math.max(...jobs.map((job) => numberValue(job.generatedAt)), Date.now());
+  return {
+    ok: true,
+    generatedAt,
+    cwd,
+    sources: {
+      activeDrain: runDirs[0],
+      activeDrainSources: runDirs
+    },
+    summary: lifetimeDashboardSummary(jobs),
+    lanes: lifetimeLaneRows(jobs),
+    jobs,
+    events: activeRunEvents(jobs),
+    raw: {
+      activeDrain: {
+        runDirs,
+        jobCount: jobs.length,
+        runningCount: jobs.filter((job) => textValue(job.status, '') === 'running').length
+      }
+    }
+  };
+}
+
+async function findDrainCoordinatorRunDirs(root: string): Promise<string[]> {
+  const out: Array<{ dir: string; mtimeMs: number }> = [];
+  const rootEntries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const drain of rootEntries) {
+    if (!drain.isDirectory() || !drain.name.startsWith('drain-')) continue;
+    const drainDir = path.join(root, drain.name);
+    const iterationEntries = await fs.readdir(drainDir, { withFileTypes: true }).catch(() => []);
+    for (const iteration of iterationEntries) {
+      if (!iteration.isDirectory() || !iteration.name.startsWith('iteration-')) continue;
+      for (const runDirName of ['coordinator-run', 'worker-run']) {
+        const runDir = path.join(drainDir, iteration.name, runDirName);
+        const stat = await fs.stat(runDir).catch(() => undefined);
+        if (stat?.isDirectory()) out.push({ dir: runDir, mtimeMs: stat.mtimeMs });
+      }
+    }
+  }
+  return out.sort((left, right) => right.mtimeMs - left.mtimeMs || right.dir.localeCompare(left.dir)).map((entry) => entry.dir);
+}
+
+function drainRootForRunDir(runDir: string): string {
+  return path.dirname(path.dirname(runDir));
+}
+
+async function readDrainCoordinatorJobs(cwd: string, coordinatorRunDir: string): Promise<Array<Record<string, unknown>>> {
+  const entries = await fs.readdir(coordinatorRunDir, { withFileTypes: true }).catch(() => []);
+  const liveLines = liveProcessLinesForPath(coordinatorRunDir);
+  const now = Date.now();
+  const jobs: Array<Record<string, unknown>> = [];
+  const seenJobIds = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === 'streams') continue;
+    seenJobIds.add(entry.name);
+    jobs.push(await readDrainCoordinatorJob(cwd, coordinatorRunDir, path.join(coordinatorRunDir, entry.name), liveLines, now));
+  }
+  const pidEntries = await readRunPidEntries(coordinatorRunDir);
+  const planJobs = await readRunPlanJobs(coordinatorRunDir);
+  for (const entry of pidEntries) {
+    const jobId = textValue(entry.jobId, '');
+    if (!jobId || seenJobIds.has(jobId)) continue;
+    jobs.push(readDrainPidManifestJob(cwd, coordinatorRunDir, entry, planJobs.get(jobId), now));
+  }
+  return jobs.sort((left, right) => textValue(left.lane, '').localeCompare(textValue(right.lane, '')));
+}
+
+async function readRunPidEntries(runDir: string): Promise<Array<Record<string, unknown>>> {
+  const pidManifest = recordValue(await readJsonFile(path.join(runDir, 'pids.json')));
+  return recordArray(pidManifest.entries).filter((entry) => textValue(entry.role, '') === 'codex');
+}
+
+async function readRunPlanJobs(runDir: string): Promise<Map<string, Record<string, unknown>>> {
+  const plan = recordValue(await readJsonFile(path.join(runDir, 'swarm-plan.json')));
+  const entries: Array<[string, Record<string, unknown>]> = [];
+  for (const job of recordArray(plan.jobs)) {
+    const id = textValue(job.id, '');
+    if (id) entries.push([id, job]);
+  }
+  return new Map(entries);
+}
+
+function readDrainPidManifestJob(
+  cwd: string,
+  coordinatorRunDir: string,
+  entry: Record<string, unknown>,
+  planJob: Record<string, unknown> | undefined,
+  now: number
+): Record<string, unknown> {
+  const jobId = textValue(entry.jobId, 'job');
+  const runKind = path.basename(coordinatorRunDir) === 'worker-run' ? 'worker' : 'coordinator';
+  const task = recordValue(planJob?.task);
+  const compute = recordValue(planJob?.compute);
+  const command = stringArray(entry.command);
+  const live = isProcessLive(numberValue(entry.pid), entry);
+  const status = live ? 'running' : 'failed';
+  const startedAt = numberValue(entry.startedAt);
+  const lane = textValue(planJob?.lane ?? task.lane, drainCoordinatorLane(jobId, runKind));
+  return {
+    id: jobId,
+    originalJobId: jobId,
+    taskId: textValue(planJob?.taskId ?? task.id, jobId),
+    title: textValue(planJob?.title ?? task.title, runKind === 'coordinator' ? `Coordinate lane review for ${lane}` : `Continue ${lane} work`),
+    lane,
+    status,
+    bucket: status === 'running' ? 'running' : 'failed-evidence',
+    disposition: status === 'running' ? 'active' : 'failed',
+    agentId: jobId,
+    workerId: jobId,
+    model: textValue(compute.model, commandOptionValue(command, '--model') || 'gpt-5.5'),
+    computeId: textValue(compute.id, runKind === 'coordinator' ? 'coordinator-agent' : 'continuation-worker'),
+    reasoningEffort: textValue(compute.reasoningEffort, ''),
+    startedAt: startedAt || undefined,
+    durationMs: startedAt ? Math.max(0, now - startedAt) : 0,
+    evidencePaths: [],
+    evidencePathCount: 0,
+    changedPathCount: 0,
+    collectReasonClasses: status === 'running' ? [`active drain ${runKind}`] : [`missing ${runKind} output`],
+    mergeReadiness: status,
+    sourceRun: path.relative(cwd, coordinatorRunDir),
+    sourceLabel: path.relative(cwd, coordinatorRunDir),
+    generatedAt: now
+  };
+}
+
+function commandOptionValue(command: readonly string[], option: string): string {
+  const index = command.indexOf(option);
+  return index >= 0 ? textValue(command[index + 1], '') : '';
+}
+
+async function readDrainCoordinatorJob(
+  cwd: string,
+  coordinatorRunDir: string,
+  jobDir: string,
+  liveLines: readonly string[],
+  now: number
+): Promise<Record<string, unknown>> {
+  const jobId = path.basename(jobDir);
+  const runKind = path.basename(coordinatorRunDir) === 'worker-run' ? 'worker' : 'coordinator';
+  const evidenceDir = path.join(jobDir, 'evidence');
+  const eventsPath = path.join(jobDir, 'codex-events.jsonl');
+  const lastMessagePath = path.join(jobDir, 'last-message.md');
+  const decisionsJson = path.join(evidenceDir, 'coordinator-decisions.json');
+  const decisionsJsonl = path.join(evidenceDir, 'coordinator-decisions.jsonl');
+  const modelAvailability = recordValue(await readJsonFile(path.join(evidenceDir, 'model-availability.json')));
+  const eventStat = await fs.stat(eventsPath).catch(() => undefined);
+  const lastMessageStat = await fs.stat(lastMessagePath).catch(() => undefined);
+  const decisionJsonStat = await fs.stat(decisionsJson).catch(() => undefined);
+  const decisionJsonlStat = await fs.stat(decisionsJsonl).catch(() => undefined);
+  const live = liveLines.some((line) => line.includes(jobDir) || line.includes(jobId));
+  const hasDecision = Boolean(decisionJsonStat?.isFile() || decisionJsonlStat?.isFile());
+  const failed = !live && !lastMessageStat && !hasDecision && await codexEventsHaveFailure(eventsPath);
+  const status = live && !lastMessageStat
+    ? 'running'
+    : lastMessageStat || hasDecision
+      ? 'completed'
+      : 'failed';
+  const startedAt = numberValue(eventStat?.birthtimeMs ?? eventStat?.ctimeMs ?? eventStat?.mtimeMs);
+  const finishedAt = status === 'running'
+    ? undefined
+    : Math.max(numberValue(lastMessageStat?.mtimeMs), numberValue(decisionJsonStat?.mtimeMs), numberValue(decisionJsonlStat?.mtimeMs), numberValue(eventStat?.mtimeMs));
+  const usage = await readCodexEventUsageSummary(eventsPath);
+  const lane = drainCoordinatorLane(jobId, runKind);
+  const evidencePaths = await existingRelativePaths(cwd, [
+    eventsPath,
+    lastMessagePath,
+    decisionsJson,
+    decisionsJsonl,
+    path.join(evidenceDir, 'merge.json'),
+    path.join(evidenceDir, 'evidence.json'),
+    path.join(evidenceDir, 'human-question.json'),
+    path.join(evidenceDir, 'resource-allocation.json'),
+    path.join(evidenceDir, 'model-availability.json')
+  ]);
+  return {
+    id: jobId,
+    originalJobId: jobId,
+    taskId: jobId,
+    title: runKind === 'coordinator' ? `Coordinate lane review for ${lane}` : `Continue ${lane} work`,
+    lane,
+    status,
+    bucket: status === 'running' ? 'running' : status === 'completed' ? 'completed' : 'failed-evidence',
+    disposition: status === 'running' ? 'active' : status,
+    agentId: jobId,
+    workerId: jobId,
+    model: textValue(modelAvailability.effectiveModel ?? modelAvailability.requestedModel, 'gpt-5.5'),
+    computeId: runKind === 'coordinator' ? 'coordinator-agent' : 'continuation-worker',
+    startedAt: startedAt || undefined,
+    ...(finishedAt ? { finishedAt } : {}),
+    durationMs: startedAt ? Math.max(0, (finishedAt ?? now) - startedAt) : 0,
+    ...(usage.inputTokens ? { actualInputTokens: usage.inputTokens, inputTokens: usage.inputTokens } : {}),
+    ...(!usage.inputTokens && usage.estimatedInputTokens ? { estimatedInputTokens: usage.estimatedInputTokens } : {}),
+    ...(usage.cachedInputTokens ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+    ...(usage.uncachedInputTokens ? { uncachedInputTokens: usage.uncachedInputTokens } : {}),
+    ...(usage.outputTokens ? { actualOutputTokens: usage.outputTokens, outputTokens: usage.outputTokens } : {}),
+    ...(usage.reasoningOutputTokens ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
+    ...(usage.eventCount ? { usage: { ...usage, source: 'codex-events.jsonl' } } : {}),
+    evidencePaths,
+    evidencePathCount: evidencePaths.length,
+    changedPathCount: 0,
+    collectReasonClasses: status === 'running' ? [`active drain ${runKind}`] : [`drain ${runKind}`],
+    mergeReadiness: status,
+    sourceRun: path.relative(cwd, coordinatorRunDir),
+    sourceLabel: path.relative(cwd, coordinatorRunDir),
+    generatedAt: numberValue(finishedAt) || numberValue(eventStat?.mtimeMs) || now
+  };
+}
+
+function liveProcessLinesForPath(needle: string): string[] {
+  const result = spawnSync('pgrep', ['-fl', needle], { encoding: 'utf8' });
+  if (result.status !== 0 && !result.stdout) return [];
+  return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+async function existingRelativePaths(cwd: string, files: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const file of files) {
+    const stat = await fs.stat(file).catch(() => undefined);
+    if (stat?.isFile()) out.push(path.relative(cwd, file));
+  }
+  return out;
+}
+
+async function firstExistingRelativePath(cwd: string, files: string[]): Promise<string | undefined> {
+  for (const file of files) {
+    const stat = await fs.stat(file).catch(() => undefined);
+    if (stat?.isFile()) return path.relative(cwd, file);
+  }
+  return undefined;
+}
+
+function rawRunPatchCandidates(jobDir: string): string[] {
+  return [
+    path.join(jobDir, 'changes.patch'),
+    path.join(jobDir, 'source.patch'),
+    path.join(jobDir, 'evidence', 'changes.patch'),
+    path.join(jobDir, 'evidence', 'source.patch')
+  ];
+}
+
+async function readPatchChangedPathList(cwd: string, patchPath: string | undefined): Promise<string[]> {
+  if (!patchPath) return [];
+  const absolute = path.resolve(cwd, patchPath);
+  if (!isPathInside(cwd, absolute)) return [];
+  const stat = await fs.stat(absolute).catch(() => undefined);
+  if (!stat?.isFile() || stat.size > TASK_DETAIL_PATCH_MAX_BYTES) return [];
+  const patch = await fs.readFile(absolute, 'utf8');
+  return uniquePaths(parseUnifiedPatchFiles(patch).map((file) => file.path).filter(Boolean));
+}
+
+async function codexEventsHaveFailure(file: string): Promise<boolean> {
+  const text = await fs.readFile(file, 'utf8').catch(() => '');
+  return /"type":"(?:error|turn\.failed)"/.test(text);
+}
+
+async function codexEventsHaveQuotaLimit(file: string): Promise<boolean> {
+  const text = await fs.readFile(file, 'utf8').catch(() => '');
+  return /usage limit|quota|purchase more credits/i.test(text);
+}
+
+function drainCoordinatorLane(jobId: string, runKind = 'coordinator'): string {
+  if (runKind === 'worker') {
+    for (const marker of [
+      '-continuation-rerun-',
+      '-continuation-supersede-',
+      '-continuation-reject-',
+      '-continuation-',
+      '-queue-candidate-package-'
+    ]) {
+      const index = jobId.indexOf(marker);
+      if (index > 0) return jobId.slice(0, index);
+    }
+  }
+  const marker = '-coordinator-agent-';
+  const index = jobId.indexOf(marker);
+  return index > 0 ? jobId.slice(0, index) : jobId;
+}
+
+function mergeLifetimeDrainCoordinatorSnapshot(
+  lifetime: Record<string, unknown>,
+  drain: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  const drainJobs = recordArray(drain?.jobs);
+  if (!drainJobs.length) return lifetime;
+  const existingJobs = recordArray(lifetime.jobs).filter((job) => {
+    const source = textValue(job.sourceRun ?? job.sourceLabel, '');
+    return !/agent-runs\/frontier-swarm-codex\/drain-.*\/(?:coordinator-run|worker-run)/.test(source);
+  });
+  const jobs = [...drainJobs, ...existingJobs].slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
+  const events = [...recordArray(lifetime.events), ...recordArray(drain?.events)]
+    .sort((left, right) => numberValue(left.at) - numberValue(right.at))
+    .slice(-160);
+  return {
+    ...lifetime,
+    generatedAt: Math.max(numberValue(lifetime.generatedAt), numberValue(drain?.generatedAt), Date.now()),
+    sources: {
+      ...recordValue(lifetime.sources),
+      ...recordValue(drain?.sources)
+    },
+    summary: lifetimeDashboardSummary(jobs),
+    health: lifetimeHealthSummary(jobs),
+    lanes: lifetimeLaneRows(jobs),
+    jobs,
+    events,
+    raw: {
+      ...recordValue(lifetime.raw),
+      activeDrain: recordValue(recordValue(drain?.raw).activeDrain)
+    }
+  };
 }
 
 async function readCoordinatorReviewDecisions(cwd: string): Promise<CoordinatorReviewDecision[]> {
@@ -710,25 +1308,41 @@ function applyCoordinatorReviewDecisions(jobs: unknown[], decisions: Coordinator
     if (!decision) return record;
     const status = textValue(decision.status ?? decision.decision, 'resolved');
     const resolved = isResolvedCoordinatorDecision(status);
-    return {
+    const decided = {
       ...record,
       coordinatorDecision: decision,
       coordinatorDecisionStatus: status,
       coordinatorDecisionAt: textValue(decision.decidedAt, ''),
       reviewResolved: resolved,
-      ...(resolved && isCoordinatorPortBucket(record.bucket) ? { bucket: 'review-resolved' } : {}),
       ...(resolved ? { disposition: status } : {})
     };
+    return resolved ? markCoordinatorReviewResolved(decided, status) : decided;
   });
 }
 
 function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<string, unknown> {
-  return {
+  const normalizedRecord: Record<string, unknown> = {
     ...record,
     bucket: coordinatorFacingMachineLabel(record.bucket),
     status: coordinatorFacingMachineLabel(record.status),
     disposition: coordinatorFacingMachineLabel(record.disposition),
     mergeReadiness: coordinatorFacingMachineLabel(record.mergeReadiness)
+  };
+  if (!isResolvedCoordinatorReviewRecord(normalizedRecord)) return normalizedRecord;
+  return markCoordinatorReviewResolved(normalizedRecord, textValue(normalizedRecord.coordinatorDecisionStatus ?? normalizedRecord.disposition, 'review-resolved'));
+}
+
+function markCoordinatorReviewResolved(record: Record<string, unknown>, disposition: string): Record<string, unknown> {
+  return {
+    ...record,
+    reviewResolved: true,
+    originalBucket: record.originalBucket ?? record.bucket,
+    originalStatus: record.originalStatus ?? record.status,
+    bucket: 'review-resolved',
+    status: 'completed',
+    disposition: disposition || 'review-resolved',
+    mergeReadiness: 'review-resolved',
+    health: ['failed', 'warning'].includes(normalized(record.health)) ? 'resolved' : record.health
   };
 }
 
@@ -865,8 +1479,18 @@ function lifetimeDashboardSummary(jobs: Array<Record<string, unknown>>): Record<
     maxDurationMs: jobs.reduce((max, job) => Math.max(max, numberValue(job.durationMs)), 0),
     actualInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.actualInputTokens), 0),
     cachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.cachedInputTokens), 0),
-    uncachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.uncachedInputTokens), 0)
+    uncachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.uncachedInputTokens), 0),
+    bucketCounts: countJobsByBucket(jobs)
   };
+}
+
+function countJobsByBucket(jobs: Array<Record<string, unknown>>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const job of jobs) {
+    const bucket = textValue(job.bucket, 'unknown') || 'unknown';
+    counts[bucket] = (counts[bucket] ?? 0) + 1;
+  }
+  return counts;
 }
 
 function lifetimeHealthSummary(jobs: Array<Record<string, unknown>>): Record<string, unknown> {
@@ -909,6 +1533,110 @@ function lifetimeLaneRows(jobs: Array<Record<string, unknown>>): Array<Record<st
     failedCount: entries.filter(isLifetimeFailedJob).length,
     runningCount: entries.filter((job) => textValue(job.status, '') === 'running').length
   }));
+}
+
+function lifetimeCapacitySummary(queueBacklog: LifetimeQueueBacklog, jobs: Array<Record<string, unknown>>): Record<string, unknown> {
+  const manifest = queueBacklog.manifests[0];
+  const laneRows = new Map<string, Record<string, unknown>>();
+  const terminalTaskIds = new Set(jobs
+    .filter((job) => ['completed', 'failed', 'blocked'].includes(textValue(job.status, '').toLowerCase()))
+    .flatMap(recordIdentityKeys));
+  const representedTaskIds = new Set(jobs.flatMap(recordIdentityKeys));
+  const openEntries = queueBacklog.entries.filter((entry) => {
+    const ids = recordIdentityKeys(entry);
+    return !ids.some((id) => terminalTaskIds.has(id) || representedTaskIds.has(id));
+  });
+  const queuedByLane = groupRecordsByText(openEntries, (entry) => textValue(entry.lane ?? entry.group ?? entry.sourceQueue, 'unassigned'));
+  const jobsByLane = groupRecordsByText(jobs, (job) => textValue(job.lane, 'unassigned'));
+  const manifestLanes = manifest?.lanes ?? [];
+  for (const lane of manifestLanes) {
+    laneRows.set(lane.id, capacityLaneRow(lane, queuedByLane.get(lane.id) ?? [], jobsByLane.get(lane.id) ?? []));
+  }
+  for (const [laneId, entries] of queuedByLane) {
+    if (!laneRows.has(laneId)) laneRows.set(laneId, capacityLaneRow({ id: laneId, title: laneId, layer: '', compute: '', model: '', maxConcurrency: 1 }, entries, jobsByLane.get(laneId) ?? []));
+  }
+  for (const [laneId, entries] of jobsByLane) {
+    if (!laneRows.has(laneId)) laneRows.set(laneId, capacityLaneRow({ id: laneId, title: laneId, layer: '', compute: '', model: '', maxConcurrency: 1 }, queuedByLane.get(laneId) ?? [], entries));
+  }
+  const lanes = Array.from(laneRows.values()).sort((left, right) => {
+    const pressure = numberValue(right.runningCount) - numberValue(left.runningCount)
+      || numberValue(right.queuedTaskCount) - numberValue(left.queuedTaskCount);
+    return pressure || textValue(left.id, '').localeCompare(textValue(right.id, ''));
+  });
+  const runningAgentCount = jobs.filter((job) => textValue(job.status, '') === 'running').length;
+  const queuedTaskCount = lanes.reduce((sum, lane) => sum + numberValue(lane.queuedTaskCount), 0);
+  return {
+    manifestPath: manifest?.path ?? '',
+    manifestId: manifest?.id ?? '',
+    title: manifest?.title ?? 'Swarm capacity',
+    defaultConcurrency: manifest?.defaultConcurrency ?? 0,
+    computeMaxConcurrency: manifest?.computeMaxConcurrency ?? 0,
+    maxConcurrency: manifest?.maxConcurrency ?? 0,
+    laneCount: lanes.length,
+    openLaneCount: lanes.filter((lane) => numberValue(lane.queuedTaskCount) > 0 || numberValue(lane.runningCount) > 0).length,
+    activeLaneCount: lanes.filter((lane) => numberValue(lane.runningCount) > 0).length,
+    runningAgentCount,
+    assignedAgentCount: lanes.reduce((sum, lane) => sum + numberValue(lane.assignedAgentCount), 0),
+    queuedTaskCount,
+    totalTaskCount: queueBacklog.entries.length,
+    completedTaskCount: jobs.filter((job) => textValue(job.status, '') === 'completed').length,
+    lanes,
+    queueSources: queueBacklog.paths
+  };
+}
+
+function capacityLaneRow(
+  lane: LifetimeQueueCapacityManifestLane,
+  queuedEntries: Array<Record<string, unknown>>,
+  laneJobs: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  const runningJobs = laneJobs.filter((job) => textValue(job.status, '') === 'running');
+  const queuedJobs = laneJobs.filter((job) => textValue(job.status, '') === 'queued');
+  const assignedAgents = Array.from(new Set(runningJobs.map((job) => textValue(job.agentId ?? job.workerId ?? job.id, '')).filter(Boolean))).slice(0, 6);
+  const queuedKeys = new Set([
+    ...queuedEntries.filter((entry) => {
+      const status = normalized(entry.status ?? entry.queueStatus);
+      return !status || ['todo', 'queued', 'pending', 'ready', 'open'].includes(status);
+    }).flatMap(recordIdentityKeys),
+    ...runningJobs.flatMap(recordIdentityKeys),
+    ...queuedJobs.flatMap(recordIdentityKeys)
+  ]);
+  return {
+    id: lane.id,
+    title: lane.title || lane.id,
+    layer: lane.layer,
+    compute: lane.compute,
+    model: lane.model,
+    maxConcurrency: lane.maxConcurrency,
+    queuedTaskCount: queuedKeys.size,
+    totalTaskCount: queuedEntries.length,
+    runningCount: runningJobs.length,
+    completedCount: laneJobs.filter((job) => textValue(job.status, '') === 'completed').length,
+    failedCount: laneJobs.filter(isLifetimeFailedJob).length,
+    assignedAgentCount: assignedAgents.length,
+    assignedAgents
+  };
+}
+
+function recordIdentityKeys(record: Record<string, unknown>): string[] {
+  return Array.from(new Set([
+    textValue(record.id, ''),
+    textValue(record.originalJobId, ''),
+    textValue(record.jobId, ''),
+    textValue(record.taskId, '')
+  ].filter(Boolean)));
+}
+
+function groupRecordsByText(
+  records: Array<Record<string, unknown>>,
+  keyFor: (record: Record<string, unknown>) => string
+): Map<string, Array<Record<string, unknown>>> {
+  const groups = new Map<string, Array<Record<string, unknown>>>();
+  for (const record of records) {
+    const key = keyFor(record) || 'unassigned';
+    groups.set(key, [...(groups.get(key) ?? []), record]);
+  }
+  return groups;
 }
 
 function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<Record<string, unknown>>): Record<string, unknown> {
@@ -981,6 +1709,7 @@ function lifetimeRoutingSummary(snapshots: Record<string, unknown>[]): Record<st
 }
 
 function isLifetimeFailedJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewRecord(job)) return false;
   const status = textValue(job.status, '').toLowerCase();
   const health = textValue(job.health, '').toLowerCase();
   const bucket = textValue(job.bucket, '').toLowerCase();
@@ -1014,6 +1743,7 @@ async function readActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Pr
   const completedCount = jobs.filter((job) => textValue(job.status, '') === 'completed').length;
   const failedCount = jobs.filter((job) => textValue(job.status, '') === 'failed').length;
   const actualInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.actualInputTokens), 0);
+  const estimatedInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.estimatedInputTokens), 0);
   const cachedInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.cachedInputTokens), 0);
   return {
     ok: true,
@@ -1026,6 +1756,7 @@ async function readActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Pr
       runningCount,
       blockedCount: 0,
       actualInputTokens,
+      estimatedInputTokens,
       cachedInputTokens,
       uncachedInputTokens: Math.max(0, actualInputTokens - cachedInputTokens),
       durationMs: jobs.reduce((sum, job) => Math.max(sum, numberValue(job.durationMs)), 0),
@@ -1064,30 +1795,41 @@ async function activeRunJob(
   const jobDir = path.join(runDir, jobId);
   const lastMessagePath = path.join(jobDir, 'last-message.md');
   const mergePath = path.join(jobDir, 'merge.json');
+  const eventsPath = path.join(jobDir, 'codex-events.jsonl');
   const lastMessage = await fs.stat(lastMessagePath).catch(() => undefined);
   const merge = recordValue(await readJsonFile(mergePath));
   const live = isProcessLive(numberValue(entry.pid), entry);
-  const status = live && !lastMessage ? 'running' : lastMessage || Object.keys(merge).length ? 'completed' : 'failed';
+  const quotaDeferred = !live && !lastMessage && !Object.keys(merge).length && await codexEventsHaveQuotaLimit(eventsPath);
+  const status = live && !lastMessage ? 'running' : quotaDeferred ? 'queued' : lastMessage || Object.keys(merge).length ? 'completed' : 'failed';
   const startedAt = numberValue(entry.startedAt);
   const finishedAt = status === 'running' ? undefined : Math.max(numberValue(lastMessage?.mtimeMs), numberValue(merge.generatedAt));
-  const evidencePaths = [
-    path.relative(optionsSafeCwd(runDir), lastMessagePath),
-    path.relative(optionsSafeCwd(runDir), path.join(jobDir, 'codex-events.jsonl')),
-    path.relative(optionsSafeCwd(runDir), path.join(jobDir, 'evidence', 'resource-allocation.json')),
-    ...(Object.keys(merge).length ? [path.relative(optionsSafeCwd(runDir), mergePath)] : [])
-  ];
-  const usage = await readCodexEventUsageSummary(path.join(jobDir, 'codex-events.jsonl'));
+  const cwd = optionsSafeCwd(runDir);
+  const rawPatchPath = await firstExistingRelativePath(cwd, rawRunPatchCandidates(jobDir));
+  const evidencePaths = await existingRelativePaths(cwd, [
+    lastMessagePath,
+    eventsPath,
+    path.join(jobDir, 'evidence', 'last-message.md'),
+    path.join(jobDir, 'evidence', 'handoff.md'),
+    path.join(jobDir, 'evidence', 'evidence.json'),
+    path.join(jobDir, 'evidence', 'resource-allocation.json'),
+    ...rawRunPatchCandidates(jobDir),
+    ...(Object.keys(merge).length ? [mergePath] : [])
+  ]);
+  const usage = await readCodexEventUsageSummary(eventsPath);
   const task = recordValue(planJob?.task);
   const compute = recordValue(planJob?.compute);
-  const changedPaths = stringArray(merge.changedPaths);
+  const changedPaths = uniquePaths([
+    ...stringArray(merge.changedPaths),
+    ...await readPatchChangedPathList(cwd, rawPatchPath)
+  ]);
   return {
     id: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
     title: textValue(planJob?.title ?? task.title, jobId),
     lane: textValue(planJob?.lane ?? task.lane, 'active-run'),
     status,
-    bucket: status === 'running' ? 'running' : status === 'completed' ? 'completed' : 'failed-evidence',
-    disposition: status === 'running' ? 'active' : status,
+    bucket: status === 'running' ? 'running' : status === 'completed' ? 'completed' : status === 'queued' ? 'queued' : 'failed-evidence',
+    disposition: status === 'running' ? 'active' : status === 'queued' ? 'quota-deferred' : status,
     agentId: jobId,
     workerId: jobId,
     model: textValue(compute.model, ''),
@@ -1097,6 +1839,7 @@ async function activeRunJob(
     ...(finishedAt ? { finishedAt } : {}),
     durationMs: startedAt ? Math.max(0, (finishedAt ?? now) - startedAt) : 0,
     ...(usage.inputTokens ? { actualInputTokens: usage.inputTokens, inputTokens: usage.inputTokens } : {}),
+    ...(!usage.inputTokens && usage.estimatedInputTokens ? { estimatedInputTokens: usage.estimatedInputTokens } : {}),
     ...(usage.cachedInputTokens ? { cachedInputTokens: usage.cachedInputTokens } : {}),
     ...(usage.uncachedInputTokens ? { uncachedInputTokens: usage.uncachedInputTokens } : {}),
     ...(usage.outputTokens ? { actualOutputTokens: usage.outputTokens, outputTokens: usage.outputTokens } : {}),
@@ -1108,17 +1851,20 @@ async function activeRunJob(
         uncached_input_tokens: usage.uncachedInputTokens,
         output_tokens: usage.outputTokens,
         reasoning_output_tokens: usage.reasoningOutputTokens,
+        estimated_input_tokens: usage.estimatedInputTokens,
+        estimated_from_event_bytes: usage.estimatedFromEventBytes,
         source: 'codex-events.jsonl',
         event_count: usage.eventCount
       }
     } : {}),
     changedPaths,
     changedPathCount: changedPaths.length || numberValue(merge.changedPathCount),
+    ...(rawPatchPath ? { patchPath: rawPatchPath, artifactPaths: [rawPatchPath] } : {}),
     evidencePaths,
     evidencePathCount: evidencePaths.length,
     commandsPassed: recordArray(merge.commandsPassed),
     commandsFailed: recordArray(merge.commandsFailed),
-    collectReasonClasses: status === 'running' ? ['active worker'] : [],
+    collectReasonClasses: status === 'running' ? ['active worker'] : quotaDeferred ? ['quota deferred'] : [],
     mergeReadiness: textValue(merge.mergeReadiness, status)
   };
 }
@@ -1206,6 +1952,7 @@ async function readCodexEventUsageSummary(file: string): Promise<CodexEventUsage
   const text = await fs.readFile(file, 'utf8').catch(() => '');
   if (!text) return empty;
   const summary = emptyCodexEventUsageSummary();
+  summary.estimatedFromEventBytes = Buffer.byteLength(text, 'utf8');
   for (const line of text.split(/\r?\n/g)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -1230,6 +1977,9 @@ async function readCodexEventUsageSummary(file: string): Promise<CodexEventUsage
   if (summary.inputTokens && !summary.uncachedInputTokens) {
     summary.uncachedInputTokens = Math.max(0, summary.inputTokens - summary.cachedInputTokens);
   }
+  if (!hasCodexUsageValues(summary)) {
+    summary.estimatedInputTokens = estimateInputTokensFromEventText(text);
+  }
   return summary;
 }
 
@@ -1240,8 +1990,16 @@ function emptyCodexEventUsageSummary(): CodexEventUsageSummary {
     uncachedInputTokens: 0,
     outputTokens: 0,
     reasoningOutputTokens: 0,
+    estimatedInputTokens: 0,
+    estimatedFromEventBytes: 0,
     eventCount: 0
   };
+}
+
+function estimateInputTokensFromEventText(text: string): number {
+  const compactText = text.replace(/\s+/g, ' ').trim();
+  if (!compactText) return 0;
+  return Math.max(1, Math.ceil(compactText.length / 4));
 }
 
 function collectCodexUsageRecords(value: unknown, depth = 0): Array<Record<string, unknown>> {
@@ -1312,11 +2070,13 @@ function normalizeCodexUsageRecord(record: Record<string, unknown>): CodexEventU
     uncachedInputTokens,
     outputTokens,
     reasoningOutputTokens,
-    eventCount: hasCodexUsageValues({ inputTokens, cachedInputTokens, uncachedInputTokens, outputTokens, reasoningOutputTokens, eventCount: 0 }) ? 1 : 0
+    estimatedInputTokens: 0,
+    estimatedFromEventBytes: 0,
+    eventCount: hasCodexUsageValues({ inputTokens, cachedInputTokens, uncachedInputTokens, outputTokens, reasoningOutputTokens }) ? 1 : 0
   };
 }
 
-function hasCodexUsageValues(usage: CodexEventUsageSummary): boolean {
+function hasCodexUsageValues(usage: Pick<CodexEventUsageSummary, 'inputTokens' | 'cachedInputTokens' | 'uncachedInputTokens' | 'outputTokens' | 'reasoningOutputTokens'>): boolean {
   return usage.inputTokens + usage.cachedInputTokens + usage.uncachedInputTokens + usage.outputTokens + usage.reasoningOutputTokens > 0;
 }
 
@@ -1384,9 +2144,13 @@ function optionsSafeCwd(runDir: string): string {
   return path.dirname(path.dirname(runDir));
 }
 
-async function readTaskDetails(options: NormalizedLoomUiServerOptions, jobId: string): Promise<FrontierLoomUiTaskDetailsResponse> {
+async function readTaskDetails(
+  options: NormalizedLoomUiServerOptions,
+  jobId: string,
+  sourceRun = ''
+): Promise<FrontierLoomUiTaskDetailsResponse> {
   if (!jobId) return { ok: false, jobId, files: [], commandsPassed: [], commandsFailed: [], evidenceArtifacts: [], error: 'missing job id' };
-  const entry = await findCollectionBundle(options, jobId);
+  const entry = await findCollectionBundle(options, jobId) ?? await findRawRunTaskBundle(options, jobId, sourceRun);
   if (!entry) return { ok: false, jobId, files: [], commandsPassed: [], commandsFailed: [], evidenceArtifacts: [], error: 'task not found in collection' };
   const { bundle, outputDir } = entry;
   const patchPath = textValue(bundle.patchPath, '');
@@ -1400,6 +2164,94 @@ async function readTaskDetails(options: NormalizedLoomUiServerOptions, jobId: st
     commandsFailed: recordArray(bundle.commandsFailed).slice(0, 20),
     evidenceArtifacts: evidencePaths.map((evidencePath) => artifactRecord(resolveRelativeArtifactPath(outputDir, evidencePath), evidencePath))
   };
+}
+
+async function findRawRunTaskBundle(
+  options: NormalizedLoomUiServerOptions,
+  jobId: string,
+  sourceRun = ''
+): Promise<{ bundle: Record<string, unknown>; outputDir?: string } | undefined> {
+  const sourceRunRoot = sourceRun ? safeCwdRelativeDirectory(options.cwd, sourceRun) : undefined;
+  const hintedRoot = sourceRunRoot ?? rawRunSourceHint(options.cwd, jobId);
+  const root = hintedRoot ?? path.join(options.cwd, 'agent-runs');
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) return undefined;
+  const matches = await findRawRunJobDirs(root, jobId, 0);
+  if (!matches.length) return undefined;
+  const scoredMatches = await Promise.all(matches.map(async (match) => {
+    const patchPath = await firstExistingRelativePath(options.cwd, rawRunPatchCandidates(match));
+    const matchStat = await fs.stat(match).catch(() => undefined);
+    return { match, patchPath, mtimeMs: matchStat?.mtimeMs ?? 0 };
+  }));
+  scoredMatches.sort((left, right) => {
+    const patchScore = Number(Boolean(right.patchPath)) - Number(Boolean(left.patchPath));
+    if (patchScore) return patchScore;
+    const timeScore = right.mtimeMs - left.mtimeMs;
+    if (timeScore) return timeScore;
+    return right.match.localeCompare(left.match);
+  });
+  const { match, patchPath } = scoredMatches[0];
+  const evidencePaths = await existingRelativePaths(options.cwd, [
+    path.join(match, 'last-message.md'),
+    path.join(match, 'codex-events.jsonl'),
+    path.join(match, 'evidence', 'last-message.md'),
+    path.join(match, 'evidence', 'handoff.md'),
+    path.join(match, 'evidence', 'evidence.json'),
+    path.join(match, 'evidence', 'resource-allocation.json'),
+    ...rawRunPatchCandidates(match)
+  ]);
+  return {
+    bundle: {
+      jobId: path.basename(match),
+      patchPath,
+      changedPaths: await readPatchChangedPathList(options.cwd, patchPath),
+      evidencePaths,
+      commandsPassed: [],
+      commandsFailed: []
+    }
+  };
+}
+
+function rawRunSourceHint(cwd: string, jobId: string): string | undefined {
+  const match = /(?:^|:)(agent-runs\/[^:]+)/.exec(jobId);
+  if (!match) return undefined;
+  const absolute = path.resolve(cwd, match[1]);
+  return isPathInside(cwd, absolute) ? absolute : undefined;
+}
+
+function safeCwdRelativeDirectory(cwd: string, input: string): string | undefined {
+  const absolute = path.resolve(cwd, input);
+  if (!isPathInside(cwd, absolute)) return undefined;
+  return absolute;
+}
+
+async function findRawRunJobDirs(root: string, jobId: string, depth: number): Promise<string[]> {
+  if (depth > 5) return [];
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const matches: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === 'streams' || entry.name === 'artifact-store' || entry.name.startsWith('.')) continue;
+    const absolute = path.join(root, entry.name);
+    if (rawRunJobIdMatches(jobId, entry.name) && await rawRunJobHasArtifacts(absolute)) matches.push(absolute);
+    matches.push(...await findRawRunJobDirs(absolute, jobId, depth + 1));
+  }
+  return matches;
+}
+
+async function rawRunJobHasArtifacts(jobDir: string): Promise<boolean> {
+  for (const file of [
+    path.join(jobDir, 'last-message.md'),
+    path.join(jobDir, 'codex-events.jsonl'),
+    ...rawRunPatchCandidates(jobDir)
+  ]) {
+    const stat = await fs.stat(file).catch(() => undefined);
+    if (stat?.isFile()) return true;
+  }
+  return false;
+}
+
+function rawRunJobIdMatches(requestedId: string, jobId: string): boolean {
+  return requestedId === jobId || requestedId.endsWith(`:${jobId}`) || requestedId.endsWith(`-${jobId}`);
 }
 
 async function findCollectionBundle(
@@ -1530,7 +2382,7 @@ async function readPatchFiles(options: NormalizedLoomUiServerOptions, patchPath:
 }
 
 function parseUnifiedPatchFiles(patch: string): FrontierLoomUiTaskFileDiff[] {
-  const sections = patch.split(/\n(?=diff --git )/g).filter((section) => section.trim().length > 0);
+  const sections = splitUnifiedPatchSections(patch);
   return sections.flatMap((section) => {
     const lines = section.split('\n');
     const pathLine = lines.find((line) => line.startsWith('+++ ')) ?? lines.find((line) => line.startsWith('diff --git '));
@@ -1550,6 +2402,27 @@ function parseUnifiedPatchFiles(patch: string): FrontierLoomUiTaskFileDiff[] {
       truncated
     }];
   });
+}
+
+function splitUnifiedPatchSections(patch: string): string[] {
+  if (/^diff --git /m.test(patch)) {
+    return patch.split(/\n(?=diff --git )/g).filter((section) => section.trim().length > 0);
+  }
+  const lines = patch.split('\n');
+  const sections: string[] = [];
+  let current: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const next = lines[index + 1] ?? '';
+    const startsPlainFile = line.startsWith('--- ') && next.startsWith('+++ ');
+    if (startsPlainFile && current.length) {
+      sections.push(current.join('\n'));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.some((line) => line.trim().length > 0)) sections.push(current.join('\n'));
+  return sections;
 }
 
 function parseUnifiedPatchHunks(section: string): FrontierLoomUiDiffHunk[] {
@@ -1587,9 +2460,19 @@ function parseUnifiedPatchHunks(section: string): FrontierLoomUiDiffHunk[] {
 
 function patchFilePath(line: string): string {
   const plus = /^\+\+\+\s+(?:b\/)?(.+)$/.exec(line);
-  if (plus && plus[1] !== '/dev/null') return plus[1];
+  if (plus && plus[1] !== '/dev/null') return normalizePatchDisplayPath(plus[1]);
   const diff = /^diff --git\s+a\/(.+?)\s+b\/(.+)$/.exec(line);
-  return diff?.[2] ?? '';
+  return normalizePatchDisplayPath(diff?.[2] ?? '');
+}
+
+function normalizePatchDisplayPath(value: string): string {
+  let clean = value.trim().split(/\t/g)[0]?.trim() ?? '';
+  clean = clean.replace(/^(?:a|b)\//, '');
+  const packageIndex = clean.indexOf('/packages/');
+  if (packageIndex >= 0) clean = clean.slice(packageIndex + 1);
+  const repoPackageIndex = clean.indexOf('packages/');
+  if (repoPackageIndex > 0) clean = clean.slice(repoPackageIndex);
+  return clean === '/dev/null' ? '' : clean;
 }
 
 function artifactRecord(pathValue: string, label = pathValue): FrontierLoomUiTaskArtifact {

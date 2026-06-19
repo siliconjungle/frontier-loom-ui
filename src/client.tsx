@@ -15,6 +15,7 @@ type Dashboard = {
   events: Array<Record<string, unknown>>;
   routing?: Record<string, unknown>;
   backlog?: Record<string, unknown>;
+  capacity?: Record<string, unknown>;
   semantic?: Record<string, unknown>;
   sources: Record<string, unknown>;
   raw?: Record<string, unknown>;
@@ -346,6 +347,7 @@ let chartPopover: HTMLElement | undefined;
 let activeContributionTarget: HTMLElement | undefined;
 const taskDetailsCache = new Map<string, TaskDetails>();
 const taskDetailsPending = new Set<string>();
+const taskFileDiffOpenStates = new Map<string, boolean>();
 const humanAnswerDrafts = new Map<string, string>();
 const humanAnswerStates = new Map<string, { status: 'submitting' | 'submitted' | 'error'; message: string }>();
 
@@ -398,6 +400,14 @@ root?.addEventListener('click', (event) => {
   }
   return;
 });
+
+root?.addEventListener('toggle', (event) => {
+  const target = event.target instanceof Element
+    ? event.target.closest<HTMLDetailsElement>('details[data-task-file-diff-key]')
+    : null;
+  if (!target) return;
+  taskFileDiffOpenStates.set(target.dataset.taskFileDiffKey ?? '', target.open);
+}, true);
 
 root?.addEventListener('input', (event) => {
   const target = event.target instanceof Element
@@ -571,6 +581,7 @@ async function refresh(): Promise<void> {
 function renderDashboard(dashboard: Dashboard, signature = dashboardSignature(dashboard)): void {
   hideChartPopover();
   captureScrollPositions();
+  captureTaskFileDiffOpenStates();
   pruneResolvedHumanActionDrafts(dashboard);
   const lanes = laneRollups(dashboard);
   root?.replaceChildren(<DashboardView dashboard={dashboard} lanes={lanes} />);
@@ -870,8 +881,8 @@ function TaskBoard({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Reco
 function AgentWork({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Record<string, unknown>> }): Node {
   const items = taskBoardItems(dashboard, jobs).filter(isActiveAgentJob);
   const workers = agentWorkers(items);
-  void dashboard;
   return <div className="agent-work-layout" data-scroll-id="swarm">
+    <SwarmCapacityPanel dashboard={dashboard} workers={workers} />
     <section className="agent-roster-panel" aria-label="Active agent roster">
       <div className="agent-roster-head">
         <span>Agent</span>
@@ -890,10 +901,78 @@ function AgentWork({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Reco
   </div>;
 }
 
+function SwarmCapacityPanel({ dashboard, workers }: { dashboard: Dashboard; workers: AgentWorker[] }): Node {
+  const capacity = recordValue(dashboard.capacity);
+  const lanes = arrayRecords(capacity.lanes);
+  const openLaneCount = numberValue(capacity.openLaneCount);
+  const activeLaneCount = numberValue(capacity.activeLaneCount);
+  const maxConcurrency = numberValue(capacity.maxConcurrency);
+  const runningAgentCount = numberValue(capacity.runningAgentCount) || workers.filter((worker) => worker.status === 'active').length;
+  const queuedTaskCount = numberValue(capacity.queuedTaskCount);
+  const laneRows = lanes.slice(0, 8);
+  const hiddenLaneCount = Math.max(0, lanes.length - laneRows.length);
+  const manifestLabel = textValue(capacity.manifestId, textValue(capacity.title, 'manifest'));
+  return <section className="swarm-capacity-panel" aria-label="Swarm capacity">
+    <div className="swarm-capacity-summary">
+      <div>
+        <span>Concurrency</span>
+        <b>{maxConcurrency ? `${text(runningAgentCount)} / ${text(maxConcurrency)}` : text(runningAgentCount)}</b>
+        <small>{manifestLabel}</small>
+      </div>
+      <div>
+        <span>Lanes</span>
+        <b>{text(openLaneCount || lanes.length)}</b>
+        <small>{text(activeLaneCount)} active · {text(lanes.length)} defined</small>
+      </div>
+      <div>
+        <span>Open tasks</span>
+        <b>{text(queuedTaskCount)}</b>
+        <small>{text(numberValue(capacity.totalTaskCount))} manifest tasks</small>
+      </div>
+      <div>
+        <span>Source</span>
+        <b>{text(numberValue(capacity.computeMaxConcurrency) || maxConcurrency || runningAgentCount)}</b>
+        <small>{artifactLabel(textValue(capacity.manifestPath, 'manifest'))}</small>
+      </div>
+    </div>
+    <div className="swarm-lane-strip" aria-label="Lane assignments">
+      {laneRows.length
+        ? laneRows.map((lane) => <SwarmLaneRow lane={lane} />)
+        : <p className="swarm-lane-empty">No manifest lanes loaded yet.</p>}
+      {hiddenLaneCount ? <p className="swarm-lane-more">+{text(hiddenLaneCount)} more lanes</p> : null}
+    </div>
+  </section>;
+}
+
+function SwarmLaneRow({ lane }: { lane: Record<string, unknown> }): Node {
+  const agents = stringArray(lane.assignedAgents);
+  const running = numberValue(lane.runningCount);
+  const cap = numberValue(lane.maxConcurrency);
+  const queued = numberValue(lane.queuedTaskCount);
+  const model = textValue(lane.model, textValue(lane.compute, 'model'));
+  return <article className="swarm-lane-row">
+    <div className="swarm-lane-main">
+      <b>{textValue(lane.title, textValue(lane.id, 'lane'))}</b>
+      <small>{textValue(lane.layer, 'lane')} · {model}</small>
+    </div>
+    <div className="swarm-lane-numbers">
+      <span>{text(running)} / {text(cap || 1)} active</span>
+      <span>{text(queued)} open</span>
+    </div>
+    <div className="swarm-lane-agents">
+      {agents.length
+        ? agents.slice(0, 3).map((agent) => <code>{shortAgentId(agent)}</code>)
+        : <span>idle</span>}
+      {agents.length > 3 ? <span>+{text(agents.length - 3)}</span> : null}
+    </div>
+  </article>;
+}
+
 function AgentWorkerCard({ worker, index, now }: { worker: AgentWorker; index: number; now: number }): Node {
   const model = agentModelSummary(worker);
   const files = agentTouchedFiles(worker);
   const evidenceCount = agentEvidenceCount(worker);
+  const fileFallback = evidenceCount ? 'Evidence only' : worker.status === 'active' ? 'Files pending' : 'No source files';
   const visibleJobs = worker.currentJobs.slice(0, 2);
   const hiddenJobCount = Math.max(0, worker.currentJobs.length - visibleJobs.length);
   return <article
@@ -934,9 +1013,9 @@ function AgentWorkerCard({ worker, index, now }: { worker: AgentWorker; index: n
       <div className="agent-file-list">
         {files.slice(0, 2).map((file) => <ArtifactLink path={file} label={artifactLabel(file)} className="agent-file-tag" />)}
         {files.length > 2 ? <span className="agent-file-more">+{text(files.length - 2)}</span> : null}
-        {!files.length ? <span className="agent-file-empty">No files</span> : null}
+        {!files.length ? <span className="agent-file-empty">{fileFallback}</span> : null}
       </div>
-      {evidenceCount ? <small>{text(evidenceCount)} {evidenceCount === 1 ? 'artifact' : 'artifacts'}</small> : null}
+      {evidenceCount ? <small>{text(evidenceCount)} evidence {evidenceCount === 1 ? 'artifact' : 'artifacts'}</small> : null}
     </div>
   </article>;
 }
@@ -961,8 +1040,8 @@ function TaskBoardCard({ job }: { job: TaskBoardItem }): Node {
     <b>{taskTitle(job)}</b>
     <small>{laneOf(job)} · {taskStatusDetail(job)}</small>
     <div className="task-card-foot">
-      <span>{formatNumber(numberValue(job.changedPathCount))} paths</span>
-      <span>{formatNumber(numberValue(job.evidencePathCount))} evidence</span>
+      <span>{pathSummaryText(job)}</span>
+      <span>{evidenceSummaryText(job)}</span>
     </div>
   </article>;
 }
@@ -1035,14 +1114,17 @@ function TaskFileDiffs({ job, details }: { job: TaskBoardItem; details?: TaskDet
   if (details?.files?.length) return <section className="task-dialog-section">
     <h4>Files changed</h4>
     <div className="task-file-list">
-      {details.files.map((file) => <details className="task-file-diff">
-        <summary>
-          <span className="task-file-name">{file.path}</span>
-          <small>+{text(file.additions)} -{text(file.deletions)}{file.truncated ? ' · truncated' : ''}</small>
-          <ArtifactLink path={file.artifactPath ?? file.path} label="Reveal" className="task-file-reveal" />
-        </summary>
-        <DiffRenderer file={file} />
-      </details>)}
+      {details.files.map((file) => {
+        const key = taskFileDiffKey(job, file);
+        return <details className="task-file-diff" data-task-file-diff-key={key} open={taskFileDiffOpenStates.get(key) ? 'open' : undefined}>
+          <summary>
+            <span className="task-file-name">{file.path}</span>
+            <small>+{text(file.additions)} -{text(file.deletions)}{file.truncated ? ' · truncated' : ''}</small>
+            <ArtifactLink path={file.artifactPath ?? file.path} label="Reveal" className="task-file-reveal" />
+          </summary>
+          <DiffRenderer file={file} />
+        </details>;
+      })}
     </div>
   </section>;
   if (changedPaths.length) return <section className="task-dialog-section">
@@ -1351,6 +1433,13 @@ function generatedAgentName(key: string): string {
 function agentDisplayName(worker: AgentWorker, index: number): string {
   if (worker.name) return worker.name;
   return `Agent ${String(index + 1).padStart(2, '0')}`;
+}
+
+function shortAgentId(value: string): string {
+  const clean = value.split(/[\\/]/g).pop() ?? value;
+  const parts = clean.split('-').filter(Boolean);
+  if (parts.length <= 3) return clean;
+  return parts.slice(-3).join('-');
 }
 
 function agentColor(key: string): string {
@@ -2927,6 +3016,16 @@ function taskDialogScrollId(id: string): string {
   return `task-dialog-${id}`;
 }
 
+function captureTaskFileDiffOpenStates(): void {
+  root?.querySelectorAll<HTMLDetailsElement>('details[data-task-file-diff-key]').forEach((entry) => {
+    taskFileDiffOpenStates.set(entry.dataset.taskFileDiffKey ?? '', entry.open);
+  });
+}
+
+function taskFileDiffKey(job: TaskBoardItem, file: TaskFileDiff): string {
+  return `${taskCardId(job)}::${file.path}`;
+}
+
 async function fetchTaskDetails(job: TaskBoardItem): Promise<void> {
   const id = taskCardId(job);
   if (!id || taskDetailsCache.has(id) || taskDetailsPending.has(id)) return;
@@ -2936,7 +3035,10 @@ async function fetchTaskDetails(job: TaskBoardItem): Promise<void> {
   }
   taskDetailsPending.add(id);
   try {
-    const response = await fetch(`/api/task-details?id=${encodeURIComponent(id)}`);
+    const params = new URLSearchParams({ id });
+    const sourceRun = textValue(job.sourceRun, '');
+    if (sourceRun) params.set('sourceRun', sourceRun);
+    const response = await fetch(`/api/task-details?${params}`);
     const details = await response.json() as TaskDetails;
     taskDetailsCache.set(id, details);
   } catch (error) {
@@ -3500,6 +3602,7 @@ function isCompletedJob(job: Record<string, unknown>): boolean {
 }
 
 function isReadyJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewJob(job)) return false;
   return normalized(job.bucket) === 'ready-to-apply'
     || normalized(job.disposition) === 'ready-to-apply'
     || normalized(job.mergeReadiness).includes('ready');
@@ -3517,6 +3620,7 @@ function jobRiskLabel(job: Record<string, unknown>): string {
 }
 
 function isFailedJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewJob(job)) return false;
   const status = normalized(job.status);
   const bucket = normalized(job.bucket);
   const disposition = normalized(job.disposition);
@@ -3529,6 +3633,7 @@ function isFailedJob(job: Record<string, unknown>): boolean {
 }
 
 function isBlockedJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewJob(job)) return false;
   const status = normalized(job.status);
   const bucket = normalized(job.bucket);
   const disposition = normalized(job.disposition);
@@ -3570,6 +3675,7 @@ function isCoordinatorReviewJob(job: Record<string, unknown>): boolean {
 }
 
 function isStaleJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewJob(job)) return false;
   return normalized(job.bucket).includes('stale')
     || normalized(job.disposition).includes('stale')
     || normalized(job.mergeReadiness).includes('stale');
@@ -3625,11 +3731,31 @@ function pathSummaryText(job: Record<string, unknown>): string {
   const ignoredOwnership = ignoredOwnershipViolations(job);
   const ignoredChangedPathCount = numberValue(job.ignoredChangedPathCount);
   const quarantinedChangedPathCount = numberValue(job.quarantinedChangedPathCount);
+  const changedPathCount = numberValue(job.changedPathCount);
+  const evidencePathCount = numberValue(job.evidencePathCount);
   const ignoredCount = ignoredOwnership.length + ignoredChangedPathCount;
   if (sourceOwnership.length) return `${text(sourceOwnership.length)} source issue`;
   if (quarantinedChangedPathCount) return `${text(quarantinedChangedPathCount)} quarantined`;
   if (ignoredCount) return `${text(ignoredCount)} generated noise`;
-  return `${text(job.changedPathCount)} changed paths`;
+  if (!changedPathCount && hasPatchArtifact(job)) return 'patch not indexed yet';
+  if (!changedPathCount && evidencePathCount) return 'evidence only';
+  if (!changedPathCount && isActiveAgentJob(job as TaskBoardItem)) return 'files pending';
+  return `${text(changedPathCount)} changed ${changedPathCount === 1 ? 'path' : 'paths'}`;
+}
+
+function hasPatchArtifact(job: Record<string, unknown>): boolean {
+  const paths = [
+    textValue(job.patchPath, ''),
+    ...stringArray(job.artifactPaths),
+    ...stringArray(job.evidencePaths)
+  ];
+  return paths.some((entry) => /\.patch(?:$|[?#])/.test(entry));
+}
+
+function evidenceSummaryText(job: Record<string, unknown>): string {
+  const count = numberValue(job.evidencePathCount);
+  if (!count) return 'no evidence yet';
+  return `${formatNumber(count)} evidence ${count === 1 ? 'artifact' : 'artifacts'}`;
 }
 
 function sourceOwnershipViolations(job: Record<string, unknown>): string[] {
