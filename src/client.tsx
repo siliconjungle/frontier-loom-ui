@@ -406,7 +406,7 @@ root?.addEventListener('toggle', (event) => {
     ? event.target.closest<HTMLDetailsElement>('details[data-task-file-diff-key]')
     : null;
   if (!target) return;
-  taskFileDiffOpenStates.set(target.dataset.taskFileDiffKey ?? '', target.open);
+  setTaskFileDiffOpenState(target);
 }, true);
 
 root?.addEventListener('input', (event) => {
@@ -1115,8 +1115,13 @@ function TaskFileDiffs({ job, details }: { job: TaskBoardItem; details?: TaskDet
     <h4>Files changed</h4>
     <div className="task-file-list">
       {details.files.map((file) => {
-        const key = taskFileDiffKey(job, file);
-        return <details className="task-file-diff" data-task-file-diff-key={key} open={taskFileDiffOpenStates.get(key) ? 'open' : undefined}>
+        const keys = taskFileDiffKeys(job, file);
+        return <details
+          className="task-file-diff"
+          data-task-file-diff-key={keys[0] ?? ''}
+          data-task-file-diff-keys={keys.join('\t')}
+          open={isTaskFileDiffOpen(job, file) ? 'open' : undefined}
+        >
           <summary>
             <span className="task-file-name">{file.path}</span>
             <small>+{text(file.additions)} -{text(file.deletions)}{file.truncated ? ' · truncated' : ''}</small>
@@ -3018,12 +3023,36 @@ function taskDialogScrollId(id: string): string {
 
 function captureTaskFileDiffOpenStates(): void {
   root?.querySelectorAll<HTMLDetailsElement>('details[data-task-file-diff-key]').forEach((entry) => {
-    taskFileDiffOpenStates.set(entry.dataset.taskFileDiffKey ?? '', entry.open);
+    setTaskFileDiffOpenState(entry);
   });
 }
 
-function taskFileDiffKey(job: TaskBoardItem, file: TaskFileDiff): string {
-  return `${taskCardId(job)}::${file.path}`;
+function taskFileDiffKeys(job: TaskBoardItem, file: TaskFileDiff): string[] {
+  const filePath = textValue(file.path, '');
+  if (!filePath) return [];
+  return uniqueStrings([
+    taskCardId(job),
+    textValue(job.originalJobId, ''),
+    textValue(job.jobId, ''),
+    textValue(job.taskId, ''),
+    textValue(job.workerId, ''),
+    textValue(job.agentId, ''),
+    ticketId(job)
+  ].filter(Boolean)).map((id) => `${id}::${filePath}`);
+}
+
+function isTaskFileDiffOpen(job: TaskBoardItem, file: TaskFileDiff): boolean {
+  return taskFileDiffKeys(job, file).some((key) => taskFileDiffOpenStates.get(key));
+}
+
+function taskFileDiffElementKeys(entry: HTMLDetailsElement): string[] {
+  const keys = textValue(entry.dataset.taskFileDiffKeys, '').split('\t').filter(Boolean);
+  const primary = textValue(entry.dataset.taskFileDiffKey, '');
+  return uniqueStrings([...keys, primary].filter(Boolean));
+}
+
+function setTaskFileDiffOpenState(entry: HTMLDetailsElement): void {
+  for (const key of taskFileDiffElementKeys(entry)) taskFileDiffOpenStates.set(key, entry.open);
 }
 
 async function fetchTaskDetails(job: TaskBoardItem): Promise<void> {
