@@ -4,10 +4,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  readCodexDashboardSnapshot,
-  type FrontierCodexDashboardSnapshotInput
-} from '@shapeshift-labs/frontier-swarm-codex';
+import { readCodexDashboardSnapshot } from '@shapeshift-labs/frontier-swarm-codex';
 
 const packageDir = path.dirname(fileURLToPath(import.meta.url));
 const HEALTH_JSON_PARSE_MAX_BYTES = 16 * 1024 * 1024;
@@ -28,7 +25,11 @@ const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const dashboardStreamListeners = new Set<() => void>();
 
-export interface FrontierLoomUiServerOptions extends FrontierCodexDashboardSnapshotInput {
+export interface FrontierLoomUiServerOptions {
+  cwd?: string;
+  run?: string;
+  collection?: string;
+  continuation?: string;
   host?: string;
   port?: number;
   staticDir?: string;
@@ -392,7 +393,7 @@ function formatUrlHost(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
-function dashboardInput(options: FrontierLoomUiServerOptions & { cwd: string }): FrontierCodexDashboardSnapshotInput {
+function dashboardInput(options: FrontierLoomUiServerOptions & { cwd: string }) {
   return {
     cwd: options.cwd,
     run: options.run,
@@ -935,7 +936,9 @@ function combineLifetimeDashboardSnapshots(
     if (entry.source.kind !== 'collection') return true;
     return !drainedRunRoots.has(lifetimeRunRootKey(entry.source));
   });
+  const autoDrainDelays = lifetimeAutoDrainDelayRecords(visibleSnapshots);
   const jobs = dedupeLifetimeDashboardJobs(collapseSupersededLifetimeReviewJobs(applyCoordinatorReviewDecisions(visibleSnapshots.flatMap(({ source, snapshot }) => {
+    const autoDrainDelay = lifetimeAutoDrainDelayRecord(source, snapshot);
     return recordArray(snapshot.jobs).map((job) => ({
       ...job,
       id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
@@ -944,11 +947,21 @@ function combineLifetimeDashboardSnapshots(
       sourceCollection: source.collection,
       sourceContinuation: source.continuation,
       sourceLabel: source.label,
+      ...(autoDrainDelay ? {
+        coordinationDelay: autoDrainDelay.reason,
+        autoDrainSkippedReason: autoDrainDelay.skippedReason,
+        autoDrainDirtyPathCount: autoDrainDelay.dirtyPathCount
+      } : {}),
       generatedAt: numberValue(job.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
     }));
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = recordArray(awaitNoop([]));
-  const summary = lifetimeDashboardSummary(jobs);
+  const summary = {
+    ...lifetimeDashboardSummary(jobs),
+    coordinationDelayCount: autoDrainDelays.length,
+    dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length
+  };
+  const queueOverlay = lifetimeQueueBacklogOverlay(queueBacklog, jobs);
   const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...visibleSnapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
   const events = visibleSnapshots.flatMap(({ source, snapshot }) => recordArray(snapshot.events).map((event) => ({
     ...event,
@@ -970,6 +983,7 @@ function combineLifetimeDashboardSnapshots(
       loadedSourceCount: visibleSnapshots.length,
       suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
       queueSourceCount: queueBacklog.sourceCount,
+      coordinationDelayCount: autoDrainDelays.length,
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
     summary,
@@ -978,7 +992,7 @@ function combineLifetimeDashboardSnapshots(
     quality: {},
     timeSeries: lifetimeTimeSeries(jobs, events),
     lanes: lifetimeLaneRows(jobs),
-    capacity: lifetimeCapacitySummary(queueBacklog, jobs),
+    capacity: lifetimeCapacitySummary(queueBacklog, jobs, queueOverlay.entries),
     jobs,
     humanActions: visibleSnapshots.flatMap(({ snapshot }) => recordArray(snapshot.humanActions)).slice(-100),
     humanActionAnswers,
@@ -986,9 +1000,13 @@ function combineLifetimeDashboardSnapshots(
     routing: lifetimeRoutingSummary(visibleSnapshots.map((entry) => entry.snapshot)),
     backlog: {
       id: 'workspace-lifetime',
-      entryCount: queueBacklog.entries.length + visibleSnapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).entryCount), 0),
-      readyCount: queueBacklog.entries.filter((entry) => textValue(entry.status, '') === 'todo').length + visibleSnapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).readyCount), 0),
-      entries: queueBacklog.entries
+      entryCount: queueOverlay.totalCount,
+      readyCount: queueOverlay.readyCount,
+      activeCount: queueOverlay.activeCount,
+      doneCount: queueOverlay.doneCount,
+      failedCount: queueOverlay.failedCount,
+      representedCount: queueOverlay.representedCount,
+      entries: queueOverlay.entries
     },
     raw: {
       lifetime: {
@@ -996,6 +1014,7 @@ function combineLifetimeDashboardSnapshots(
         sourceCount: discoveredSources.length,
         loadedSourceCount: visibleSnapshots.length,
         suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
+        autoDrainDelays,
         sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
         manifests: queueBacklog.manifests,
         queueSources: queueBacklog.paths
@@ -1006,6 +1025,47 @@ function combineLifetimeDashboardSnapshots(
 
 function lifetimeScopedId(source: LifetimeDashboardSource, id: string): string {
   return `${source.id}:${id}`.replaceAll(/[^\w:.-]+/g, '-');
+}
+
+interface LifetimeAutoDrainDelayRecord {
+  source: string;
+  sourceLabel: string;
+  reason: string;
+  skippedReason: string;
+  dirtyPathCount: number;
+  dirtyPaths: string[];
+  remainingReadyCount: number;
+  generatedAt: number;
+}
+
+function lifetimeAutoDrainDelayRecords(
+  entries: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }>
+): LifetimeAutoDrainDelayRecord[] {
+  return entries
+    .map(({ source, snapshot }) => lifetimeAutoDrainDelayRecord(source, snapshot))
+    .filter((record): record is LifetimeAutoDrainDelayRecord => Boolean(record));
+}
+
+function lifetimeAutoDrainDelayRecord(
+  source: LifetimeDashboardSource,
+  snapshot: Record<string, unknown>
+): LifetimeAutoDrainDelayRecord | undefined {
+  const rawRun = recordValue(recordValue(snapshot.raw).run);
+  const autoDrain = recordValue(rawRun.autoDrain);
+  const skippedReason = textValue(autoDrain.skippedReason, '');
+  if (skippedReason !== 'dirty-worktree') return undefined;
+  const summary = recordValue(autoDrain.summary);
+  const dirtyPaths = stringArray(autoDrain.dirtyPaths);
+  return {
+    source: source.path,
+    sourceLabel: source.label,
+    reason: 'apply-delayed-by-dirty-worktree',
+    skippedReason,
+    dirtyPathCount: dirtyPaths.length,
+    dirtyPaths: dirtyPaths.slice(0, 12),
+    remainingReadyCount: numberValue(summary.remainingReadyCount),
+    generatedAt: numberValue(autoDrain.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
+  };
 }
 
 async function readLatestDrainCoordinatorSnapshot(cwd: string): Promise<Record<string, unknown> | undefined> {
@@ -1742,16 +1802,59 @@ function lifetimeLaneRows(jobs: Array<Record<string, unknown>>): Array<Record<st
   }));
 }
 
-function lifetimeCapacitySummary(queueBacklog: LifetimeQueueBacklog, jobs: Array<Record<string, unknown>>): Record<string, unknown> {
+function lifetimeQueueBacklogOverlay(queueBacklog: LifetimeQueueBacklog, jobs: Array<Record<string, unknown>>): {
+  entries: Array<Record<string, unknown>>;
+  totalCount: number;
+  readyCount: number;
+  activeCount: number;
+  doneCount: number;
+  failedCount: number;
+  representedCount: number;
+} {
+  const jobsByKey = new Map<string, Array<Record<string, unknown>>>();
+  for (const job of jobs) {
+    for (const key of recordIdentityKeys(job).map(canonicalLifetimeTaskKey).filter(Boolean)) {
+      jobsByKey.set(key, [...(jobsByKey.get(key) ?? []), job]);
+    }
+  }
+  let activeCount = 0;
+  let doneCount = 0;
+  let failedCount = 0;
+  let representedCount = 0;
+  const entries: Array<Record<string, unknown>> = [];
+  for (const entry of queueBacklog.entries) {
+    const matchedJobs = Array.from(new Set(recordIdentityKeys(entry).map(canonicalLifetimeTaskKey).flatMap((key) => jobsByKey.get(key) ?? [])));
+    if (!matchedJobs.length) {
+      entries.push(entry);
+      continue;
+    }
+    representedCount += 1;
+    if (matchedJobs.some((job) => textValue(job.status, '') === 'running')) activeCount += 1;
+    else if (matchedJobs.some(isLifetimeFailedJob)) failedCount += 1;
+    else if (matchedJobs.some((job) => textValue(job.status, '') === 'completed' || isResolvedCoordinatorReviewRecord(job))) doneCount += 1;
+    else activeCount += 1;
+  }
+  return {
+    entries,
+    totalCount: queueBacklog.entries.length,
+    readyCount: entries.filter((entry) => textValue(entry.status, '') === 'todo').length,
+    activeCount,
+    doneCount,
+    failedCount,
+    representedCount
+  };
+}
+
+function lifetimeCapacitySummary(queueBacklog: LifetimeQueueBacklog, jobs: Array<Record<string, unknown>>, openQueueEntries = queueBacklog.entries): Record<string, unknown> {
   const manifest = queueBacklog.manifests[0];
   const laneRows = new Map<string, Record<string, unknown>>();
   const terminalTaskIds = new Set(jobs
     .filter((job) => ['completed', 'failed', 'blocked'].includes(textValue(job.status, '').toLowerCase()))
-    .flatMap(recordIdentityKeys));
-  const representedTaskIds = new Set(jobs.flatMap(recordIdentityKeys));
-  const openEntries = queueBacklog.entries.filter((entry) => {
+    .flatMap((job) => recordIdentityKeys(job).map(canonicalLifetimeTaskKey)));
+  const representedTaskIds = new Set(jobs.flatMap((job) => recordIdentityKeys(job).map(canonicalLifetimeTaskKey)));
+  const openEntries = openQueueEntries.filter((entry) => {
     const ids = recordIdentityKeys(entry);
-    return !ids.some((id) => terminalTaskIds.has(id) || representedTaskIds.has(id));
+    return !ids.some((id) => terminalTaskIds.has(canonicalLifetimeTaskKey(id)) || representedTaskIds.has(canonicalLifetimeTaskKey(id)));
   });
   const queuedByLane = groupRecordsByText(openEntries, (entry) => textValue(entry.lane ?? entry.group ?? entry.sourceQueue, 'unassigned'));
   const jobsByLane = groupRecordsByText(jobs, (job) => textValue(job.lane, 'unassigned'));
@@ -1804,9 +1907,8 @@ function capacityLaneRow(
     ...queuedEntries.filter((entry) => {
       const status = normalized(entry.status ?? entry.queueStatus);
       return !status || ['todo', 'queued', 'pending', 'ready', 'open'].includes(status);
-    }).flatMap(recordIdentityKeys),
-    ...runningJobs.flatMap(recordIdentityKeys),
-    ...queuedJobs.flatMap(recordIdentityKeys)
+    }).map(primaryRecordIdentityKey).filter(Boolean),
+    ...queuedJobs.map(primaryRecordIdentityKey).filter(Boolean)
   ]);
   return {
     id: lane.id,
@@ -1832,6 +1934,13 @@ function recordIdentityKeys(record: Record<string, unknown>): string[] {
     textValue(record.jobId, ''),
     textValue(record.taskId, '')
   ].filter(Boolean)));
+}
+
+function primaryRecordIdentityKey(record: Record<string, unknown>): string {
+  return canonicalLifetimeTaskKey(textValue(record.taskId, ''))
+    || canonicalLifetimeTaskKey(textValue(record.originalJobId, ''))
+    || canonicalLifetimeTaskKey(textValue(record.jobId, ''))
+    || canonicalLifetimeTaskKey(textValue(record.id, ''));
 }
 
 function groupRecordsByText(
@@ -2007,7 +2116,7 @@ async function activeRunJob(
   const merge = recordValue(await readJsonFile(mergePath));
   const live = isProcessLive(numberValue(entry.pid), entry);
   const quotaDeferred = !live && !lastMessage && !Object.keys(merge).length && await codexEventsHaveQuotaLimit(eventsPath);
-  const status = live && !lastMessage ? 'running' : quotaDeferred ? 'queued' : lastMessage || Object.keys(merge).length ? 'completed' : 'failed';
+  const status = live && !lastMessage ? 'running' : quotaDeferred ? 'completed' : lastMessage || Object.keys(merge).length ? 'completed' : 'failed';
   const startedAt = numberValue(entry.startedAt);
   const finishedAt = status === 'running' ? undefined : Math.max(numberValue(lastMessage?.mtimeMs), numberValue(merge.generatedAt));
   const cwd = optionsSafeCwd(runDir);
@@ -2035,8 +2144,14 @@ async function activeRunJob(
     title: textValue(planJob?.title ?? task.title, jobId),
     lane: textValue(planJob?.lane ?? task.lane, 'active-run'),
     status,
-    bucket: status === 'running' ? 'running' : status === 'completed' ? 'completed' : status === 'queued' ? 'queued' : 'failed-evidence',
-    disposition: status === 'running' ? 'active' : status === 'queued' ? 'quota-deferred' : status,
+    bucket: quotaDeferred ? 'review-resolved' : status === 'running' ? 'running' : status === 'completed' ? 'completed' : 'failed-evidence',
+    disposition: status === 'running' ? 'active' : quotaDeferred ? 'quota-deferred' : status,
+    ...(quotaDeferred ? {
+      reviewResolved: true,
+      coordinatorDecisionStatus: 'quota-deferred',
+      originalStatus: 'queued',
+      originalBucket: 'queued'
+    } : {}),
     agentId: jobId,
     workerId: jobId,
     model: textValue(compute.model, ''),
@@ -2072,7 +2187,7 @@ async function activeRunJob(
     commandsPassed: recordArray(merge.commandsPassed),
     commandsFailed: recordArray(merge.commandsFailed),
     collectReasonClasses: status === 'running' ? ['active worker'] : quotaDeferred ? ['quota deferred'] : [],
-    mergeReadiness: textValue(merge.mergeReadiness, status)
+    mergeReadiness: quotaDeferred ? 'quota-deferred' : textValue(merge.mergeReadiness, status)
   };
 }
 

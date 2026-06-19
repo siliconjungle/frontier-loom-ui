@@ -13,6 +13,7 @@ const lifetimeCurrentDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', '
 const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-resolved');
 const lifetimeDrainedRunDir = path.join(tmp, 'agent-runs', 'drained-autonomous-run', 'run-1');
 const lifetimeDrainedCollectionDir = path.join(lifetimeDrainedRunDir, 'auto-drain', 'collection-01-post-apply');
+const lifetimeDirtySkipRunDir = path.join(tmp, 'agent-runs', 'dirty-autodrain-run', 'run-1');
 const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
 const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
@@ -23,6 +24,7 @@ await fs.mkdir(path.join(activeRunDir, 'active-done', 'evidence'), { recursive: 
 await fs.mkdir(lifetimeCurrentDir, { recursive: true });
 await fs.mkdir(lifetimeResolvedDir, { recursive: true });
 await fs.mkdir(lifetimeDrainedCollectionDir, { recursive: true });
+await fs.mkdir(lifetimeDirtySkipRunDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
@@ -350,6 +352,48 @@ await fs.writeFile(path.join(lifetimeDrainedCollectionDir, 'collection.json'), J
     }]
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeDirtySkipRunDir, 'swarm-results.json'), JSON.stringify({
+  ok: false,
+  outDir: lifetimeDirtySkipRunDir,
+  run: {
+    id: 'dirty-skip-proof',
+    status: 'completed',
+    jobs: [{
+      id: 'dirty-skip-job',
+      taskId: 'dirty-skip-task',
+      title: 'Dirty checkout delayed apply',
+      lane: 'dirty-delay',
+      status: 'completed'
+    }],
+    results: [{
+      jobId: 'dirty-skip-job',
+      status: 'completed',
+      startedAt: Date.now() - 2000,
+      finishedAt: Date.now() - 1000,
+      durationMs: 1000
+    }]
+  },
+  proof: {
+    summary: {
+      jobCount: 1,
+      completedCount: 1,
+      failedCount: 0,
+      blockedCount: 0
+    }
+  },
+  autoDrain: {
+    ok: false,
+    skippedReason: 'dirty-worktree',
+    dirtyPaths: ['packages/frontier-swarm/src/index.ts'],
+    generatedAt: Date.now() - 500,
+    summary: {
+      remainingReadyCount: 1,
+      terminalCount: 0,
+      blockedCount: 0,
+      rerunManifestTerminalState: 'drained'
+    }
+  }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(lifetimeRedrainCollectionDir, 'collection.json'), JSON.stringify({
   ok: false,
   generatedAt: Date.now() - 500,
@@ -525,7 +569,9 @@ try {
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 6);
+    assert.equal(lifetimeDashboard.summary.jobCount, 7);
+    assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
+    assert.equal(lifetimeDashboard.summary.dirtyAutoDrainSkipCount, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['ready-to-apply'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
@@ -548,6 +594,12 @@ try {
     assert.equal(redrainJob.status, 'completed');
     assert.equal(redrainJob.bucket, 'review-resolved');
     assert.equal(redrainJob.coordinatorDecisionStatus, 'committed');
+    const dirtySkipJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dirty-skip-job');
+    assert.ok(dirtySkipJob);
+    assert.equal(dirtySkipJob.status, 'completed');
+    assert.equal(dirtySkipJob.coordinationDelay, 'apply-delayed-by-dirty-worktree');
+    assert.equal(dirtySkipJob.autoDrainSkippedReason, 'dirty-worktree');
+    assert.equal(lifetimeDashboard.raw.lifetime.autoDrainDelays.length, 1);
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);
     assert.equal(lifetimeDashboard.capacity.openLaneCount, 1);

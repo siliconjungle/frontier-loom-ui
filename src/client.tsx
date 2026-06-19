@@ -135,7 +135,7 @@ type RouteState = {
   ticket?: string;
 };
 
-type ContentTab = 'work' | 'board' | 'swarm' | 'performance' | 'history' | 'testing' | 'actions';
+type ContentTab = 'work' | 'board' | 'swarm' | 'lanes' | 'performance' | 'history' | 'testing' | 'actions';
 
 type TimelinePoint = {
   at: number;
@@ -329,6 +329,7 @@ const contentTabs: Array<{ id: ContentTab; label: string }> = [
   { id: 'work', label: 'Overview' },
   { id: 'board', label: 'Board' },
   { id: 'swarm', label: 'Swarm' },
+  { id: 'lanes', label: 'Lanes' },
   { id: 'performance', label: 'Performance' },
   { id: 'history', label: 'History' },
   { id: 'testing', label: 'Testing' },
@@ -625,6 +626,7 @@ function DashboardView({ dashboard, lanes }: { dashboard: Dashboard; lanes: Lane
         <nav className="content-tabs" role="tablist" aria-label="Dashboard sections">
           {contentTabs.map((tab) => contentTab(tab.id, tab.label, tabMeta(tab.id, {
             jobs: visibleJobs.length,
+            lanes: dashboardLaneCount(dashboard, lanes),
             questions: humanActionRows(visibleJobs, audit, dashboard).length,
             events: visibleEvents.length,
             sources: sourceEntries.length
@@ -678,6 +680,9 @@ function contentPanel(tab: ContentTab, input: {
     <AgentWork dashboard={input.dashboard} jobs={input.visibleJobs} />
   </Panel>;
   }
+  if (tab === 'lanes') return <Panel title="Lanes" meta={`${text(dashboardLaneCount(input.dashboard, input.lanes))} lanes`}>
+    <LaneWork dashboard={input.dashboard} lanes={input.lanes} />
+  </Panel>;
   if (tab === 'performance') return <Panel title="Performance" meta={performanceTabMeta(input.dashboard, input.visibleJobs)}>
     <PerformanceView dashboard={input.dashboard} jobs={input.visibleJobs} attention={input.attention} audit={input.audit} />
   </Panel>;
@@ -911,6 +916,126 @@ function AgentWork({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Reco
   </div>;
 }
 
+function LaneWork({ dashboard, lanes }: { dashboard: Dashboard; lanes: LaneRollup[] }): Node {
+  const capacity = recordValue(dashboard.capacity);
+  const capacityLanes = arrayRecords(capacity.lanes);
+  const capacityById = new Map(capacityLanes.map((lane) => [textValue(lane.id, textValue(lane.title, '')), lane]));
+  const ids = new Set<string>();
+  for (const lane of lanes) ids.add(lane.id);
+  for (const lane of capacityLanes) ids.add(textValue(lane.id, textValue(lane.title, 'lane')));
+  const rows = Array.from(ids)
+    .filter(Boolean)
+    .map((id) => laneDetailRow(id, lanes.find((lane) => lane.id === id), capacityById.get(id)))
+    .filter(isActiveLaneRow)
+    .sort((left, right) => {
+      const group = laneSortGroup(left) - laneSortGroup(right);
+      const active = right.runningCount - left.runningCount;
+      const queued = right.queuedTaskCount - left.queuedTaskCount;
+      const review = (right.needsCoordinatorReviewCount + right.staleCount + right.failedCount) - (left.needsCoordinatorReviewCount + left.staleCount + left.failedCount);
+      return group || active || queued || review || left.title.localeCompare(right.title);
+    });
+  return <div className="lane-work-layout" data-scroll-id="lanes">
+    <SwarmCapacityPanel dashboard={dashboard} workers={[]} />
+    <section className="lane-roster-panel" aria-label="Swarm lanes">
+      <div className="lane-roster-head">
+        <span>Lane</span>
+        <span>Work</span>
+        <span>Capacity</span>
+        <span>Agents</span>
+      </div>
+      <div className="lane-roster-list" data-scroll-id="lane-roster">
+        {rows.length
+          ? rows.map((lane) => <LaneRosterRow lane={lane} />)
+          : <p className="lane-roster-empty">No lanes have active workers right now.</p>}
+      </div>
+    </section>
+  </div>;
+}
+
+function dashboardLaneCount(dashboard: Dashboard, lanes: LaneRollup[]): number {
+  const ids = new Set<string>();
+  for (const lane of lanes) ids.add(lane.id);
+  for (const lane of arrayRecords(recordValue(dashboard.capacity).lanes)) ids.add(textValue(lane.id, textValue(lane.title, '')));
+  return Array.from(ids)
+    .filter(Boolean)
+    .map((id) => laneDetailRow(id, lanes.find((lane) => lane.id === id), arrayRecords(recordValue(dashboard.capacity).lanes).find((lane) => textValue(lane.id, textValue(lane.title, '')) === id)))
+    .filter(isActiveLaneRow)
+    .length;
+}
+
+type LaneDetailRow = {
+  id: string;
+  title: string;
+  layer: string;
+  model: string;
+  jobCount: number;
+  completedCount: number;
+  runningCount: number;
+  failedCount: number;
+  blockedCount: number;
+  queuedTaskCount: number;
+  needsCoordinatorReviewCount: number;
+  staleCount: number;
+  eventCount: number;
+  maxConcurrency: number;
+  assignedAgents: string[];
+};
+
+function laneDetailRow(id: string, rollup: LaneRollup | undefined, capacity: Record<string, unknown> | undefined): LaneDetailRow {
+  const row = recordValue(capacity);
+  return {
+    id,
+    title: textValue(row.title, id),
+    layer: textValue(row.layer, ''),
+    model: textValue(row.model, textValue(row.compute, '')),
+    jobCount: rollup?.jobCount ?? numberValue(row.totalTaskCount),
+    completedCount: rollup?.completedCount ?? numberValue(row.completedCount),
+    runningCount: rollup?.runningCount ?? numberValue(row.runningCount),
+    failedCount: rollup?.failedCount ?? numberValue(row.failedCount),
+    blockedCount: rollup?.blockedCount ?? numberValue(row.blockedCount),
+    queuedTaskCount: numberValue(row.queuedTaskCount),
+    needsCoordinatorReviewCount: rollup?.needsCoordinatorReviewCount ?? 0,
+    staleCount: rollup?.staleCount ?? 0,
+    eventCount: rollup?.eventCount ?? 0,
+    maxConcurrency: numberValue(row.maxConcurrency) || 1,
+    assignedAgents: stringArray(row.assignedAgents)
+  };
+}
+
+function laneSortGroup(lane: LaneDetailRow): number {
+  if (lane.runningCount > 0) return 0;
+  if (lane.queuedTaskCount > 0) return 1;
+  if (lane.needsCoordinatorReviewCount || lane.staleCount || lane.failedCount || lane.blockedCount) return 2;
+  if (lane.completedCount || lane.eventCount || lane.jobCount) return 3;
+  return 4;
+}
+
+function isActiveLaneRow(lane: LaneDetailRow): boolean {
+  return lane.runningCount > 0 || lane.assignedAgents.length > 0;
+}
+
+function LaneRosterRow({ lane }: { lane: LaneDetailRow }): Node {
+  return <article className="lane-roster-row">
+    <div className="lane-cell lane-cell-name">
+      <b>{lane.title}</b>
+      <small>{[lane.layer || 'lane', lane.model].filter(Boolean).join(' · ')}</small>
+    </div>
+    <div className="lane-cell lane-cell-work">
+      <b>{text(lane.runningCount)} running · {text(lane.queuedTaskCount)} queued</b>
+      <small>{text(lane.completedCount)} done · {text(lane.failedCount)} failed · {text(lane.eventCount)} events</small>
+    </div>
+    <div className="lane-cell lane-cell-capacity">
+      <b>{text(lane.runningCount)} / {text(lane.maxConcurrency)}</b>
+      <small>{lane.needsCoordinatorReviewCount ? `${text(lane.needsCoordinatorReviewCount)} review` : lane.staleCount ? `${text(lane.staleCount)} stale` : `${text(lane.jobCount)} tracked`}</small>
+    </div>
+    <div className="lane-cell lane-cell-agents">
+      {lane.assignedAgents.length
+        ? lane.assignedAgents.map((agent) => <code>{shortAgentId(agent)}</code>)
+        : <span>idle</span>}
+    </div>
+  </article>;
+}
+
 function SwarmCapacityPanel({ dashboard, workers }: { dashboard: Dashboard; workers: AgentWorker[] }): Node {
   const capacity = recordValue(dashboard.capacity);
   const lanes = arrayRecords(capacity.lanes);
@@ -919,8 +1044,6 @@ function SwarmCapacityPanel({ dashboard, workers }: { dashboard: Dashboard; work
   const maxConcurrency = numberValue(capacity.maxConcurrency);
   const runningAgentCount = numberValue(capacity.runningAgentCount) || workers.filter((worker) => worker.status === 'active').length;
   const queuedTaskCount = numberValue(capacity.queuedTaskCount);
-  const laneRows = lanes.slice(0, 8);
-  const hiddenLaneCount = Math.max(0, lanes.length - laneRows.length);
   const manifestLabel = textValue(capacity.manifestId, textValue(capacity.title, 'manifest'));
   return <section className="swarm-capacity-panel" aria-label="Swarm capacity">
     <div className="swarm-capacity-summary">
@@ -945,37 +1068,7 @@ function SwarmCapacityPanel({ dashboard, workers }: { dashboard: Dashboard; work
         <small>{artifactLabel(textValue(capacity.manifestPath, 'manifest'))}</small>
       </div>
     </div>
-    <div className="swarm-lane-strip" aria-label="Lane assignments">
-      {laneRows.length
-        ? laneRows.map((lane) => <SwarmLaneRow lane={lane} />)
-        : <p className="swarm-lane-empty">No manifest lanes loaded yet.</p>}
-      {hiddenLaneCount ? <p className="swarm-lane-more">+{text(hiddenLaneCount)} more lanes</p> : null}
-    </div>
   </section>;
-}
-
-function SwarmLaneRow({ lane }: { lane: Record<string, unknown> }): Node {
-  const agents = stringArray(lane.assignedAgents);
-  const running = numberValue(lane.runningCount);
-  const cap = numberValue(lane.maxConcurrency);
-  const queued = numberValue(lane.queuedTaskCount);
-  const model = textValue(lane.model, textValue(lane.compute, 'model'));
-  return <article className="swarm-lane-row">
-    <div className="swarm-lane-main">
-      <b>{textValue(lane.title, textValue(lane.id, 'lane'))}</b>
-      <small>{textValue(lane.layer, 'lane')} · {model}</small>
-    </div>
-    <div className="swarm-lane-numbers">
-      <span>{text(running)} / {text(cap || 1)} active</span>
-      <span>{text(queued)} open</span>
-    </div>
-    <div className="swarm-lane-agents">
-      {agents.length
-        ? agents.slice(0, 3).map((agent) => <code>{shortAgentId(agent)}</code>)
-        : <span>idle</span>}
-      {agents.length > 3 ? <span>+{text(agents.length - 3)}</span> : null}
-    </div>
-  </article>;
 }
 
 function AgentWorkerCard({ worker, index, now }: { worker: AgentWorker; index: number; now: number }): Node {
@@ -1328,7 +1421,10 @@ function backlogBoardItems(dashboard: Dashboard): TaskBoardItem[] {
   return entries.map((entry, index) => {
     const id = textValue(entry.id ?? entry.taskId ?? entry.title, `backlog-${index + 1}`);
     const status = normalized(entry.status ?? entry.state);
-    const column: TaskBoardColumnId = ['todo', 'ready', 'queued', 'pending'].includes(status) || Boolean(entry.ready)
+    const requestedColumn = textValue(entry.boardColumn, '') as TaskBoardColumnId;
+    const column: TaskBoardColumnId = ['backlog', 'todo', 'active', 'review', 'ready', 'done', 'blocked'].includes(requestedColumn)
+      ? requestedColumn
+      : ['todo', 'ready', 'queued', 'pending'].includes(status) || Boolean(entry.ready)
       ? 'todo'
       : 'backlog';
     return {
@@ -4120,12 +4216,13 @@ function timelinePointTone(point: TimelinePoint): 'bad' | 'warn' | 'good' | 'neu
   return 'neutral';
 }
 
-function tabMeta(tab: ContentTab, input: { jobs: number; questions: number; events: number; sources: number }): string {
+function tabMeta(tab: ContentTab, input: { jobs: number; lanes: number; questions: number; events: number; sources: number }): string {
   void input.events;
   void input.sources;
   if (tab === 'work') return `${text(input.jobs)} tasks`;
   if (tab === 'board') return 'AI tasks';
   if (tab === 'swarm') return 'active agents';
+  if (tab === 'lanes') return `${text(input.lanes)} lanes`;
   if (tab === 'performance') return 'cost trends';
   if (tab === 'history') return 'change graph';
   if (tab === 'testing') return 'quality checks';
