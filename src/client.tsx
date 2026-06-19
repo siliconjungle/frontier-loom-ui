@@ -668,7 +668,7 @@ function contentPanel(tab: ContentTab, input: {
   if (tab === 'work') return <Panel title="Overview" meta={`${text(input.visibleJobs.length)} tasks`} hideHead>
     <WorkOverview dashboard={input.dashboard} lanes={input.lanes} jobs={input.visibleJobs} attention={input.attention} audit={input.audit} success={input.success} />
   </Panel>;
-  if (tab === 'board') return <Panel title="Task board" meta={`${text(boardItems.length)} active-visible tasks`}>
+  if (tab === 'board') return <Panel title="Task board" meta={boardPanelMeta(boardItems.length, input.visibleJobs.length)}>
     <TaskBoard dashboard={input.dashboard} jobs={input.visibleJobs} />
   </Panel>;
   if (tab === 'swarm') {
@@ -690,6 +690,11 @@ function contentPanel(tab: ContentTab, input: {
   return <Panel title="Questions for you" meta={`${text(humanActionRows(input.visibleJobs, input.audit, input.dashboard).length)} open`}>
     <HumanActionQueue dashboard={input.dashboard} jobs={input.visibleJobs} audit={input.audit} />
   </Panel>;
+}
+
+function boardPanelMeta(visibleCount: number, totalCount: number): string {
+  if (visibleCount === totalCount) return `${text(visibleCount)} tasks`;
+  return `${text(visibleCount)} visible · ${text(totalCount)} lifetime`;
 }
 
 function Panel({ title, meta, children, className, hideHead = false }: { title: string; meta?: string; children: unknown; className?: string; hideHead?: boolean }): Node {
