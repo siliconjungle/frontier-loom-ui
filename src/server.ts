@@ -14,8 +14,8 @@ const ARTIFACT_VIEW_MAX_BYTES = 768 * 1024;
 const ARTIFACT_DIRECTORY_MAX_ENTRIES = 200;
 const HUMAN_ACTION_ANSWER_MAX_BYTES = 16 * 1024;
 const CODEX_EVENTS_USAGE_MAX_BYTES = 8 * 1024 * 1024;
-const DASHBOARD_SNAPSHOT_CACHE_MS = 1500;
-const LIFETIME_DASHBOARD_MAX_SOURCES = 80;
+const DASHBOARD_SNAPSHOT_CACHE_MS = 5000;
+const LIFETIME_DASHBOARD_MAX_SOURCES = 24;
 const LIFETIME_DASHBOARD_MAX_JOBS = 800;
 const LIFETIME_DASHBOARD_SCAN_MAX_FILES = 600;
 const LIFETIME_DASHBOARD_SCAN_MAX_DEPTH = 5;
@@ -565,9 +565,7 @@ async function discoverLifetimeDashboardSources(cwd: string): Promise<LifetimeDa
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
     const hasCollection = entry.files.has('collection.json') || entry.files.has('coordinator-query.json');
     const hasContinuation = entry.files.has('continuation.json');
-    const hasCompletedRun = entry.files.has('swarm-results.json') || entry.files.has('coordinator-dashboard.json');
-    const hasLivePidRun = entry.files.has('pids.json') && await pidManifestHasLiveCodexEntry(path.join(dir, 'pids.json'));
-    const hasRun = hasCompletedRun || hasLivePidRun;
+    const hasRun = entry.files.has('swarm-results.json') || entry.files.has('coordinator-dashboard.json');
     if (hasCollection) {
       out.push({
         id: `collection:${relative}`,
@@ -1627,36 +1625,8 @@ function mergeLifetimeActiveRunSnapshot(
 }
 
 async function readLifetimeActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown> | undefined> {
-  const runDirs = await findLifetimeActiveRunDirs(options.cwd);
-  const jobs: Array<Record<string, unknown>> = [];
-  const sources: string[] = [];
-  for (const runDir of runDirs) {
-    const relative = path.relative(options.cwd, runDir);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
-    const sourceStat = await fs.stat(runDir).catch(() => undefined);
-    const source: LifetimeDashboardSource = {
-      id: `run:${relative}`,
-      label: lifetimeSourceLabel(relative),
-      path: relative,
-      kind: 'run',
-      mtimeMs: sourceStat?.mtimeMs ?? Date.now(),
-      run: relative
-    };
-    const snapshot = recordValue(await readActiveRunSnapshot({ ...options, run: relative }));
-    const runningJobs = recordArray(snapshot.jobs)
-      .filter((job) => textValue(job.status, '') === 'running')
-      .map((job) => ({
-        ...job,
-        id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
-        originalJobId: textValue(job.id ?? job.jobId ?? job.taskId, 'job'),
-        sourceRun: source.run,
-        sourceLabel: source.label,
-        generatedAt: Date.now()
-      }));
-    if (!runningJobs.length) continue;
-    jobs.push(...runningJobs);
-    sources.push(relative);
-  }
+  const jobs = await readLiveCodexProcessJobs(options.cwd);
+  const sources = uniquePaths(jobs.map((job) => textValue(job.sourceRun, '')).filter(Boolean));
   if (!jobs.length) return undefined;
   const generatedAt = Date.now();
   return {
@@ -1679,6 +1649,112 @@ async function readLifetimeActiveRunSnapshot(options: NormalizedLoomUiServerOpti
       }
     }
   };
+}
+
+async function readLiveCodexProcessJobs(cwd: string): Promise<Array<Record<string, unknown>>> {
+  if (process.platform === 'win32') return [];
+  const result = spawnSync('ps', ['-axo', 'pid,ppid,etime,command'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore']
+  });
+  if (result.status !== 0 && !result.stdout) return [];
+  const agentWorktreeRoot = `${path.join(cwd, 'agent-worktrees')}/`;
+  const now = Date.now();
+  const byWorker = new Map<string, {
+    pid: number;
+    etime: string;
+    cd: string;
+    model: string;
+    outputLastMessage: string;
+    runDir: string;
+    jobId: string;
+  }>();
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (!line.includes('codex ') || !line.includes(' exec ') || !line.includes(agentWorktreeRoot)) continue;
+    const fields = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!fields) continue;
+    const command = fields[4];
+    const cd = commandOptionValue(splitCommandWords(command), '--cd') || regexCommandOption(command, '--cd');
+    if (!cd.startsWith(agentWorktreeRoot)) continue;
+    const outputLastMessage = commandOptionValue(splitCommandWords(command), '--output-last-message') || regexCommandOption(command, '--output-last-message');
+    const model = commandOptionValue(splitCommandWords(command), '--model') || regexCommandOption(command, '--model') || '';
+    const runDir = outputLastMessage ? path.dirname(path.dirname(outputLastMessage)) : '';
+    const jobId = outputLastMessage ? path.basename(path.dirname(outputLastMessage)) : path.basename(cd);
+    const key = outputLastMessage || cd;
+    const pid = Number(fields[1]);
+    const current = byWorker.get(key);
+    if (!current || pid < current.pid) byWorker.set(key, { pid, etime: fields[3], cd, model, outputLastMessage, runDir, jobId });
+  }
+  const planCache = new Map<string, Promise<Map<string, Record<string, unknown>>>>();
+  const jobs: Array<Record<string, unknown>> = [];
+  for (const worker of byWorker.values()) {
+    const relativeRun = worker.runDir && isPathInside(cwd, worker.runDir) ? path.relative(cwd, worker.runDir) : '';
+    const planJobs = worker.runDir
+      ? await (planCache.get(worker.runDir) ?? planCache.set(worker.runDir, readRunPlanJobs(worker.runDir)).get(worker.runDir)!)
+      : new Map<string, Record<string, unknown>>();
+    const planJob = planJobs.get(worker.jobId);
+    const task = recordValue(planJob?.task);
+    const compute = recordValue(planJob?.compute);
+    const startedAt = now - parsePsElapsedMs(worker.etime);
+    const title = textValue(planJob?.title ?? task.title, humanizeWorkerJobId(worker.jobId));
+    const lane = textValue(planJob?.lane ?? task.lane, inferLaneFromWorkerJobId(worker.jobId));
+    jobs.push({
+      id: relativeRun ? `run:${relativeRun.replaceAll(/[^\w:.-]+/g, '-')}:${worker.jobId}` : worker.jobId,
+      originalJobId: worker.jobId,
+      taskId: textValue(planJob?.taskId ?? task.id, worker.jobId),
+      title,
+      lane,
+      status: 'running',
+      bucket: 'running',
+      disposition: 'active',
+      agentId: worker.jobId,
+      workerId: worker.jobId,
+      model: textValue(compute.model, worker.model),
+      computeId: textValue(compute.id, ''),
+      reasoningEffort: textValue(compute.reasoningEffort, ''),
+      startedAt,
+      durationMs: Math.max(0, now - startedAt),
+      evidencePaths: worker.outputLastMessage && isPathInside(cwd, worker.outputLastMessage) ? [path.relative(cwd, worker.outputLastMessage)] : [],
+      evidencePathCount: worker.outputLastMessage ? 1 : 0,
+      changedPathCount: 0,
+      collectReasonClasses: ['active worker process'],
+      mergeReadiness: 'running',
+      sourceRun: relativeRun,
+      sourceLabel: relativeRun ? lifetimeSourceLabel(relativeRun) : 'active-process',
+      generatedAt: now
+    });
+  }
+  return jobs.sort((left, right) => textValue(left.lane, '').localeCompare(textValue(right.lane, '')) || textValue(left.title, '').localeCompare(textValue(right.title, '')));
+}
+
+function regexCommandOption(command: string, option: string): string {
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`${escaped}\\s+([^\\s]+)`).exec(command);
+  return match?.[1] ?? '';
+}
+
+function splitCommandWords(command: string): string[] {
+  return command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((word) => word.replace(/^(['"])(.*)\1$/u, '$2')) ?? [];
+}
+
+function parsePsElapsedMs(value: string): number {
+  const daySplit = value.split('-');
+  const days = daySplit.length === 2 ? Number(daySplit[0]) || 0 : 0;
+  const time = daySplit.at(-1) ?? '';
+  const parts = time.split(':').map((part) => Number(part) || 0);
+  const [hours, minutes, seconds] = parts.length === 3 ? parts : [0, parts[0] ?? 0, parts[1] ?? 0];
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
+function inferLaneFromWorkerJobId(jobId: string): string {
+  const parts = jobId.split('-');
+  const half = Math.floor(parts.length / 2);
+  if (half > 0 && parts.slice(0, half).join('-') === parts.slice(half, half * 2).join('-')) return parts.slice(0, half).join('-');
+  return parts.slice(0, Math.max(1, parts.length - 1)).join('-');
+}
+
+function humanizeWorkerJobId(jobId: string): string {
+  return inferLaneFromWorkerJobId(jobId).split('-').filter(Boolean).map((part) => part[0]?.toUpperCase() + part.slice(1)).join(' ') || jobId;
 }
 
 async function findLifetimeActiveRunDirs(cwd: string): Promise<string[]> {
@@ -2386,18 +2462,22 @@ function shouldPreferActiveRunSnapshot(jobs: unknown[], activeJobs: Array<Record
   return activeJobs.length > jobs.length;
 }
 
-async function readActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown> | undefined> {
+async function readActiveRunSnapshot(
+  options: NormalizedLoomUiServerOptions,
+  readOptions: { runningOnly?: boolean; includeUsage?: boolean } = {}
+): Promise<Record<string, unknown> | undefined> {
   const runDir = await resolveRunDirectory(options);
   if (!runDir) return undefined;
   const pidPath = path.join(runDir, 'pids.json');
   const pidManifest = recordValue(await readJsonFile(pidPath));
-  const entries = recordArray(pidManifest.entries).filter((entry) => textValue(entry.role, '') === 'codex');
+  let entries = recordArray(pidManifest.entries).filter((entry) => textValue(entry.role, '') === 'codex');
+  if (readOptions.runningOnly) entries = entries.filter((entry) => isProcessLive(numberValue(entry.pid), entry));
   if (!entries.length) return undefined;
   const planPath = path.join(runDir, 'swarm-plan.json');
   const plan = recordValue(await readJsonFile(planPath));
   const planJobs = new Map(recordArray(plan.jobs).map((job) => [textValue(job.id, ''), job]));
   const now = Date.now();
-  const jobs = await Promise.all(entries.map((entry) => activeRunJob(options.cwd, runDir, entry, planJobs.get(textValue(entry.jobId, '')), now)));
+  const jobs = await Promise.all(entries.map((entry) => activeRunJob(options.cwd, runDir, entry, planJobs.get(textValue(entry.jobId, '')), now, readOptions)));
   const runningCount = jobs.filter((job) => textValue(job.status, '') === 'running').length;
   const completedCount = jobs.filter((job) => textValue(job.status, '') === 'completed').length;
   const failedCount = jobs.filter((job) => textValue(job.status, '') === 'failed').length;
@@ -2449,7 +2529,8 @@ async function activeRunJob(
   runDir: string,
   entry: Record<string, unknown>,
   planJob: Record<string, unknown> | undefined,
-  now: number
+  now: number,
+  readOptions: { includeUsage?: boolean } = {}
 ): Promise<Record<string, unknown>> {
   const jobId = textValue(entry.jobId, 'job');
   const jobDir = path.join(runDir, jobId);
@@ -2474,7 +2555,7 @@ async function activeRunJob(
     ...rawRunPatchCandidates(jobDir),
     ...(Object.keys(merge).length ? [mergePath] : [])
   ]);
-  const usage = await readCodexEventUsageSummary(eventsPath);
+  const usage = readOptions.includeUsage === false ? emptyCodexEventUsageSummary() : await readCodexEventUsageSummary(eventsPath);
   const task = recordValue(planJob?.task);
   const compute = recordValue(planJob?.compute);
   const changedPaths = uniquePaths([
