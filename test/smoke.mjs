@@ -236,6 +236,18 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
         disposition: 'failed',
         evidencePaths: []
       }
+    }, {
+      bucket: 'failed-evidence',
+      jobId: 'collection:copied-artifact:historical-failed',
+      bundle: {
+        jobId: 'collection:copied-artifact:historical-failed',
+        taskId: 'historical-failed-task',
+        lane: 'dedupe',
+        status: 'failed',
+        mergeReadiness: 'blocked',
+        disposition: 'failed',
+        evidencePaths: []
+      }
     }]
   }
 }, null, 2) + '\n');

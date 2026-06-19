@@ -23,6 +23,7 @@ const LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES = 400;
 const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
 const LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS = 32;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
+const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 2500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const dashboardStreamListeners = new Set<() => void>();
@@ -337,6 +338,16 @@ function debounce(fn: () => void | Promise<void>, delayMs: number): () => void {
   };
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function createDashboardWatchers(options: NormalizedLoomUiServerOptions, onChange: () => void): Promise<FSWatcher[]> {
   const roots = await dashboardWatchRoots(options);
   const watchers: FSWatcher[] = [];
@@ -504,16 +515,27 @@ async function readScopedDashboardSnapshot(
 async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown>> {
   const sources = await discoverLifetimeDashboardSources(options.cwd);
   const snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }> = [];
+  let skippedSourceCount = 0;
+  let timedOutSourceCount = 0;
   for (const source of sources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES)) {
     try {
-      const snapshot = await enrichLifetimeRunSnapshotEvidence(options.cwd, source, recordValue(await readScopedDashboardSnapshot({
-        ...options,
-        run: source.run,
-        collection: source.collection,
-        continuation: source.continuation
-      }, { includeActiveRun: false })));
+      const snapshot = await withTimeout(
+        (async () => {
+          const scopedSnapshot = await readScopedDashboardSnapshot({
+            ...options,
+            run: source.run,
+            collection: source.collection,
+            continuation: source.continuation
+          }, { includeActiveRun: false });
+          return enrichLifetimeRunSnapshotEvidence(options.cwd, source, recordValue(scopedSnapshot));
+        })(),
+        LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS,
+        `lifetime source timed out: ${source.path}`
+      );
       if (Object.keys(snapshot).length) snapshots.push({ source, snapshot });
-    } catch {
+    } catch (error) {
+      skippedSourceCount++;
+      if (error instanceof Error && error.message.startsWith('lifetime source timed out:')) timedOutSourceCount++;
       continue;
     }
   }
@@ -524,8 +546,16 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
     mergeReviewDecisionLists(await readCoordinatorReviewDecisions(options.cwd), await readAutonomousMergeDecisions(options.cwd)),
     await readLifetimeQueueBacklog(options.cwd)
   );
+  const lifetimeWithSourceHealth = {
+    ...lifetime,
+    sources: {
+      ...recordValue(lifetime.sources),
+      skippedSourceCount,
+      timedOutSourceCount
+    }
+  };
   return mergeLifetimeActiveRunSnapshot(
-    mergeLifetimeDrainCoordinatorSnapshot(lifetime, await readLatestDrainCoordinatorSnapshot(options.cwd)),
+    mergeLifetimeDrainCoordinatorSnapshot(lifetimeWithSourceHealth, await readLatestDrainCoordinatorSnapshot(options.cwd)),
     await readLifetimeActiveRunSnapshot(options)
   );
 }
@@ -739,10 +769,16 @@ function lifetimeReviewDedupeKey(job: Record<string, unknown>): string {
 }
 
 function canonicalLifetimeTaskKey(value: string): string {
-  return value
+  return unscopedLifetimeTaskKey(value)
     .trim()
     .replace(/(?:-continuation)?-rerun(?:-\d+)?$/u, '')
     .replace(/(?:-continuation)?-retry(?:-\d+)?$/u, '');
+}
+
+function unscopedLifetimeTaskKey(value: string): string {
+  const trimmed = value.trim();
+  const match = /^(?:run|collection|continuation):.+:([^:]+)$/u.exec(trimmed);
+  return match?.[1] ?? trimmed;
 }
 
 function isOpenCoordinatorReviewRecord(job: Record<string, unknown>): boolean {
@@ -988,21 +1024,25 @@ function combineLifetimeDashboardSnapshots(
   const autoDrainDelays = lifetimeAutoDrainDelayRecords(visibleSnapshots);
   const jobs = dedupeLifetimeDashboardJobs(collapseSupersededLifetimeReviewJobs(applyCoordinatorReviewDecisions(visibleSnapshots.flatMap(({ source, snapshot }) => {
     const autoDrainDelay = lifetimeAutoDrainDelayRecord(source, snapshot);
-    return recordArray(snapshot.jobs).map((job) => ({
-      ...job,
-      id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
-      originalJobId: textValue(job.id ?? job.jobId ?? job.taskId, 'job'),
-      sourceRun: source.run,
-      sourceCollection: source.collection,
-      sourceContinuation: source.continuation,
-      sourceLabel: source.label,
-      ...(autoDrainDelay ? {
-        coordinationDelay: autoDrainDelay.reason,
-        autoDrainSkippedReason: autoDrainDelay.skippedReason,
-        autoDrainDirtyPathCount: autoDrainDelay.dirtyPathCount
-      } : {}),
-      generatedAt: numberValue(job.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
-    }));
+    return recordArray(snapshot.jobs).map((job) => {
+      const sourceJobId = textValue(job.id ?? job.jobId ?? job.taskId, 'job');
+      return {
+        ...job,
+        id: lifetimeScopedId(source, sourceJobId),
+        sourceJobId,
+        originalJobId: unscopedLifetimeTaskKey(sourceJobId),
+        sourceRun: source.run,
+        sourceCollection: source.collection,
+        sourceContinuation: source.continuation,
+        sourceLabel: source.label,
+        ...(autoDrainDelay ? {
+          coordinationDelay: autoDrainDelay.reason,
+          autoDrainSkippedReason: autoDrainDelay.skippedReason,
+          autoDrainDirtyPathCount: autoDrainDelay.dirtyPathCount
+        } : {}),
+        generatedAt: numberValue(job.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
+      };
+    });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = recordArray(awaitNoop([]));
   const summary = {
