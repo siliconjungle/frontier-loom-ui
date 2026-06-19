@@ -226,9 +226,37 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
 }, null, 2) + '\n');
 await fs.writeFile(path.join(tmp, 'agent-runs', '.loom-ui-review-decisions.json'), JSON.stringify({
   decisions: [
-    { jobId: 'historical-ready', taskId: 'historical-ready-task', status: 'applied', decidedAt: new Date().toISOString() },
-    { jobId: 'historical-stale', taskId: 'historical-stale-task', status: 'rerun', decidedAt: new Date().toISOString() },
-    { jobId: 'historical-failed', taskId: 'historical-failed-task', status: 'rejected', decidedAt: new Date().toISOString() }
+    {
+      jobId: 'historical-ready',
+      taskId: 'historical-ready-task',
+      status: 'applied',
+      source: 'historical-review-drain-test',
+      latestPath: 'agent-runs/lifetime-dedupe-run/collected-resolved/queue-overlay.json',
+      decidedAt: new Date().toISOString()
+    },
+    {
+      jobId: 'historical-stale',
+      taskId: 'historical-stale-task',
+      status: 'rerun',
+      source: 'historical-review-drain-test',
+      latestPath: 'agent-runs/lifetime-dedupe-run/collected-resolved/queue-overlay.json',
+      decidedAt: new Date().toISOString()
+    },
+    {
+      jobId: 'historical-failed',
+      taskId: 'historical-failed-task',
+      status: 'rejected',
+      source: 'historical-review-drain-test',
+      latestPath: 'agent-runs/lifetime-dedupe-run/collected-resolved/queue-overlay.json',
+      decidedAt: new Date().toISOString()
+    },
+    {
+      jobId: 'active-live',
+      status: 'rejected',
+      source: 'historical-review-drain-test',
+      latestPath: 'agent-runs/some-old-run/auto-drain/collection-01/queue-overlay.json',
+      decidedAt: new Date().toISOString()
+    }
   ]
 }, null, 2) + '\n');
 await fs.writeFile(path.join(continuationDir, 'continuation.json'), JSON.stringify({
@@ -322,6 +350,10 @@ try {
     assert.equal(activeDashboard.summary.runningCount, 1);
     assert.equal(activeDashboard.summary.completedCount, 1);
     assert.equal(activeDashboard.jobs[0].model, 'gpt-5.5');
+    const liveJob = activeDashboard.jobs.find((job) => job.id === 'active-live' || job.jobId === 'active-live');
+    assert.ok(liveJob);
+    assert.equal(liveJob.status, 'running');
+    assert.notEqual(liveJob.bucket, 'review-resolved');
     assert.match(activeDashboard.sources.activeRun, /pids\.json$/);
   } finally {
     await activeServer.close();

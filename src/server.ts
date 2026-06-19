@@ -1414,6 +1414,7 @@ function coordinatorReviewDecisionMatches(job: Record<string, unknown>, decision
   if (!idMatches) return false;
   const decisionSource = textValue(decision.source ?? decision.sourceCollection ?? decision.sourceRun ?? decision.sourceLabel, '');
   if (!decisionSource) return true;
+  if (isHistoricalReviewDrainDecision(decision)) return historicalReviewDrainDecisionMatches(job, decision);
   const jobSources = [
     textValue(job.sourceLabel, ''),
     textValue(job.sourceCollection, ''),
@@ -1421,6 +1422,44 @@ function coordinatorReviewDecisionMatches(job: Record<string, unknown>, decision
     textValue(job.sourceContinuation, '')
   ].filter(Boolean);
   return jobSources.some((source) => source === decisionSource || source.endsWith(decisionSource) || decisionSource.endsWith(source));
+}
+
+function isHistoricalReviewDrainDecision(decision: CoordinatorReviewDecision): boolean {
+  const sources = [
+    textValue(decision.source, ''),
+    textValue(decision.sourceCollection, ''),
+    textValue(decision.sourceRun, ''),
+    textValue(decision.sourceLabel, ''),
+    textValue(decision.sourceArtifact, '')
+  ];
+  return sources.some((source) => normalized(source).includes('historical-review-drain'));
+}
+
+function historicalReviewDrainDecisionMatches(job: Record<string, unknown>, decision: CoordinatorReviewDecision): boolean {
+  if (normalized(job.status) === 'running' || normalized(job.bucket) === 'running') return false;
+  const latestPath = textValue(decision.latestPath, '');
+  if (!latestPath) return false;
+  const latestRoot = historicalReviewDrainSourceRoot(latestPath);
+  if (!latestRoot) return false;
+  const jobSources = [
+    textValue(job.sourceLabel, ''),
+    textValue(job.sourceCollection, ''),
+    textValue(job.sourceRun, ''),
+    textValue(job.sourceContinuation, '')
+  ].filter(Boolean);
+  return jobSources.some((source) => {
+    const jobRoot = historicalReviewDrainSourceRoot(source);
+    return Boolean(jobRoot) && (jobRoot === latestRoot || jobRoot.endsWith(latestRoot) || latestRoot.endsWith(jobRoot));
+  });
+}
+
+function historicalReviewDrainSourceRoot(value: string): string {
+  const normalizedPath = value.replaceAll('\\', '/').replace(/\/(?:queue-overlay|collection|coordinator-query|swarm-results|coordinator-dashboard)\.json$/u, '');
+  const autoDrainIndex = normalizedPath.indexOf('/auto-drain/');
+  if (autoDrainIndex >= 0) return normalizedPath.slice(0, autoDrainIndex);
+  const collectionIndex = normalizedPath.search(/\/(?:collection|collected|post-coordinator-collected|coordinator-collected)[^/]*(?:\/|$)/u);
+  if (collectionIndex >= 0) return normalizedPath.slice(0, collectionIndex);
+  return normalizedPath.replace(/\/$/u, '');
 }
 
 function coordinatorDecisionIds(record: Record<string, unknown>): string[] {
