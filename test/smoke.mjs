@@ -14,6 +14,8 @@ const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 
 const lifetimeDrainedRunDir = path.join(tmp, 'agent-runs', 'drained-autonomous-run', 'run-1');
 const lifetimeDrainedCollectionDir = path.join(lifetimeDrainedRunDir, 'auto-drain', 'collection-01-post-apply');
 const lifetimeDirtySkipRunDir = path.join(tmp, 'agent-runs', 'dirty-autodrain-run', 'run-1');
+const lifetimeFailedWithEvidenceRunDir = path.join(tmp, 'agent-runs', 'failed-with-evidence-run', 'run-1');
+const lifetimeFailedWithEvidenceJobDir = path.join(lifetimeFailedWithEvidenceRunDir, 'failed-with-evidence-job');
 const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
 const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
@@ -25,6 +27,7 @@ await fs.mkdir(lifetimeCurrentDir, { recursive: true });
 await fs.mkdir(lifetimeResolvedDir, { recursive: true });
 await fs.mkdir(lifetimeDrainedCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeDirtySkipRunDir, { recursive: true });
+await fs.mkdir(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence'), { recursive: true });
 await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
@@ -394,6 +397,56 @@ await fs.writeFile(path.join(lifetimeDirtySkipRunDir, 'swarm-results.json'), JSO
     }
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeFailedWithEvidenceRunDir, 'swarm-results.json'), JSON.stringify({
+  ok: false,
+  outDir: lifetimeFailedWithEvidenceRunDir,
+  run: {
+    id: 'failed-with-evidence-proof',
+    status: 'completed',
+    jobs: [{
+      id: 'failed-with-evidence-job',
+      taskId: 'failed-with-evidence-task',
+      title: 'Failed worker with usable evidence',
+      lane: 'failed-evidence',
+      status: 'failed'
+    }],
+    results: [{
+      jobId: 'failed-with-evidence-job',
+      status: 'failed',
+      startedAt: Date.now() - 3000,
+      finishedAt: Date.now() - 1000,
+      durationMs: 2000
+    }]
+  },
+  proof: {
+    summary: {
+      jobCount: 1,
+      completedCount: 0,
+      failedCount: 1,
+      blockedCount: 0
+    }
+  }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeFailedWithEvidenceJobDir, 'codex-events.jsonl'), JSON.stringify({ type: 'turn.failed', error: 'fixture failure after patch generation' }) + '\n');
+await fs.writeFile(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence', 'merge.json'), JSON.stringify({
+  jobId: 'failed-with-evidence-job',
+  taskId: 'failed-with-evidence-task',
+  status: 'failed',
+  mergeReadiness: 'rejected',
+  disposition: 'rejected',
+  changedPaths: ['src/failed-worker.ts'],
+  reasons: ['failed', 'rejected']
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence', 'changes.patch'), [
+  'diff --git a/src/failed-worker.ts b/src/failed-worker.ts',
+  'index 1111111..2222222 100644',
+  '--- a/src/failed-worker.ts',
+  '+++ b/src/failed-worker.ts',
+  '@@ -1 +1 @@',
+  '-export const failedWorker = false;',
+  '+export const failedWorker = true;',
+  ''
+].join('\n'));
 await fs.writeFile(path.join(lifetimeRedrainCollectionDir, 'collection.json'), JSON.stringify({
   ok: false,
   generatedAt: Date.now() - 500,
@@ -569,16 +622,17 @@ try {
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 7);
+    assert.equal(lifetimeDashboard.summary.jobCount, 8);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
     assert.equal(lifetimeDashboard.summary.dirtyAutoDrainSkipCount, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['ready-to-apply'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['failed-evidence'] ?? 0, 0);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['worker-failed'] ?? 0, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 5);
     assert.equal(lifetimeDashboard.health.summary.readyToApplyJobCount, 0);
-    assert.equal(lifetimeDashboard.health.summary.failedJobCount, 0);
+    assert.equal(lifetimeDashboard.health.summary.failedJobCount, 1);
     const dedupeJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dedupe-job');
     assert.ok(dedupeJob);
     assert.match(dedupeJob.sourceLabel, /collected-resolved/);
@@ -599,6 +653,12 @@ try {
     assert.equal(dirtySkipJob.status, 'completed');
     assert.equal(dirtySkipJob.coordinationDelay, 'apply-delayed-by-dirty-worktree');
     assert.equal(dirtySkipJob.autoDrainSkippedReason, 'dirty-worktree');
+    const failedWithEvidenceJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'failed-with-evidence-job');
+    assert.ok(failedWithEvidenceJob);
+    assert.equal(failedWithEvidenceJob.status, 'failed');
+    assert.equal(failedWithEvidenceJob.bucket, 'worker-failed');
+    assert.equal(failedWithEvidenceJob.evidencePathCount >= 3, true);
+    assert.deepEqual(failedWithEvidenceJob.changedPaths, ['src/failed-worker.ts']);
     assert.equal(lifetimeDashboard.raw.lifetime.autoDrainDelays.length, 1);
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);

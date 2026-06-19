@@ -1831,6 +1831,7 @@ function coordinatorFacingSignalLabel(value: unknown): string {
   if (normalizedValue === 'needs-human-review' || normalizedValue === 'needs-coordinator-review') return 'needs coordinator review';
   if (normalizedValue === 'needs-human-decision' || normalizedValue === 'needs-coordinator-decision') return 'needs coordinator decision';
   if (normalizedValue === 'failed-evidence') return 'failed evidence';
+  if (normalizedValue === 'worker-failed') return 'failed worker';
   if (normalizedValue === 'ready-to-apply') return 'ready to apply';
   if (normalizedValue === 'patch-candidate') return 'patch candidate';
   return sentenceCaseIdentifier(raw);
@@ -3781,6 +3782,7 @@ function isFailedJob(job: Record<string, unknown>): boolean {
   const readiness = normalized(job.mergeReadiness);
   return status === 'failed'
     || bucket === 'failed-evidence'
+    || bucket === 'worker-failed'
     || disposition === 'rejected'
     || disposition === 'failed'
     || readiness.includes('failed');

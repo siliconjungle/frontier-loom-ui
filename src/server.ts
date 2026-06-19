@@ -460,12 +460,12 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
   const snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }> = [];
   for (const source of sources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES)) {
     try {
-      const snapshot = recordValue(await readScopedDashboardSnapshot({
+      const snapshot = await enrichLifetimeRunSnapshotEvidence(options.cwd, source, recordValue(await readScopedDashboardSnapshot({
         ...options,
         run: source.run,
         collection: source.collection,
         continuation: source.continuation
-      }));
+      })));
       if (Object.keys(snapshot).length) snapshots.push({ source, snapshot });
     } catch {
       continue;
@@ -1066,6 +1066,152 @@ function lifetimeAutoDrainDelayRecord(
     remainingReadyCount: numberValue(summary.remainingReadyCount),
     generatedAt: numberValue(autoDrain.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
   };
+}
+
+async function enrichLifetimeRunSnapshotEvidence(
+  cwd: string,
+  source: LifetimeDashboardSource,
+  snapshot: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  if (source.kind !== 'run' || !source.run) return snapshot;
+  const runRoot = safeCwdRelativeDirectory(cwd, source.run);
+  if (!runRoot) return snapshot;
+  const jobs = recordArray(snapshot.jobs);
+  if (!jobs.length) return snapshot;
+  const enrichedJobs = await Promise.all(jobs.map((job) => enrichLifetimeRunJobEvidence(cwd, runRoot, job)));
+  return {
+    ...snapshot,
+    jobs: enrichedJobs
+  };
+}
+
+async function enrichLifetimeRunJobEvidence(
+  cwd: string,
+  runRoot: string,
+  job: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const jobDir = await findBestRawRunJobDir(runRoot, rawRunJobIdCandidates(job));
+  if (!jobDir) return job;
+  const evidenceDir = path.join(jobDir, 'evidence');
+  const rootMerge = recordValue(await readJsonFile(path.join(jobDir, 'merge.json')));
+  const evidenceMerge = recordValue(await readJsonFile(path.join(evidenceDir, 'merge.json')));
+  const merge = Object.keys(rootMerge).length ? rootMerge : evidenceMerge;
+  const rawPatchPath = await firstExistingRelativePath(cwd, rawRunPatchCandidates(jobDir));
+  const evidencePaths = await existingRelativePaths(cwd, [
+    path.join(jobDir, 'last-message.md'),
+    path.join(jobDir, 'codex-events.jsonl'),
+    path.join(jobDir, 'merge.json'),
+    path.join(evidenceDir, 'last-message.md'),
+    path.join(evidenceDir, 'handoff.md'),
+    path.join(evidenceDir, 'evidence.json'),
+    path.join(evidenceDir, 'merge.json'),
+    path.join(evidenceDir, 'human-question.json'),
+    path.join(evidenceDir, 'resource-allocation.json'),
+    path.join(evidenceDir, 'model-availability.json'),
+    ...rawRunPatchCandidates(jobDir)
+  ]);
+  if (!evidencePaths.length && !rawPatchPath && !Object.keys(merge).length) return job;
+
+  const patchChangedPaths = await readPatchChangedPathList(cwd, rawPatchPath);
+  const changedPaths = uniquePaths([
+    ...stringArray(job.changedPaths),
+    ...stringArray(merge.changedPaths),
+    ...patchChangedPaths
+  ]);
+  const status = lifetimeRunEvidenceStatus(job, merge, evidencePaths);
+  const bucket = lifetimeRunEvidenceBucket(job, status, evidencePaths, rawPatchPath);
+  const collectReasonClasses = uniquePaths([
+    ...stringArray(job.collectReasonClasses),
+    status === 'failed' && evidencePaths.length ? 'worker failed with evidence' : 'raw run evidence discovered'
+  ]);
+  const mergedEvidencePaths = uniquePaths([...stringArray(job.evidencePaths), ...evidencePaths]);
+  return {
+    ...job,
+    status,
+    bucket,
+    disposition: textValue(merge.disposition, textValue(job.disposition, status)),
+    mergeReadiness: textValue(merge.mergeReadiness, textValue(job.mergeReadiness, status)),
+    ...(rawPatchPath ? { patchPath: rawPatchPath, artifactPaths: uniquePaths([rawPatchPath, ...stringArray(job.artifactPaths)]) } : {}),
+    changedPaths,
+    changedPathCount: changedPaths.length || numberValue(job.changedPathCount),
+    evidencePaths: mergedEvidencePaths,
+    evidencePathCount: mergedEvidencePaths.length,
+    commandsPassed: recordArray(job.commandsPassed).length ? recordArray(job.commandsPassed) : recordArray(merge.commandsPassed),
+    commandsFailed: recordArray(job.commandsFailed).length ? recordArray(job.commandsFailed) : recordArray(merge.commandsFailed),
+    collectReasonClasses,
+    runEvidenceRecovered: true
+  };
+}
+
+function rawRunJobIdCandidates(job: Record<string, unknown>): string[] {
+  const values = [
+    textValue(job.originalJobId, ''),
+    textValue(job.jobId, ''),
+    textValue(job.id, ''),
+    textValue(job.taskId, '')
+  ].filter(Boolean);
+  const out = new Set<string>();
+  for (const value of values) {
+    out.add(value);
+    const parts = value.split(':').filter(Boolean);
+    if (parts.length) out.add(parts[parts.length - 1]);
+  }
+  return Array.from(out);
+}
+
+async function findBestRawRunJobDir(runRoot: string, candidates: string[]): Promise<string | undefined> {
+  const matches = new Map<string, number>();
+  for (const candidate of candidates) {
+    const direct = path.join(runRoot, candidate);
+    if (await rawRunJobHasArtifacts(direct)) matches.set(direct, await rawRunJobEvidenceScore(direct));
+    for (const match of await findRawRunJobDirs(runRoot, candidate, 0)) {
+      matches.set(match, await rawRunJobEvidenceScore(match));
+    }
+  }
+  return Array.from(matches.entries()).sort((left, right) => right[1] - left[1] || right[0].localeCompare(left[0]))[0]?.[0];
+}
+
+async function rawRunJobEvidenceScore(jobDir: string): Promise<number> {
+  let score = 0;
+  for (const [relative, weight] of [
+    ['last-message.md', 100],
+    ['evidence/merge.json', 80],
+    ['merge.json', 80],
+    ['evidence/evidence.json', 50],
+    ['evidence/changes.patch', 40],
+    ['changes.patch', 40],
+    ['codex-events.jsonl', 20]
+  ] as const) {
+    const stat = await fs.stat(path.join(jobDir, relative)).catch(() => undefined);
+    if (stat?.isFile()) score += weight + Math.min(10, Math.floor(stat.size / 1024));
+  }
+  const stat = await fs.stat(jobDir).catch(() => undefined);
+  return score + Math.floor((stat?.mtimeMs ?? 0) / 1_000_000_000);
+}
+
+function lifetimeRunEvidenceStatus(
+  job: Record<string, unknown>,
+  merge: Record<string, unknown>,
+  evidencePaths: string[]
+): string {
+  const mergeStatus = textValue(coordinatorFacingMachineLabel(merge.status), '');
+  if (mergeStatus) return mergeStatus;
+  const status = textValue(coordinatorFacingMachineLabel(job.status), '');
+  if (status) return status === 'failed' && evidencePaths.some((entry) => entry.endsWith('last-message.md')) ? 'completed' : status;
+  return evidencePaths.some((entry) => entry.endsWith('last-message.md')) ? 'completed' : 'failed';
+}
+
+function lifetimeRunEvidenceBucket(
+  job: Record<string, unknown>,
+  status: string,
+  evidencePaths: string[],
+  patchPath: string | undefined
+): string {
+  const bucket = textValue(coordinatorFacingMachineLabel(job.bucket), '');
+  if (status === 'running') return 'running';
+  if (status === 'completed') return bucket && bucket !== 'failed-evidence' ? bucket : 'completed';
+  if (status === 'failed' && (evidencePaths.length || patchPath)) return 'worker-failed';
+  return bucket || (status === 'failed' ? 'failed-evidence' : status);
 }
 
 async function readLatestDrainCoordinatorSnapshot(cwd: string): Promise<Record<string, unknown> | undefined> {
