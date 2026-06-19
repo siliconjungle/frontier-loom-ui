@@ -659,7 +659,7 @@ function dedupeLifetimeDashboardJobs(jobs: Array<Record<string, unknown>>): Arra
 }
 
 function lifetimeJobDedupeKey(job: Record<string, unknown>): string {
-  return textValue(job.originalJobId ?? job.taskId ?? job.id ?? job.jobId, '').trim();
+  return canonicalLifetimeTaskKey(textValue(job.originalJobId ?? job.taskId ?? job.id ?? job.jobId, ''));
 }
 
 function compareLifetimeJobPreference(left: Record<string, unknown>, right: Record<string, unknown>): number {
@@ -685,7 +685,14 @@ function lifetimeJobPreference(job: Record<string, unknown>): number {
 }
 
 function lifetimeReviewDedupeKey(job: Record<string, unknown>): string {
-  return textValue(job.originalJobId ?? job.jobId ?? job.taskId, '').trim();
+  return canonicalLifetimeTaskKey(textValue(job.originalJobId ?? job.jobId ?? job.taskId, ''));
+}
+
+function canonicalLifetimeTaskKey(value: string): string {
+  return value
+    .trim()
+    .replace(/(?:-continuation)?-rerun(?:-\d+)?$/u, '')
+    .replace(/(?:-continuation)?-retry(?:-\d+)?$/u, '');
 }
 
 function isOpenCoordinatorReviewRecord(job: Record<string, unknown>): boolean {
