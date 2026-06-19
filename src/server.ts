@@ -14,16 +14,25 @@ const ARTIFACT_VIEW_MAX_BYTES = 768 * 1024;
 const ARTIFACT_DIRECTORY_MAX_ENTRIES = 200;
 const HUMAN_ACTION_ANSWER_MAX_BYTES = 16 * 1024;
 const CODEX_EVENTS_USAGE_MAX_BYTES = 8 * 1024 * 1024;
+const DASHBOARD_SNAPSHOT_CACHE_MS = 1500;
 const LIFETIME_DASHBOARD_MAX_SOURCES = 80;
 const LIFETIME_DASHBOARD_MAX_JOBS = 800;
 const LIFETIME_DASHBOARD_SCAN_MAX_FILES = 600;
 const LIFETIME_DASHBOARD_SCAN_MAX_DEPTH = 5;
 const LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES = 400;
 const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
+const LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS = 32;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const dashboardStreamListeners = new Set<() => void>();
+
+let dashboardSnapshotCache: {
+  key: string;
+  at: number;
+  value?: unknown;
+  pending?: Promise<unknown>;
+} | undefined;
 
 export interface FrontierLoomUiServerOptions {
   cwd?: string;
@@ -222,7 +231,7 @@ async function handleRequest(
   } else if (request.method === 'GET' && url.pathname === '/api/dashboard/stream') {
     await streamDashboard(request, response, options);
   } else if (request.method === 'GET' && url.pathname === '/api/dashboard') {
-    writeJson(response, 200, await readDashboardSnapshot(options));
+    writeJson(response, 200, await readDashboardSnapshotCached(options));
   } else if (request.method === 'GET' && url.pathname === '/api/task-details') {
     writeJson(response, 200, await readTaskDetails(
       options,
@@ -272,7 +281,7 @@ async function streamDashboard(
     if (closed || pending) return;
     pending = true;
     try {
-      const snapshot = await readDashboardSnapshot(options);
+      const snapshot = await readDashboardSnapshotCached(options);
       const signature = dashboardStreamSignature(snapshot);
       const body = JSON.stringify(snapshot);
       if (signature !== lastSignature) {
@@ -345,7 +354,10 @@ async function createDashboardWatchers(options: NormalizedLoomUiServerOptions, o
 
 function watchDirectory(root: string, recursive: boolean, onChange: () => void): FSWatcher | undefined {
   try {
-    return watch(root, { recursive }, onChange);
+    return watch(root, { recursive }, () => {
+      invalidateDashboardSnapshotCache();
+      onChange();
+    });
   } catch {
     return undefined;
   }
@@ -407,9 +419,40 @@ async function readDashboardSnapshot(options: NormalizedLoomUiServerOptions): Pr
   return readScopedDashboardSnapshot(options);
 }
 
-async function readScopedDashboardSnapshot(options: NormalizedLoomUiServerOptions): Promise<unknown> {
+async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOptions): Promise<unknown> {
+  const key = JSON.stringify(dashboardInput(options));
+  const now = Date.now();
+  if (dashboardSnapshotCache?.key === key) {
+    if (dashboardSnapshotCache.value !== undefined && now - dashboardSnapshotCache.at < DASHBOARD_SNAPSHOT_CACHE_MS) {
+      return dashboardSnapshotCache.value;
+    }
+    if (dashboardSnapshotCache.pending) return dashboardSnapshotCache.pending;
+  }
+  const pending = readDashboardSnapshot(options).then((value) => {
+    dashboardSnapshotCache = { key, at: Date.now(), value };
+    return value;
+  }, (error) => {
+    if (dashboardSnapshotCache?.key === key) {
+      dashboardSnapshotCache = dashboardSnapshotCache.value === undefined
+        ? undefined
+        : { key, at: dashboardSnapshotCache.at, value: dashboardSnapshotCache.value };
+    }
+    throw error;
+  });
+  dashboardSnapshotCache = { key, at: now, value: dashboardSnapshotCache?.key === key ? dashboardSnapshotCache.value : undefined, pending };
+  return pending;
+}
+
+function invalidateDashboardSnapshotCache(): void {
+  dashboardSnapshotCache = undefined;
+}
+
+async function readScopedDashboardSnapshot(
+  options: NormalizedLoomUiServerOptions,
+  readOptions: { includeActiveRun?: boolean } = {}
+): Promise<unknown> {
   const snapshot = await readCodexDashboardSnapshot(dashboardInput(options));
-  const activeRunSnapshot = await readActiveRunSnapshot(options);
+  const activeRunSnapshot = readOptions.includeActiveRun === false ? undefined : await readActiveRunSnapshot(options);
   const reviewDecisions = await readCoordinatorReviewDecisions(options.cwd);
   const autonomousDecisions = await readAutonomousMergeDecisions(options.cwd);
   const decisions = mergeReviewDecisionLists(reviewDecisions, autonomousDecisions);
@@ -465,7 +508,7 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
         run: source.run,
         collection: source.collection,
         continuation: source.continuation
-      })));
+      }, { includeActiveRun: false })));
       if (Object.keys(snapshot).length) snapshots.push({ source, snapshot });
     } catch {
       continue;
@@ -478,7 +521,10 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
     mergeReviewDecisionLists(await readCoordinatorReviewDecisions(options.cwd), await readAutonomousMergeDecisions(options.cwd)),
     await readLifetimeQueueBacklog(options.cwd)
   );
-  return mergeLifetimeDrainCoordinatorSnapshot(lifetime, await readLatestDrainCoordinatorSnapshot(options.cwd));
+  return mergeLifetimeActiveRunSnapshot(
+    mergeLifetimeDrainCoordinatorSnapshot(lifetime, await readLatestDrainCoordinatorSnapshot(options.cwd)),
+    await readLifetimeActiveRunSnapshot(options)
+  );
 }
 
 interface LifetimeDashboardSource {
@@ -519,7 +565,9 @@ async function discoverLifetimeDashboardSources(cwd: string): Promise<LifetimeDa
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
     const hasCollection = entry.files.has('collection.json') || entry.files.has('coordinator-query.json');
     const hasContinuation = entry.files.has('continuation.json');
-    const hasRun = entry.files.has('swarm-results.json') || entry.files.has('pids.json') || entry.files.has('coordinator-dashboard.json');
+    const hasCompletedRun = entry.files.has('swarm-results.json') || entry.files.has('coordinator-dashboard.json');
+    const hasLivePidRun = entry.files.has('pids.json') && await pidManifestHasLiveCodexEntry(path.join(dir, 'pids.json'));
+    const hasRun = hasCompletedRun || hasLivePidRun;
     if (hasCollection) {
       out.push({
         id: `collection:${relative}`,
@@ -1536,6 +1584,154 @@ function mergeLifetimeDrainCoordinatorSnapshot(
   };
 }
 
+function mergeLifetimeActiveRunSnapshot(
+  lifetime: Record<string, unknown>,
+  active: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  const activeJobs = recordArray(active?.jobs).filter((job) => textValue(job.status, '') === 'running');
+  if (!activeJobs.length) return lifetime;
+  const activeKeys = new Set(activeJobs.map(lifetimeJobDedupeKey).filter(Boolean));
+  const existingJobs = recordArray(lifetime.jobs).filter((job) => !activeKeys.has(lifetimeJobDedupeKey(job)));
+  const jobs = [...activeJobs, ...existingJobs].slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
+  const events = [...recordArray(lifetime.events), ...recordArray(active?.events)]
+    .sort((left, right) => numberValue(left.at) - numberValue(right.at))
+    .slice(-160);
+  return {
+    ...lifetime,
+    generatedAt: Math.max(numberValue(lifetime.generatedAt), numberValue(active?.generatedAt), Date.now()),
+    sources: {
+      ...recordValue(lifetime.sources),
+      ...recordValue(active?.sources)
+    },
+    summary: lifetimeDashboardSummary(jobs),
+    health: lifetimeHealthSummary(jobs),
+    lanes: lifetimeLaneRows(jobs),
+    capacity: lifetimeCapacitySummary(
+      {
+        entries: recordArray(recordValue(lifetime.backlog).entries),
+        manifests: recordArray(recordValue(recordValue(lifetime.raw).lifetime).manifests) as unknown as LifetimeQueueCapacityManifest[],
+        sourceCount: numberValue(recordValue(lifetime.backlog).entryCount),
+        paths: stringArray(recordValue(recordValue(lifetime.raw).lifetime).queueSources),
+        generatedAt: numberValue(lifetime.generatedAt)
+      },
+      jobs,
+      recordArray(recordValue(lifetime.backlog).entries)
+    ),
+    jobs,
+    events,
+    raw: {
+      ...recordValue(lifetime.raw),
+      activeRuns: recordValue(recordValue(active?.raw).activeRuns)
+    }
+  };
+}
+
+async function readLifetimeActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown> | undefined> {
+  const runDirs = await findLifetimeActiveRunDirs(options.cwd);
+  const jobs: Array<Record<string, unknown>> = [];
+  const sources: string[] = [];
+  for (const runDir of runDirs) {
+    const relative = path.relative(options.cwd, runDir);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+    const sourceStat = await fs.stat(runDir).catch(() => undefined);
+    const source: LifetimeDashboardSource = {
+      id: `run:${relative}`,
+      label: lifetimeSourceLabel(relative),
+      path: relative,
+      kind: 'run',
+      mtimeMs: sourceStat?.mtimeMs ?? Date.now(),
+      run: relative
+    };
+    const snapshot = recordValue(await readActiveRunSnapshot({ ...options, run: relative }));
+    const runningJobs = recordArray(snapshot.jobs)
+      .filter((job) => textValue(job.status, '') === 'running')
+      .map((job) => ({
+        ...job,
+        id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
+        originalJobId: textValue(job.id ?? job.jobId ?? job.taskId, 'job'),
+        sourceRun: source.run,
+        sourceLabel: source.label,
+        generatedAt: Date.now()
+      }));
+    if (!runningJobs.length) continue;
+    jobs.push(...runningJobs);
+    sources.push(relative);
+  }
+  if (!jobs.length) return undefined;
+  const generatedAt = Date.now();
+  return {
+    ok: true,
+    generatedAt,
+    cwd: options.cwd,
+    sources: {
+      activeRuns: sources,
+      activeRunCount: sources.length
+    },
+    summary: lifetimeDashboardSummary(jobs),
+    lanes: lifetimeLaneRows(jobs),
+    jobs,
+    events: activeRunEvents(jobs),
+    raw: {
+      activeRuns: {
+        runDirs: sources,
+        jobCount: jobs.length,
+        runningCount: jobs.length
+      }
+    }
+  };
+}
+
+async function findLifetimeActiveRunDirs(cwd: string): Promise<string[]> {
+  const root = path.join(cwd, 'agent-runs');
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) return [];
+  const resetAt = await readLifetimeDashboardResetCutoff(root);
+  const files = await findPidManifestFiles(root, LIFETIME_DASHBOARD_SCAN_MAX_DEPTH, LIFETIME_DASHBOARD_SCAN_MAX_FILES, resetAt);
+  const candidates = await Promise.all(files.map(async (file) => ({
+    file,
+    dir: path.dirname(file),
+    mtimeMs: (await fs.stat(file).catch(() => undefined))?.mtimeMs ?? 0
+  })));
+  const out: string[] = [];
+  for (const candidate of candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || right.file.localeCompare(left.file))) {
+    if (out.length >= LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS) break;
+    if (await pidManifestHasLiveCodexEntry(candidate.file)) out.push(candidate.dir);
+  }
+  return uniquePaths(out);
+}
+
+async function findPidManifestFiles(root: string, maxDepth: number, maxFiles: number, resetAt: number): Promise<string[]> {
+  const out: string[] = [];
+  const skipDirs = new Set(['.git', 'node_modules', 'dist', 'coverage', 'evidence', 'streams', 'patch-scores', 'apply-ledger', 'artifact-index']);
+  async function walk(current: string, depth: number): Promise<void> {
+    if (out.length >= maxFiles || depth > maxDepth) return;
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (out.length >= maxFiles) return;
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (skipDirs.has(entry.name) || entry.name.startsWith('.')) continue;
+        if (resetAt && depth === 0) {
+          const dirStat = await fs.stat(absolute).catch(() => undefined);
+          if ((dirStat?.mtimeMs ?? 0) <= resetAt) continue;
+        }
+        await walk(absolute, depth + 1);
+      } else if (entry.isFile() && entry.name === 'pids.json') {
+        out.push(absolute);
+      }
+    }
+  }
+  await walk(root, 0);
+  return out;
+}
+
+async function pidManifestHasLiveCodexEntry(file: string): Promise<boolean> {
+  const manifest = recordValue(await readJsonFile(file));
+  return recordArray(manifest.entries)
+    .filter((entry) => textValue(entry.role, '') === 'codex')
+    .some((entry) => isProcessLive(numberValue(entry.pid), entry));
+}
+
 async function readCoordinatorReviewDecisions(cwd: string): Promise<CoordinatorReviewDecision[]> {
   const file = coordinatorReviewDecisionPath(cwd);
   const raw = await readJsonFile(file);
@@ -2201,7 +2397,7 @@ async function readActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Pr
   const plan = recordValue(await readJsonFile(planPath));
   const planJobs = new Map(recordArray(plan.jobs).map((job) => [textValue(job.id, ''), job]));
   const now = Date.now();
-  const jobs = await Promise.all(entries.map((entry) => activeRunJob(runDir, entry, planJobs.get(textValue(entry.jobId, '')), now)));
+  const jobs = await Promise.all(entries.map((entry) => activeRunJob(options.cwd, runDir, entry, planJobs.get(textValue(entry.jobId, '')), now)));
   const runningCount = jobs.filter((job) => textValue(job.status, '') === 'running').length;
   const completedCount = jobs.filter((job) => textValue(job.status, '') === 'completed').length;
   const failedCount = jobs.filter((job) => textValue(job.status, '') === 'failed').length;
@@ -2249,6 +2445,7 @@ async function readActiveRunSnapshot(options: NormalizedLoomUiServerOptions): Pr
 }
 
 async function activeRunJob(
+  cwd: string,
   runDir: string,
   entry: Record<string, unknown>,
   planJob: Record<string, unknown> | undefined,
@@ -2266,7 +2463,6 @@ async function activeRunJob(
   const status = live && !lastMessage ? 'running' : quotaDeferred ? 'completed' : lastMessage || Object.keys(merge).length ? 'completed' : 'failed';
   const startedAt = numberValue(entry.startedAt);
   const finishedAt = status === 'running' ? undefined : Math.max(numberValue(lastMessage?.mtimeMs), numberValue(merge.generatedAt));
-  const cwd = optionsSafeCwd(runDir);
   const rawPatchPath = await firstExistingRelativePath(cwd, rawRunPatchCandidates(jobDir));
   const evidencePaths = await existingRelativePaths(cwd, [
     lastMessagePath,
@@ -2609,10 +2805,6 @@ function processCommandMatchesPidManifest(command: string, entry: Record<string,
   return true;
 }
 
-function optionsSafeCwd(runDir: string): string {
-  return path.dirname(path.dirname(runDir));
-}
-
 async function readTaskDetails(
   options: NormalizedLoomUiServerOptions,
   jobId: string,
@@ -2789,6 +2981,7 @@ async function writeHumanActionAnswer(
 }
 
 function notifyDashboardStreams(): void {
+  invalidateDashboardSnapshotCache();
   for (const listener of dashboardStreamListeners) listener();
 }
 
