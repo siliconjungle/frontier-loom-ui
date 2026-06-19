@@ -659,6 +659,7 @@ try {
     assert.equal(failedWithEvidenceJob.bucket, 'worker-failed');
     assert.equal(failedWithEvidenceJob.evidencePathCount >= 3, true);
     assert.deepEqual(failedWithEvidenceJob.changedPaths, ['src/failed-worker.ts']);
+    assert.deepEqual(failedWithEvidenceJob.reasons, ['failed', 'rejected']);
     assert.equal(lifetimeDashboard.raw.lifetime.autoDrainDelays.length, 1);
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);

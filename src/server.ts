@@ -1136,6 +1136,7 @@ async function enrichLifetimeRunJobEvidence(
     changedPathCount: changedPaths.length || numberValue(job.changedPathCount),
     evidencePaths: mergedEvidencePaths,
     evidencePathCount: mergedEvidencePaths.length,
+    reasons: stringArray(job.reasons).length ? stringArray(job.reasons) : stringArray(merge.reasons),
     commandsPassed: recordArray(job.commandsPassed).length ? recordArray(job.commandsPassed) : recordArray(merge.commandsPassed),
     commandsFailed: recordArray(job.commandsFailed).length ? recordArray(job.commandsFailed) : recordArray(merge.commandsFailed),
     collectReasonClasses,
