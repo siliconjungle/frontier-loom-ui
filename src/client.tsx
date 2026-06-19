@@ -668,7 +668,7 @@ function contentPanel(tab: ContentTab, input: {
   if (tab === 'work') return <Panel title="Overview" meta={`${text(input.visibleJobs.length)} tasks`} hideHead>
     <WorkOverview dashboard={input.dashboard} lanes={input.lanes} jobs={input.visibleJobs} attention={input.attention} audit={input.audit} success={input.success} />
   </Panel>;
-  if (tab === 'board') return <Panel title="Task board" meta={boardPanelMeta(boardItems.length, input.visibleJobs.length)}>
+  if (tab === 'board') return <Panel title="Task board" meta={boardPanelMeta(input.dashboard, boardItems, input.visibleJobs)}>
     <TaskBoard dashboard={input.dashboard} jobs={input.visibleJobs} />
   </Panel>;
   if (tab === 'swarm') {
@@ -692,9 +692,12 @@ function contentPanel(tab: ContentTab, input: {
   </Panel>;
 }
 
-function boardPanelMeta(visibleCount: number, totalCount: number): string {
-  if (visibleCount === totalCount) return `${text(visibleCount)} tasks`;
-  return `${text(visibleCount)} visible · ${text(totalCount)} lifetime`;
+function boardPanelMeta(dashboard: Dashboard, items: TaskBoardItem[], jobs: Array<Record<string, unknown>>): string {
+  const scope = boardScopeLabel(dashboard);
+  const hiddenCount = Math.max(0, jobs.length - items.filter((item) => item.boardKind !== 'backlog').length);
+  const doneCount = items.filter((item) => taskBoardColumnId(item) === 'done').length;
+  if (hiddenCount) return `${text(items.length)} ${scope} tasks · ${text(doneCount)} done · ${text(hiddenCount)} hidden resolved noise`;
+  return `${text(items.length)} ${scope} tasks · ${text(doneCount)} done`;
 }
 
 function Panel({ title, meta, children, className, hideHead = false }: { title: string; meta?: string; children: unknown; className?: string; hideHead?: boolean }): Node {
@@ -861,10 +864,12 @@ function costMetric(label: string, value: string, detail: string): Node {
 
 function TaskBoard({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Record<string, unknown>> }): Node {
   const items = taskBoardItems(dashboard, jobs);
-  const columns = taskBoardColumns(items);
+  const sourceKind = dashboardSourceKind(dashboard);
+  const scope = boardScopeLabel(dashboard);
+  const columns = taskBoardColumns(items, sourceKind);
   const activeCount = columns.reduce((sum, column) => column.id === 'done' ? sum : sum + column.items.length, 0);
   return <div className="task-board-layout" data-scroll-id="task-board">
-    <div className="task-board-scroll" data-scroll-id="task-board-x" aria-label={`${text(items.length)} AI-managed tasks, ${text(activeCount)} not done`}>
+    <div className="task-board-scroll" data-scroll-id="task-board-x" aria-label={`${text(items.length)} ${scope} AI-managed tasks, ${text(activeCount)} not done`}>
       {columns.map((column) => <section className={`task-board-column ${column.id}`} aria-label={`${column.title}: ${text(column.items.length)} tasks`}>
         <header className="task-column-head">
           <div>
@@ -1341,14 +1346,15 @@ function backlogBoardItems(dashboard: Dashboard): TaskBoardItem[] {
   });
 }
 
-function taskBoardColumns(items: TaskBoardItem[]): TaskBoardColumn[] {
+function taskBoardColumns(items: TaskBoardItem[], sourceKind: ReturnType<typeof dashboardSourceKind> = 'snapshot'): TaskBoardColumn[] {
+  const doneDetail = sourceKind === 'lifetime' ? 'lifetime completed output' : 'completed output';
   const columns: TaskBoardColumn[] = [
     { id: 'backlog', title: 'Backlog', detail: 'not scheduled yet', empty: 'No backlog items.', items: [] },
     { id: 'todo', title: 'To do', detail: 'ready to start', empty: 'No queued tasks.', items: [] },
     { id: 'active', title: 'Active', detail: 'running work', empty: 'No active tasks.', items: [] },
     { id: 'review', title: 'Coordinator review', detail: 'needs decision', empty: 'No tasks need coordinator review.', items: [] },
     { id: 'ready', title: 'Ready', detail: 'ready to apply', empty: 'No ready patches.', items: [] },
-    { id: 'done', title: 'Done', detail: 'completed output', empty: 'No completed tasks.', items: [] },
+    { id: 'done', title: 'Done', detail: doneDetail, empty: 'No completed tasks.', items: [] },
     { id: 'blocked', title: 'Blocked', detail: 'waiting or impossible', empty: 'No genuinely blocked tasks.', items: [] }
   ];
   const byId = new Map(columns.map((column) => [column.id, column]));
@@ -3622,6 +3628,14 @@ function dashboardSourceSmokeMarker(kind: ReturnType<typeof dashboardSourceKind>
   if (kind === 'live') return 'live-source-strip';
   if (kind === 'stopped') return 'stopped-source-strip';
   return 'snapshot-source-strip';
+}
+
+function boardScopeLabel(dashboard: Dashboard): string {
+  const kind = dashboardSourceKind(dashboard);
+  if (kind === 'lifetime') return 'lifetime';
+  if (kind === 'live' || kind === 'stopped') return 'run';
+  if (kind === 'demo') return 'demo';
+  return 'snapshot';
 }
 
 function riskStatusLabel(dashboard: Dashboard, attention: AttentionSummary, loaded: boolean): string {
