@@ -3640,7 +3640,7 @@ function isReadyJob(job: Record<string, unknown>): boolean {
 function jobRiskLabel(job: Record<string, unknown>): string {
   const risk = jobRisk(job);
   if (isBlockedJob(job)) return 'blocked';
-  if (risk === 'failed') return 'review';
+  if (risk === 'failed') return 'failed';
   if (risk === 'stale') return 'stale';
   if (risk === 'review') return 'review';
   if (risk === 'ready') return 'ready';
@@ -3697,8 +3697,6 @@ function isNeedsCoordinatorPortJob(job: Record<string, unknown>): boolean {
 function isCoordinatorReviewJob(job: Record<string, unknown>): boolean {
   if (isResolvedCoordinatorReviewJob(job)) return false;
   return isNeedsCoordinatorPortJob(job)
-    || isFailedJob(job)
-    || isStaleJob(job)
     || normalized(job.disposition).includes('review')
     || normalized(job.mergeReadiness).includes('review');
 }

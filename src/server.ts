@@ -1480,6 +1480,8 @@ function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<
   let bucket = coordinatorFacingMachineLabel(record.bucket);
   if (!bucket && status === 'completed') bucket = 'completed';
   else if (!bucket && status === 'running') bucket = 'running';
+  else if (!bucket && status === 'failed') bucket = 'failed-evidence';
+  else if (!bucket && status === 'blocked') bucket = 'blocked';
   const normalizedRecord: Record<string, unknown> = {
     ...record,
     bucket,
