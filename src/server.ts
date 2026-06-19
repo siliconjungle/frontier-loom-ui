@@ -462,9 +462,11 @@ async function readScopedDashboardSnapshot(
   const jobs = Array.isArray(record.jobs) ? record.jobs : [];
   const activeJobs = recordArray(activeRunSnapshot?.jobs);
   if (shouldPreferActiveRunSnapshot(jobs, activeJobs)) {
+    const activeAgentRows = activeAgentsFromJobs(activeJobs);
     return {
       ...activeRunSnapshot,
       collectionJobs: jobs,
+      activeAgents: activeAgentRows,
       humanActions: recordArray(record.humanActions),
       humanActionAnswers: answers,
       sources: {
@@ -488,6 +490,7 @@ async function readScopedDashboardSnapshot(
   return {
     ...normalizeCoordinatorFacingSnapshot(record),
     jobs: mergedJobs,
+    activeAgents: activeAgentsFromJobs(mergedJobs),
     humanActionAnswers: answers,
     sources: {
       ...recordValue(record.sources),
@@ -1597,6 +1600,7 @@ function mergeLifetimeActiveRunSnapshot(
   const activeKeys = new Set(activeJobs.map(lifetimeJobDedupeKey).filter(Boolean));
   const existingJobs = recordArray(lifetime.jobs).filter((job) => !activeKeys.has(lifetimeJobDedupeKey(job)));
   const jobs = [...activeJobs, ...existingJobs].slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
+  const activeAgents = activeAgentsFromJobs(jobs);
   const events = [...recordArray(lifetime.events), ...recordArray(active?.events)]
     .sort((left, right) => numberValue(left.at) - numberValue(right.at))
     .slice(-160);
@@ -1622,6 +1626,7 @@ function mergeLifetimeActiveRunSnapshot(
       recordArray(recordValue(lifetime.backlog).entries)
     ),
     jobs,
+    activeAgents,
     events,
     raw: {
       ...recordValue(lifetime.raw),
@@ -1646,6 +1651,7 @@ async function readLifetimeActiveRunSnapshot(options: NormalizedLoomUiServerOpti
     summary: lifetimeDashboardSummary(jobs),
     lanes: lifetimeLaneRows(jobs),
     jobs,
+    activeAgents: activeAgentsFromJobs(jobs),
     events: activeRunEvents(jobs),
     raw: {
       activeRuns: {
@@ -2555,6 +2561,7 @@ async function readActiveRunSnapshot(
     },
     lanes: activeRunLanes(jobs),
     jobs,
+    activeAgents: activeAgentsFromJobs(jobs),
     events: activeRunEvents(jobs),
     sources: {
       run: runDir,
@@ -2687,6 +2694,40 @@ function activeRunEvents(jobs: Array<Record<string, unknown>>): Array<Record<str
     jobId: textValue(job.id, ''),
     message: `${textValue(job.title, 'worker')} ${textValue(job.status, 'running')}`
   }));
+}
+
+function activeAgentsFromJobs(jobs: unknown[]): Array<Record<string, unknown>> {
+  return jobs
+    .map(recordValue)
+    .filter((job) => textValue(job.status, '') === 'running')
+    .map((job) => {
+      const id = textValue(job.agentId ?? job.workerId ?? job.originalJobId ?? job.id, 'agent');
+      return {
+        id,
+        agentId: id,
+        workerId: textValue(job.workerId ?? job.agentId ?? id, id),
+        jobId: textValue(job.originalJobId ?? job.id ?? job.taskId, id),
+        taskId: textValue(job.taskId ?? job.originalJobId ?? job.id, id),
+        title: textValue(job.title, id),
+        lane: textValue(job.lane, ''),
+        status: 'active',
+        model: textValue(job.model, ''),
+        computeId: textValue(job.computeId, ''),
+        reasoningEffort: textValue(job.reasoningEffort, ''),
+        startedAt: numberValue(job.startedAt) || undefined,
+        durationMs: numberValue(job.durationMs),
+        inputTokens: numberValue(job.inputTokens || job.actualInputTokens || job.estimatedInputTokens),
+        uncachedInputTokens: numberValue(job.uncachedInputTokens),
+        cachedInputTokens: numberValue(job.cachedInputTokens),
+        outputTokens: numberValue(job.outputTokens || job.actualOutputTokens),
+        changedPaths: stringArray(job.changedPaths),
+        changedPathCount: numberValue(job.changedPathCount) || stringArray(job.changedPaths).length,
+        evidencePaths: stringArray(job.evidencePaths),
+        evidencePathCount: numberValue(job.evidencePathCount) || stringArray(job.evidencePaths).length,
+        sourceRun: textValue(job.sourceRun, ''),
+        sourceLabel: textValue(job.sourceLabel, '')
+      };
+    });
 }
 
 function mergeActiveRunJobTelemetry(jobs: unknown[], activeJobs: Array<Record<string, unknown>>): unknown[] {
