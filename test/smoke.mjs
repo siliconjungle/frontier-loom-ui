@@ -16,6 +16,8 @@ const lifetimeDrainedCollectionDir = path.join(lifetimeDrainedRunDir, 'auto-drai
 const lifetimeDirtySkipRunDir = path.join(tmp, 'agent-runs', 'dirty-autodrain-run', 'run-1');
 const lifetimeFailedWithEvidenceRunDir = path.join(tmp, 'agent-runs', 'failed-with-evidence-run', 'run-1');
 const lifetimeFailedWithEvidenceJobDir = path.join(lifetimeFailedWithEvidenceRunDir, 'failed-with-evidence-job');
+const lifetimeOwnershipRescopeRunDir = path.join(tmp, 'agent-runs', 'ownership-rescope-run', 'run-1');
+const lifetimeOwnershipRescopeJobDir = path.join(lifetimeOwnershipRescopeRunDir, 'ownership-rescope-job');
 const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
 const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
@@ -28,6 +30,7 @@ await fs.mkdir(lifetimeResolvedDir, { recursive: true });
 await fs.mkdir(lifetimeDrainedCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeDirtySkipRunDir, { recursive: true });
 await fs.mkdir(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence'), { recursive: true });
+await fs.mkdir(path.join(lifetimeOwnershipRescopeJobDir, 'evidence'), { recursive: true });
 await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
@@ -447,6 +450,59 @@ await fs.writeFile(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence', 'chan
   '+export const failedWorker = true;',
   ''
 ].join('\n'));
+await fs.writeFile(path.join(lifetimeOwnershipRescopeRunDir, 'swarm-results.json'), JSON.stringify({
+  ok: false,
+  outDir: lifetimeOwnershipRescopeRunDir,
+  run: {
+    id: 'ownership-rescope-proof',
+    status: 'completed',
+    jobs: [{
+      id: 'ownership-rescope-job',
+      taskId: 'ownership-rescope-task',
+      title: 'Ownership rescope rerun candidate',
+      lane: 'failed-evidence',
+      status: 'failed'
+    }],
+    results: [{
+      jobId: 'ownership-rescope-job',
+      status: 'failed',
+      startedAt: Date.now() - 3000,
+      finishedAt: Date.now() - 1000,
+      durationMs: 2000
+    }]
+  },
+  proof: {
+    summary: {
+      jobCount: 1,
+      completedCount: 0,
+      failedCount: 1,
+      blockedCount: 0
+    }
+  }
+}, null, 2) + '\n');
+const ownershipRescopePatchPath = path.join(lifetimeOwnershipRescopeJobDir, 'evidence', 'changes.patch');
+await fs.writeFile(path.join(lifetimeOwnershipRescopeJobDir, 'codex-events.jsonl'), JSON.stringify({ type: 'turn.failed', error: 'ownership violation before rescope routing existed' }) + '\n');
+await fs.writeFile(path.join(lifetimeOwnershipRescopeJobDir, 'evidence', 'merge.json'), JSON.stringify({
+  jobId: 'ownership-rescope-job',
+  taskId: 'ownership-rescope-task',
+  status: 'failed',
+  mergeReadiness: 'rejected',
+  disposition: 'rejected',
+  changedPaths: ['src/index.ts', 'src/internal.ts'],
+  ownershipViolations: ['src/internal.ts'],
+  patchPath: ownershipRescopePatchPath,
+  reasons: ['failed', 'ownership-violations', 'rejected']
+}, null, 2) + '\n');
+await fs.writeFile(ownershipRescopePatchPath, [
+  'diff --git a/src/internal.ts b/src/internal.ts',
+  'index 1111111..2222222 100644',
+  '--- a/src/internal.ts',
+  '+++ b/src/internal.ts',
+  '@@ -1 +1 @@',
+  '-export const internalValue = false;',
+  '+export const internalValue = true;',
+  ''
+].join('\n'));
 await fs.writeFile(path.join(lifetimeRedrainCollectionDir, 'collection.json'), JSON.stringify({
   ok: false,
   generatedAt: Date.now() - 500,
@@ -622,7 +678,7 @@ try {
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 8);
+    assert.equal(lifetimeDashboard.summary.jobCount, 9);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
     assert.equal(lifetimeDashboard.summary.dirtyAutoDrainSkipCount, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
@@ -630,6 +686,7 @@ try {
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['failed-evidence'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['worker-failed'] ?? 0, 1);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['rerun-work'] ?? 0, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 5);
     assert.equal(lifetimeDashboard.health.summary.readyToApplyJobCount, 0);
     assert.equal(lifetimeDashboard.health.summary.failedJobCount, 1);
@@ -660,6 +717,13 @@ try {
     assert.equal(failedWithEvidenceJob.evidencePathCount >= 3, true);
     assert.deepEqual(failedWithEvidenceJob.changedPaths, ['src/failed-worker.ts']);
     assert.deepEqual(failedWithEvidenceJob.reasons, ['failed', 'rejected']);
+    const ownershipRescopeJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'ownership-rescope-job');
+    assert.ok(ownershipRescopeJob);
+    assert.equal(ownershipRescopeJob.status, 'completed');
+    assert.equal(ownershipRescopeJob.bucket, 'rerun-work');
+    assert.equal(ownershipRescopeJob.mergeReadiness, 'needs-rerun');
+    assert.equal(ownershipRescopeJob.evidenceFailureNormalized, true);
+    assert.deepEqual(ownershipRescopeJob.ownershipViolations, ['src/internal.ts']);
     assert.equal(lifetimeDashboard.raw.lifetime.autoDrainDelays.length, 1);
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);

@@ -1164,6 +1164,10 @@ async function enrichLifetimeRunJobEvidence(
     ...stringArray(merge.changedPaths),
     ...patchChangedPaths
   ]);
+  const ownershipViolations = uniquePaths([
+    ...stringArray(job.ownershipViolations),
+    ...stringArray(merge.ownershipViolations)
+  ]);
   const status = lifetimeRunEvidenceStatus(job, merge, evidencePaths);
   const bucket = lifetimeRunEvidenceBucket(job, status, evidencePaths, rawPatchPath);
   const collectReasonClasses = uniquePaths([
@@ -1180,6 +1184,8 @@ async function enrichLifetimeRunJobEvidence(
     ...(rawPatchPath ? { patchPath: rawPatchPath, artifactPaths: uniquePaths([rawPatchPath, ...stringArray(job.artifactPaths)]) } : {}),
     changedPaths,
     changedPathCount: changedPaths.length || numberValue(job.changedPathCount),
+    ownershipViolations,
+    ownershipViolationCount: ownershipViolations.length || numberValue(job.ownershipViolationCount),
     evidencePaths: mergedEvidencePaths,
     evidencePathCount: mergedEvidencePaths.length,
     reasons: stringArray(job.reasons).length ? stringArray(job.reasons) : stringArray(merge.reasons),
@@ -1968,15 +1974,55 @@ function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<
   else if (!bucket && status === 'running') bucket = 'running';
   else if (!bucket && status === 'failed') bucket = 'failed-evidence';
   else if (!bucket && status === 'blocked') bucket = 'blocked';
-  const normalizedRecord: Record<string, unknown> = {
+  let normalizedRecord: Record<string, unknown> = {
     ...record,
     bucket,
     status,
     disposition: coordinatorFacingMachineLabel(record.disposition),
     mergeReadiness: coordinatorFacingMachineLabel(record.mergeReadiness)
   };
+  normalizedRecord = normalizeHistoricalEvidenceFailureJob(normalizedRecord);
   if (!isResolvedCoordinatorReviewRecord(normalizedRecord)) return normalizedRecord;
   return markCoordinatorReviewResolved(normalizedRecord, textValue(normalizedRecord.coordinatorDecisionStatus ?? normalizedRecord.disposition, 'review-resolved'));
+}
+
+function normalizeHistoricalEvidenceFailureJob(record: Record<string, unknown>): Record<string, unknown> {
+  if (!isHistoricalOwnershipRescopeCandidate(record)) return record;
+  return {
+    ...record,
+    reviewResolved: false,
+    originalBucket: record.originalBucket ?? record.bucket,
+    originalStatus: record.originalStatus ?? record.status,
+    originalDisposition: record.originalDisposition ?? record.disposition,
+    bucket: 'rerun-work',
+    status: 'completed',
+    disposition: 'needs-rerun',
+    mergeReadiness: 'needs-rerun',
+    evidenceFailureNormalized: true,
+    collectReasonClasses: uniquePaths([...stringArray(record.collectReasonClasses), 'ownership-rescope-rerun'])
+  };
+}
+
+function isHistoricalOwnershipRescopeCandidate(record: Record<string, unknown>): boolean {
+  const bucket = normalized(record.bucket);
+  const status = normalized(record.status);
+  const disposition = normalized(record.disposition);
+  const readiness = normalized(record.mergeReadiness);
+  const failedEvidence = bucket === 'failed-evidence'
+    || bucket === 'worker-failed'
+    || status === 'failed'
+    || disposition === 'rejected'
+    || disposition === 'failed'
+    || readiness === 'rejected'
+    || readiness === 'blocked';
+  if (!failedEvidence) return false;
+  const ownershipViolationCount = numberValue(record.ownershipViolationCount)
+    || stringArray(record.ownershipViolations).length;
+  if (!ownershipViolationCount) return false;
+  const changedPathCount = numberValue(record.changedPathCount)
+    || stringArray(record.changedPaths).length;
+  if (!changedPathCount) return false;
+  return Boolean(textValue(record.patchPath, '') || textValue(record.patchArtifactPath, '') || changedPathCount);
 }
 
 function markCoordinatorReviewResolved(record: Record<string, unknown>, disposition: string): Record<string, unknown> {
@@ -2448,6 +2494,7 @@ function isLifetimeFailedJob(job: Record<string, unknown>): boolean {
   const status = textValue(job.status, '').toLowerCase();
   const health = textValue(job.health, '').toLowerCase();
   const bucket = textValue(job.bucket, '').toLowerCase();
+  if (bucket === 'rerun-work') return false;
   return status === 'failed' || health === 'failed' || bucket === 'failed-evidence';
 }
 
