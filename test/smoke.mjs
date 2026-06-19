@@ -13,6 +13,8 @@ const lifetimeCurrentDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', '
 const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-resolved');
 const lifetimeDrainedRunDir = path.join(tmp, 'agent-runs', 'drained-autonomous-run', 'run-1');
 const lifetimeDrainedCollectionDir = path.join(lifetimeDrainedRunDir, 'auto-drain', 'collection-01-post-apply');
+const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
+const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
@@ -21,6 +23,8 @@ await fs.mkdir(path.join(activeRunDir, 'active-done', 'evidence'), { recursive: 
 await fs.mkdir(lifetimeCurrentDir, { recursive: true });
 await fs.mkdir(lifetimeResolvedDir, { recursive: true });
 await fs.mkdir(lifetimeDrainedCollectionDir, { recursive: true });
+await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
+await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
@@ -346,6 +350,40 @@ await fs.writeFile(path.join(lifetimeDrainedCollectionDir, 'collection.json'), J
     }]
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeRedrainCollectionDir, 'collection.json'), JSON.stringify({
+  ok: false,
+  generatedAt: Date.now() - 500,
+  summary: {
+    total: 1,
+    'ready-to-apply': 1
+  },
+  buckets: {
+    'ready-to-apply': [{
+      bucket: 'ready-to-apply',
+      jobId: 'redrain-job',
+      bundle: {
+        jobId: 'redrain-job',
+        taskId: 'redrain-task',
+        lane: 'redrain',
+        status: 'completed',
+        mergeReadiness: 'ready-to-apply',
+        disposition: 'ready',
+        evidencePaths: []
+      }
+    }]
+  }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeRedrainLedgerDir, 'autonomous-merge-decisions.jsonl'), JSON.stringify({
+  kind: 'frontier.swarm-codex.autonomous-merge-decision',
+  version: 1,
+  id: 'decision:redrain-job',
+  jobId: 'redrain-job',
+  taskId: 'redrain-task',
+  queueItemIds: ['redrain-task'],
+  status: 'committed',
+  reason: 'patch committed and verification passed',
+  finishedAt: Date.now() + 1500
+}) + '\n');
 await fs.writeFile(path.join(tmp, 'agent-runs', '.loom-ui-review-decisions.json'), JSON.stringify({
   decisions: [
     {
@@ -487,12 +525,12 @@ try {
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 5);
+    assert.equal(lifetimeDashboard.summary.jobCount, 6);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['ready-to-apply'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['failed-evidence'] ?? 0, 0);
-    assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 4);
+    assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 5);
     assert.equal(lifetimeDashboard.health.summary.readyToApplyJobCount, 0);
     assert.equal(lifetimeDashboard.health.summary.failedJobCount, 0);
     const dedupeJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dedupe-job');
@@ -505,6 +543,11 @@ try {
     assert.ok(drainedJob);
     assert.equal(drainedJob.status, 'completed');
     assert.notEqual(drainedJob.bucket, 'stale-against-head');
+    const redrainJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'redrain-job');
+    assert.ok(redrainJob);
+    assert.equal(redrainJob.status, 'completed');
+    assert.equal(redrainJob.bucket, 'review-resolved');
+    assert.equal(redrainJob.coordinatorDecisionStatus, 'committed');
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);
     assert.equal(lifetimeDashboard.capacity.openLaneCount, 1);

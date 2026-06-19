@@ -21,6 +21,7 @@ const LIFETIME_DASHBOARD_MAX_SOURCES = 80;
 const LIFETIME_DASHBOARD_MAX_JOBS = 800;
 const LIFETIME_DASHBOARD_SCAN_MAX_FILES = 600;
 const LIFETIME_DASHBOARD_SCAN_MAX_DEPTH = 5;
+const LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES = 400;
 const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
@@ -409,6 +410,8 @@ async function readScopedDashboardSnapshot(options: NormalizedLoomUiServerOption
   const snapshot = await readCodexDashboardSnapshot(dashboardInput(options));
   const activeRunSnapshot = await readActiveRunSnapshot(options);
   const reviewDecisions = await readCoordinatorReviewDecisions(options.cwd);
+  const autonomousDecisions = await readAutonomousMergeDecisions(options.cwd);
+  const decisions = mergeReviewDecisionLists(reviewDecisions, autonomousDecisions);
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return activeRunSnapshot ?? snapshot;
   const answers = await readHumanActionAnswers(options);
   const record = snapshot as unknown as Record<string, unknown>;
@@ -424,6 +427,7 @@ async function readScopedDashboardSnapshot(options: NormalizedLoomUiServerOption
         ...recordValue(record.sources),
         ...recordValue(activeRunSnapshot?.sources),
         ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {}),
+        ...(autonomousDecisions.length ? { autonomousMergeDecisions: autonomousDecisionSourceSummary(autonomousDecisions) } : {}),
         ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {})
       },
       raw: {
@@ -436,7 +440,7 @@ async function readScopedDashboardSnapshot(options: NormalizedLoomUiServerOption
       }
     };
   }
-  const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), reviewDecisions);
+  const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions);
   return {
     ...normalizeCoordinatorFacingSnapshot(record),
     jobs: mergedJobs,
@@ -444,6 +448,7 @@ async function readScopedDashboardSnapshot(options: NormalizedLoomUiServerOption
     sources: {
       ...recordValue(record.sources),
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {}),
+      ...(autonomousDecisions.length ? { autonomousMergeDecisions: autonomousDecisionSourceSummary(autonomousDecisions) } : {}),
       ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {})
     }
   };
@@ -469,7 +474,7 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
     options,
     sources,
     snapshots,
-    await readCoordinatorReviewDecisions(options.cwd),
+    mergeReviewDecisionLists(await readCoordinatorReviewDecisions(options.cwd), await readAutonomousMergeDecisions(options.cwd)),
     await readLifetimeQueueBacklog(options.cwd)
   );
   return mergeLifetimeDrainCoordinatorSnapshot(lifetime, await readLatestDrainCoordinatorSnapshot(options.cwd));
@@ -1327,6 +1332,124 @@ async function readCoordinatorReviewDecisions(cwd: string): Promise<CoordinatorR
 
 function coordinatorReviewDecisionPath(cwd: string): string {
   return path.join(cwd, 'agent-runs', REVIEW_DECISIONS_FILE);
+}
+
+async function readAutonomousMergeDecisions(cwd: string): Promise<CoordinatorReviewDecision[]> {
+  const root = path.join(cwd, 'agent-runs');
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) return [];
+  const files = await findAutonomousMergeDecisionFiles(root);
+  const out: CoordinatorReviewDecision[] = [];
+  for (const file of files) {
+    const text = await fs.readFile(file, 'utf8').catch(() => '');
+    for (const line of text.split(/\r?\n/u)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const raw = safeJsonObject(trimmed);
+      if (!raw) continue;
+      const normalizedDecision = normalizeAutonomousMergeDecision(cwd, file, raw);
+      if (normalizedDecision) out.push(normalizedDecision);
+    }
+  }
+  return out.sort(compareCoordinatorReviewDecisionRecency);
+}
+
+async function findAutonomousMergeDecisionFiles(root: string): Promise<string[]> {
+  const out: Array<{ file: string; mtimeMs: number }> = [];
+  async function walk(current: string, depth: number): Promise<void> {
+    if (out.length >= LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES || depth > LIFETIME_DASHBOARD_SCAN_MAX_DEPTH) return;
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (out.length >= LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES) return;
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'artifact-store' || entry.name.startsWith('.')) continue;
+        await walk(absolute, depth + 1);
+      } else if (entry.isFile() && entry.name === 'autonomous-merge-decisions.jsonl') {
+        const stat = await fs.stat(absolute).catch(() => undefined);
+        out.push({ file: absolute, mtimeMs: stat?.mtimeMs ?? 0 });
+      }
+    }
+  }
+  await walk(root, 0);
+  return out.sort((left, right) => right.mtimeMs - left.mtimeMs || right.file.localeCompare(left.file)).map((entry) => entry.file);
+}
+
+function normalizeAutonomousMergeDecision(cwd: string, file: string, raw: Record<string, unknown>): CoordinatorReviewDecision | undefined {
+  const status = autonomousDecisionStatus(textValue(raw.status ?? raw.decision, ''));
+  if (!status) return undefined;
+  const ids = Array.from(new Set([
+    textValue(raw.jobId, ''),
+    textValue(raw.taskId, ''),
+    ...stringArray(raw.queueItemIds),
+    ...stringArray(raw.queueKeys).map((key) => key.replace(/^(?:queue|task|job):/u, ''))
+  ].filter(Boolean)));
+  if (!ids.length) return undefined;
+  const decidedAtMs = Math.max(
+    numberValue(raw.finishedAt),
+    numberValue(raw.startedAt),
+    Date.parse(textValue(raw.finishedAtIso ?? raw.decidedAt ?? raw.generatedAt, '')) || 0
+  );
+  const relativeFile = path.relative(cwd, file);
+  return {
+    id: textValue(raw.id, ids[0]),
+    jobId: textValue(raw.jobId, ''),
+    taskId: textValue(raw.taskId, ''),
+    matchIds: ids,
+    status,
+    decision: status,
+    reason: textValue(raw.reason, ''),
+    decidedAt: decidedAtMs ? new Date(decidedAtMs).toISOString() : '',
+    decidedAtMs,
+    sourceArtifact: relativeFile,
+    sourceKind: 'autonomous-merge-decision',
+    latestPath: textValue(raw.bundlePath ?? raw.patchPath, relativeFile),
+    autonomousDecision: raw
+  };
+}
+
+function autonomousDecisionStatus(value: string): string {
+  const status = normalized(value);
+  if (status === 'committed' || status === 'applied') return status;
+  if (status === 'accepted' || status === 'accepted-applied') return 'applied';
+  if (status === 'rejected' || status === 'rerun' || status === 'superseded') return status;
+  if (status === 'conflict' || status === 'conflict-blocked') return 'conflict-blocked';
+  if (status === 'human-blocked' || status === 'human-question') return 'human-blocked';
+  return status;
+}
+
+function mergeReviewDecisionLists(...groups: CoordinatorReviewDecision[][]): CoordinatorReviewDecision[] {
+  return groups.flat().sort(compareCoordinatorReviewDecisionRecency);
+}
+
+function compareCoordinatorReviewDecisionRecency(left: CoordinatorReviewDecision, right: CoordinatorReviewDecision): number {
+  return decisionTime(right) - decisionTime(left)
+    || textValue(right.sourceArtifact ?? right.latestPath, '').localeCompare(textValue(left.sourceArtifact ?? left.latestPath, ''));
+}
+
+function decisionTime(decision: CoordinatorReviewDecision): number {
+  return numberValue(decision.decidedAtMs)
+    || numberValue(decision.finishedAt)
+    || numberValue(decision.startedAt)
+    || Date.parse(textValue(decision.decidedAt, ''))
+    || 0;
+}
+
+function autonomousDecisionSourceSummary(decisions: CoordinatorReviewDecision[]): Record<string, unknown> {
+  const files = Array.from(new Set(decisions.map((decision) => textValue(decision.sourceArtifact, '')).filter(Boolean)));
+  return {
+    count: decisions.length,
+    fileCount: files.length,
+    files: files.slice(0, 20)
+  };
+}
+
+function safeJsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    return recordValue(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
 }
 
 function applyCoordinatorReviewDecisions(jobs: unknown[], decisions: CoordinatorReviewDecision[]): Array<Record<string, unknown>> {
