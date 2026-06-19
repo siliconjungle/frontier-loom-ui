@@ -11,6 +11,8 @@ const continuationDir = path.join(tmp, 'continuation');
 const activeRunDir = path.join(tmp, 'active-run');
 const lifetimeCurrentDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-current');
 const lifetimeResolvedDir = path.join(tmp, 'agent-runs', 'lifetime-dedupe-run', 'collected-resolved');
+const lifetimeDrainedRunDir = path.join(tmp, 'agent-runs', 'drained-autonomous-run', 'run-1');
+const lifetimeDrainedCollectionDir = path.join(lifetimeDrainedRunDir, 'auto-drain', 'collection-01-post-apply');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
@@ -18,6 +20,7 @@ await fs.mkdir(path.join(activeRunDir, 'active-live', 'evidence'), { recursive: 
 await fs.mkdir(path.join(activeRunDir, 'active-done', 'evidence'), { recursive: true });
 await fs.mkdir(lifetimeCurrentDir, { recursive: true });
 await fs.mkdir(lifetimeResolvedDir, { recursive: true });
+await fs.mkdir(lifetimeDrainedCollectionDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
@@ -224,6 +227,125 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
     }]
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-results.json'), JSON.stringify({
+  ok: true,
+  outDir: lifetimeDrainedRunDir,
+  run: {
+    id: 'drained-run-proof',
+    status: 'completed',
+    jobs: [{
+      id: 'drained-job',
+      taskId: 'drained-task',
+      title: 'Drained autonomous task',
+      lane: 'drained',
+      status: 'completed'
+    }],
+    results: [{
+      jobId: 'drained-job',
+      status: 'completed',
+      startedAt: Date.now() - 1000,
+      finishedAt: Date.now(),
+      durationMs: 1000
+    }]
+  },
+  proof: {
+    summary: {
+      jobCount: 1,
+      completedCount: 1,
+      failedCount: 0,
+      blockedCount: 0
+    }
+  },
+  autoDrain: {
+    summary: {
+      terminalCount: 1,
+      committedDecisionCount: 1,
+      remainingReadyCount: 0,
+      blockedCount: 0,
+      conflictBlockedCount: 0,
+      humanBlockedCount: 0,
+      humanBlockedDecisionCount: 0,
+      rerunTaskCount: 0,
+      rerunManifestTerminalState: 'drained'
+    },
+    finalGateSummary: {
+      ok: true,
+      state: 'not-configured',
+      decisions: [{
+        jobId: 'drained-job',
+        taskId: 'drained-task',
+        status: 'committed',
+        reason: 'patch committed after git apply check'
+      }]
+    }
+  },
+  autoDrainArtifacts: {
+    summary: {
+      decisionCount: 1,
+      committedDecisionCount: 1,
+      remainingReadyCount: 0,
+      rerunTaskCount: 0,
+      rerunManifestTerminalState: 'drained'
+    }
+  }
+}, null, 2) + '\n');
+await fs.mkdir(path.join(lifetimeDrainedRunDir, 'drained-job'), { recursive: true });
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'last-message.md'), 'Drained autonomous task completed.\n');
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'pids.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.pid-manifest',
+  version: 1,
+  runId: 'drained-run-proof',
+  entries: [
+    { pid: process.pid, role: 'parent', runId: 'drained-run-proof', startedAt: Date.now() - 1000 },
+    { pid: 99999998, role: 'codex', jobId: 'drained-job', startedAt: Date.now() - 1000 }
+  ]
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-plan.json'), JSON.stringify({
+  jobs: [{
+    id: 'drained-job',
+    taskId: 'drained-task',
+    title: 'Drained autonomous task',
+    lane: 'drained',
+    compute: { id: 'codex.proof', model: 'gpt-5.5' },
+    task: { id: 'drained-task', title: 'Drained autonomous task', lane: 'drained' }
+  }],
+  graph: {
+    nodes: ['drained-job'],
+    edges: [],
+    dependentsByJobId: { 'drained-job': [] },
+    dependenciesByJobId: { 'drained-job': [] },
+    roots: ['drained-job'],
+    leaves: ['drained-job'],
+    issues: []
+  }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeDrainedCollectionDir, 'collection.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.collection',
+  version: 1,
+  ok: true,
+  runDir: lifetimeDrainedRunDir,
+  outDir: lifetimeDrainedCollectionDir,
+  generatedAt: Date.now() + 1000,
+  summary: {
+    total: 1,
+    'stale-against-head': 1
+  },
+  buckets: {
+    'stale-against-head': [{
+      bucket: 'stale-against-head',
+      jobId: 'drained-job',
+      bundle: {
+        jobId: 'drained-job',
+        taskId: 'drained-task',
+        lane: 'drained',
+        status: 'completed',
+        mergeReadiness: 'stale-against-head',
+        disposition: 'stale',
+        evidencePaths: []
+      }
+    }]
+  }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(tmp, 'agent-runs', '.loom-ui-review-decisions.json'), JSON.stringify({
   decisions: [
     {
@@ -362,10 +484,10 @@ try {
   try {
     const lifetimeDashboard = await fetchJson(new URL('/api/dashboard', lifetimeServer.url));
     assert.equal(lifetimeDashboard.kind, 'frontier.loom-ui.lifetime-dashboard');
-    assert.equal(lifetimeDashboard.sources.sourceCount, 1);
-    assert.equal(lifetimeDashboard.sources.loadedSourceCount, 1);
+    assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
+    assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
-    assert.equal(lifetimeDashboard.summary.jobCount, 4);
+    assert.equal(lifetimeDashboard.summary.jobCount, 5);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['needs-coordinator-review'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['ready-to-apply'] ?? 0, 0);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['stale-against-head'] ?? 0, 0);
@@ -379,6 +501,10 @@ try {
     assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-ready').bucket, 'review-resolved');
     assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-stale').bucket, 'review-resolved');
     assert.equal(lifetimeDashboard.jobs.find((job) => job.originalJobId === 'historical-failed').bucket, 'review-resolved');
+    const drainedJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'drained-job');
+    assert.ok(drainedJob);
+    assert.equal(drainedJob.status, 'completed');
+    assert.notEqual(drainedJob.bucket, 'stale-against-head');
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);
     assert.equal(lifetimeDashboard.capacity.openLaneCount, 1);

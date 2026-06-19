@@ -599,6 +599,29 @@ function lifetimeRunFamilyKey(source: LifetimeDashboardSource): string {
   return parts[start] ?? source.path;
 }
 
+function lifetimeRunRootKey(source: LifetimeDashboardSource): string {
+  const parts = source.path.split(/[\\/]/g).filter(Boolean);
+  if (!parts.length) return source.path;
+  const agentRunsIndex = parts.lastIndexOf('agent-runs');
+  const start = agentRunsIndex >= 0 ? agentRunsIndex + 1 : 0;
+  const rootParts = parts.slice(start, start + 2);
+  return rootParts.length ? rootParts.join('/') : source.path;
+}
+
+function isDrainedAutonomousRunSnapshot(snapshot: Record<string, unknown>): boolean {
+  const rawRun = recordValue(recordValue(snapshot.raw).run);
+  const autoDrain = recordValue(rawRun.autoDrain);
+  const autoDrainSummary = recordValue(autoDrain.summary);
+  const artifactSummary = recordValue(recordValue(rawRun.autoDrainArtifacts).summary);
+  const summary = Object.keys(autoDrainSummary).length ? autoDrainSummary : artifactSummary;
+  if (!Object.keys(summary).length) return false;
+  if (textValue(summary.rerunManifestTerminalState, '') !== 'drained') return false;
+  if (numberValue(summary.remainingReadyCount) > 0) return false;
+  if (numberValue(summary.humanBlockedCount) > 0 || numberValue(summary.humanBlockedDecisionCount) > 0) return false;
+  if (numberValue(summary.conflictBlockedCount) > 0 || numberValue(summary.rerunTaskCount) > 0) return false;
+  return numberValue(summary.committedDecisionCount) > 0 || numberValue(summary.terminalCount) > 0 || numberValue(summary.decisionCount) > 0;
+}
+
 function collapseSupersededLifetimeReviewJobs(jobs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   const resolvedAtByJob = new Map<string, number>();
   for (const job of jobs) {
@@ -893,7 +916,14 @@ function combineLifetimeDashboardSnapshots(
   reviewDecisions: CoordinatorReviewDecision[],
   queueBacklog: LifetimeQueueBacklog
 ): Record<string, unknown> {
-  const jobs = dedupeLifetimeDashboardJobs(collapseSupersededLifetimeReviewJobs(applyCoordinatorReviewDecisions(snapshots.flatMap(({ source, snapshot }) => {
+  const drainedRunRoots = new Set(snapshots
+    .filter((entry) => entry.source.kind === 'run' && isDrainedAutonomousRunSnapshot(entry.snapshot))
+    .map((entry) => lifetimeRunRootKey(entry.source)));
+  const visibleSnapshots = snapshots.filter((entry) => {
+    if (entry.source.kind !== 'collection') return true;
+    return !drainedRunRoots.has(lifetimeRunRootKey(entry.source));
+  });
+  const jobs = dedupeLifetimeDashboardJobs(collapseSupersededLifetimeReviewJobs(applyCoordinatorReviewDecisions(visibleSnapshots.flatMap(({ source, snapshot }) => {
     return recordArray(snapshot.jobs).map((job) => ({
       ...job,
       id: lifetimeScopedId(source, textValue(job.id ?? job.jobId ?? job.taskId, 'job')),
@@ -907,8 +937,8 @@ function combineLifetimeDashboardSnapshots(
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = recordArray(awaitNoop([]));
   const summary = lifetimeDashboardSummary(jobs);
-  const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...snapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
-  const events = snapshots.flatMap(({ source, snapshot }) => recordArray(snapshot.events).map((event) => ({
+  const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...visibleSnapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
+  const events = visibleSnapshots.flatMap(({ source, snapshot }) => recordArray(snapshot.events).map((event) => ({
     ...event,
     sourceLabel: source.label,
     message: textValue(event.message, textValue(event.type, 'event')),
@@ -925,7 +955,8 @@ function combineLifetimeDashboardSnapshots(
       lifetimeRoot: path.join(options.cwd, 'agent-runs'),
       queueRoot: path.join(options.cwd, '.loom', 'queues'),
       sourceCount: discoveredSources.length,
-      loadedSourceCount: snapshots.length,
+      loadedSourceCount: visibleSnapshots.length,
+      suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
       queueSourceCount: queueBacklog.sourceCount,
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
@@ -937,21 +968,22 @@ function combineLifetimeDashboardSnapshots(
     lanes: lifetimeLaneRows(jobs),
     capacity: lifetimeCapacitySummary(queueBacklog, jobs),
     jobs,
-    humanActions: snapshots.flatMap(({ snapshot }) => recordArray(snapshot.humanActions)).slice(-100),
+    humanActions: visibleSnapshots.flatMap(({ snapshot }) => recordArray(snapshot.humanActions)).slice(-100),
     humanActionAnswers,
     events,
-    routing: lifetimeRoutingSummary(snapshots.map((entry) => entry.snapshot)),
+    routing: lifetimeRoutingSummary(visibleSnapshots.map((entry) => entry.snapshot)),
     backlog: {
       id: 'workspace-lifetime',
-      entryCount: queueBacklog.entries.length + snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).entryCount), 0),
-      readyCount: queueBacklog.entries.filter((entry) => textValue(entry.status, '') === 'todo').length + snapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).readyCount), 0),
+      entryCount: queueBacklog.entries.length + visibleSnapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).entryCount), 0),
+      readyCount: queueBacklog.entries.filter((entry) => textValue(entry.status, '') === 'todo').length + visibleSnapshots.reduce((sum, entry) => sum + numberValue(recordValue(entry.snapshot.backlog).readyCount), 0),
       entries: queueBacklog.entries
     },
     raw: {
       lifetime: {
         mode: 'workspace',
         sourceCount: discoveredSources.length,
-        loadedSourceCount: snapshots.length,
+        loadedSourceCount: visibleSnapshots.length,
+        suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
         sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
         manifests: queueBacklog.manifests,
         queueSources: queueBacklog.paths
@@ -1321,10 +1353,14 @@ function applyCoordinatorReviewDecisions(jobs: unknown[], decisions: Coordinator
 }
 
 function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<string, unknown> {
+  const status = coordinatorFacingMachineLabel(record.status);
+  let bucket = coordinatorFacingMachineLabel(record.bucket);
+  if (!bucket && status === 'completed') bucket = 'completed';
+  else if (!bucket && status === 'running') bucket = 'running';
   const normalizedRecord: Record<string, unknown> = {
     ...record,
-    bucket: coordinatorFacingMachineLabel(record.bucket),
-    status: coordinatorFacingMachineLabel(record.status),
+    bucket,
+    status,
     disposition: coordinatorFacingMachineLabel(record.disposition),
     mergeReadiness: coordinatorFacingMachineLabel(record.mergeReadiness)
   };
