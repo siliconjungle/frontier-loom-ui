@@ -1282,7 +1282,7 @@ function taskBoardItems(dashboard: Dashboard, jobs: Array<Record<string, unknown
 }
 
 function isTaskBoardVisibleJob(job: Record<string, unknown>): boolean {
-  return !isResolvedCoordinatorReviewJob(job);
+  return !isResolvedCoordinatorReviewJob(job) || isSuccessfulResolvedCoordinatorReviewJob(job);
 }
 
 function isResolvedCoordinatorReviewJob(job: Record<string, unknown>): boolean {
@@ -1295,6 +1295,16 @@ function isResolvedCoordinatorReviewJob(job: Record<string, unknown>): boolean {
 function isResolvedCoordinatorDecisionStatus(status: string): boolean {
   const value = normalized(status);
   return Boolean(value) && !['open', 'pending', 'deferred', 'needs-review'].includes(value);
+}
+
+function isSuccessfulResolvedCoordinatorReviewJob(job: Record<string, unknown>): boolean {
+  if (!isResolvedCoordinatorReviewJob(job)) return false;
+  const status = normalized(coordinatorDecisionStatus(job));
+  const disposition = normalized(job.disposition);
+  const jobStatus = normalized(job.status);
+  return jobStatus === 'completed'
+    || ['accepted', 'accepted-applied', 'applied', 'committed', 'landed'].includes(status)
+    || ['accepted', 'accepted-applied', 'applied', 'committed', 'landed'].includes(disposition);
 }
 
 function activeAgentTaskCount(dashboard: Dashboard, jobs: Array<Record<string, unknown>>): number {
