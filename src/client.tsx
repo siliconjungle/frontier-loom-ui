@@ -1592,6 +1592,7 @@ function agentStatus(job: TaskBoardItem): AgentStatus {
   const bucket = normalized(job.bucket);
   const disposition = normalized(job.disposition ?? job.mergeReadiness);
   if (['running', 'active', 'working', 'in-progress', 'in progress'].includes(status)) return 'active';
+  if (isSuccessfulResolvedCoordinatorReviewJob(job)) return 'done';
   if (status === 'idle' || bucket === 'idle') return 'idle';
   if (isBlockedJob(job)) return 'blocked';
   if (isCoordinatorReviewJob(job) || isReadyJob(job) || disposition.includes('review')) return 'review';
@@ -1715,6 +1716,7 @@ function agentStatusRank(status: AgentStatus): number {
 function taskBoardColumnId(job: TaskBoardItem): TaskBoardColumnId {
   if (job.boardColumn) return job.boardColumn;
   if (job.boardKind === 'backlog') return 'backlog';
+  if (isSuccessfulResolvedCoordinatorReviewJob(job)) return 'done';
   if (isBlockedJob(job)) return 'blocked';
   if (isCoordinatorReviewJob(job)) return 'review';
   if (isReadyJob(job)) return 'ready';
@@ -1745,6 +1747,7 @@ function taskSortRank(job: Record<string, unknown>): number {
   if (isFailedJob(job) || isStaleJob(job)) return 2;
   if (normalized(job.status) === 'running') return 3;
   if (isReadyJob(job)) return 4;
+  if (isSuccessfulResolvedCoordinatorReviewJob(job)) return 5;
   return 5;
 }
 
@@ -1827,6 +1830,7 @@ function coordinatorDecisionLabel(status: string): string {
 function coordinatorFacingSignalLabel(value: unknown): string {
   const raw = textValue(value, 'tracked task');
   const normalizedValue = normalized(raw);
+  if (normalizedValue === 'review-resolved' || normalizedValue === 'resolved-review') return 'review resolved';
   if (normalizedValue === 'needs-human-port' || normalizedValue === 'needs-coordinator-port') return 'needs coordinator review';
   if (normalizedValue === 'needs-human-review' || normalizedValue === 'needs-coordinator-review') return 'needs coordinator review';
   if (normalizedValue === 'needs-human-decision' || normalizedValue === 'needs-coordinator-decision') return 'needs coordinator decision';
@@ -1848,12 +1852,16 @@ function taskTokenSummary(job: Record<string, unknown>): string {
 }
 
 function taskReasonItems(job: Record<string, unknown>): string[] {
-  return uniqueStrings([
+  const reasons = uniqueStrings([
     ...stringArray(job.collectReasonClasses),
     ...stringArray(job.reasons),
     ...stringArray(job.contextBudgetWarnings),
     ...stringArray(job.semanticReadinessReasons)
-  ]).slice(0, 8);
+  ]);
+  const terminalOrResolved = isResolvedCoordinatorReviewJob(job) || (isCompletedJob(job) && !isNeedsCoordinatorPortJob(job));
+  return reasons
+    .filter((reason) => !terminalOrResolved || !isOpenCoordinatorReviewSignal(reason))
+    .slice(0, 8);
 }
 
 function taskFact(label: string, value: string): Node {
@@ -3742,6 +3750,7 @@ function riskStatusLabel(dashboard: Dashboard, attention: AttentionSummary, load
 }
 
 function jobRisk(job: Record<string, unknown>): string {
+  if (isSuccessfulResolvedCoordinatorReviewJob(job)) return 'done';
   if (isBlockedJob(job)) return 'failed';
   if (isNeedsCoordinatorPortJob(job)) return 'review';
   if (isFailedJob(job)) return 'failed';
@@ -3807,9 +3816,11 @@ function isNeedsCoordinatorReviewJob(job: Record<string, unknown>): boolean {
 }
 
 function isNeedsCoordinatorPortJob(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewJob(job)) return false;
   const bucket = normalized(job.bucket);
   const disposition = normalized(job.disposition);
   const readiness = normalized(job.mergeReadiness);
+  if (isCompletedJob(job) && ['completed', 'done', 'landed', 'applied'].includes(bucket)) return false;
   return bucket === 'needs-human-port'
     || bucket === 'needs-human-review'
     || bucket === 'needs-human-decision'
@@ -3819,6 +3830,20 @@ function isNeedsCoordinatorPortJob(job: Record<string, unknown>): boolean {
     || disposition.includes('needs')
     || readiness.includes('needs')
     || normalized(job.status) === 'needs-review';
+}
+
+function isOpenCoordinatorReviewSignal(value: unknown): boolean {
+  const signal = normalized(value);
+  return signal === 'needs-human-port'
+    || signal === 'needs-human-review'
+    || signal === 'needs-human-decision'
+    || signal === 'needs-coordinator-port'
+    || signal === 'needs-coordinator-review'
+    || signal === 'needs-coordinator-decision'
+    || signal === 'needs-port'
+    || signal === 'needs-review'
+    || signal === 'manual-port-required'
+    || signal === 'manual port required';
 }
 
 function isCoordinatorReviewJob(job: Record<string, unknown>): boolean {
@@ -5335,7 +5360,12 @@ function inputTokenBreakdownForJob(job: Record<string, unknown>): InputTokenBrea
     usage.input_tokens,
     usage.prompt_tokens
   );
-  const estimatedInput = firstPositiveNumber(job.estimatedInputTokens, job.estimated_input_tokens);
+  const estimatedInput = firstPositiveNumber(
+    job.estimatedInputTokens,
+    job.estimated_input_tokens,
+    usage.estimated_input_tokens,
+    usage.estimatedInputTokens
+  );
   const reportedCached = firstPositiveNumber(
     job.cachedInputTokens,
     job.cachedPromptTokens,

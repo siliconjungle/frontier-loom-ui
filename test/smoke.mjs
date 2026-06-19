@@ -315,6 +315,11 @@ await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-results.json'), JSON.
 }, null, 2) + '\n');
 await fs.mkdir(path.join(lifetimeDrainedRunDir, 'drained-job'), { recursive: true });
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'last-message.md'), 'Drained autonomous task completed.\n');
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'codex-events.jsonl'), [
+  JSON.stringify({ type: 'turn.started' }),
+  JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 123456, cached_input_tokens: 23000, output_tokens: 7890, reasoning_output_tokens: 1234 } }),
+  ''
+].join('\n'));
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'pids.json'), JSON.stringify({
   kind: 'frontier.swarm-codex.pid-manifest',
   version: 1,
@@ -533,7 +538,8 @@ await fs.writeFile(path.join(lifetimeRedrainCollectionDir, 'collection.json'), J
         status: 'completed',
         mergeReadiness: 'ready-to-apply',
         disposition: 'ready',
-        evidencePaths: []
+        evidencePaths: [],
+        reasons: ['needs-human-port']
       }
     }]
   }
@@ -712,11 +718,18 @@ try {
     assert.ok(drainedJob);
     assert.equal(drainedJob.status, 'completed');
     assert.notEqual(drainedJob.bucket, 'stale-against-head');
+    assert.equal(drainedJob.actualInputTokens, 123456);
+    assert.equal(drainedJob.cachedInputTokens, 23000);
+    assert.equal(drainedJob.uncachedInputTokens, 100456);
+    assert.equal(drainedJob.outputTokens, 7890);
     const redrainJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'redrain-job');
     assert.ok(redrainJob);
     assert.equal(redrainJob.status, 'completed');
     assert.equal(redrainJob.bucket, 'review-resolved');
     assert.equal(redrainJob.coordinatorDecisionStatus, 'committed');
+    assert.deepEqual(redrainJob.originalReasons, ['needs-human-port']);
+    assert.equal(redrainJob.reasons.includes('needs-human-port'), false);
+    assert.deepEqual(redrainJob.reasons, ['patch committed and verification passed']);
     const dirtySkipJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dirty-skip-job');
     assert.ok(dirtySkipJob);
     assert.equal(dirtySkipJob.status, 'completed');
@@ -733,6 +746,11 @@ try {
     assert.ok(ownershipRescopeJob);
     assert.equal(ownershipRescopeJob.status, 'completed');
     assert.equal(ownershipRescopeJob.bucket, 'rerun-work');
+    assert.equal(lifetimeDashboard.summary.actualInputTokens, 123456);
+    assert.equal(lifetimeDashboard.summary.cachedInputTokens, 23000);
+    assert.equal(lifetimeDashboard.summary.uncachedInputTokens, 100456);
+    assert.equal(lifetimeDashboard.timeSeries.summary.actualInputTokens, 123456);
+    assert.equal(lifetimeDashboard.timeSeries.summary.uncachedInputTokens, 100456);
     assert.equal(ownershipRescopeJob.mergeReadiness, 'needs-rerun');
     assert.equal(ownershipRescopeJob.evidenceFailureNormalized, true);
     assert.deepEqual(ownershipRescopeJob.ownershipViolations, ['src/internal.ts']);

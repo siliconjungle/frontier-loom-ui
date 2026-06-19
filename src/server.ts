@@ -1182,13 +1182,15 @@ async function enrichLifetimeRunJobEvidence(
   const jobDir = await findBestRawRunJobDir(runRoot, rawRunJobIdCandidates(job));
   if (!jobDir) return job;
   const evidenceDir = path.join(jobDir, 'evidence');
+  const eventsPath = path.join(jobDir, 'codex-events.jsonl');
   const rootMerge = recordValue(await readJsonFile(path.join(jobDir, 'merge.json')));
   const evidenceMerge = recordValue(await readJsonFile(path.join(evidenceDir, 'merge.json')));
   const merge = Object.keys(rootMerge).length ? rootMerge : evidenceMerge;
   const rawPatchPath = await firstExistingRelativePath(cwd, rawRunPatchCandidates(jobDir));
+  const usage = await readCodexEventUsageSummary(eventsPath);
   const evidencePaths = await existingRelativePaths(cwd, [
     path.join(jobDir, 'last-message.md'),
-    path.join(jobDir, 'codex-events.jsonl'),
+    eventsPath,
     path.join(jobDir, 'merge.json'),
     path.join(evidenceDir, 'last-message.md'),
     path.join(evidenceDir, 'handoff.md'),
@@ -1229,6 +1231,26 @@ async function enrichLifetimeRunJobEvidence(
     changedPathCount: changedPaths.length || numberValue(job.changedPathCount),
     ownershipViolations,
     ownershipViolationCount: ownershipViolations.length || numberValue(job.ownershipViolationCount),
+    ...(usage.inputTokens ? { actualInputTokens: usage.inputTokens, inputTokens: usage.inputTokens } : {}),
+    ...(!usage.inputTokens && usage.estimatedInputTokens ? { estimatedInputTokens: usage.estimatedInputTokens } : {}),
+    ...(usage.cachedInputTokens ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+    ...(usage.uncachedInputTokens ? { uncachedInputTokens: usage.uncachedInputTokens } : {}),
+    ...(usage.outputTokens ? { actualOutputTokens: usage.outputTokens, outputTokens: usage.outputTokens } : {}),
+    ...(usage.reasoningOutputTokens ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
+    ...(usage.eventCount || usage.estimatedInputTokens ? {
+      usage: {
+        ...recordValue(job.usage),
+        input_tokens: usage.inputTokens,
+        cached_input_tokens: usage.cachedInputTokens,
+        uncached_input_tokens: usage.uncachedInputTokens,
+        output_tokens: usage.outputTokens,
+        reasoning_output_tokens: usage.reasoningOutputTokens,
+        estimated_input_tokens: usage.estimatedInputTokens,
+        estimated_from_event_bytes: usage.estimatedFromEventBytes,
+        source: usage.eventCount ? 'codex-events.jsonl' : 'codex-events.jsonl-estimate',
+        event_count: usage.eventCount
+      }
+    } : {}),
     evidencePaths: mergedEvidencePaths,
     evidencePathCount: mergedEvidencePaths.length,
     reasons: stringArray(job.reasons).length ? stringArray(job.reasons) : stringArray(merge.reasons),
@@ -2072,15 +2094,25 @@ function isHistoricalOwnershipRescopeCandidate(record: Record<string, unknown>):
 }
 
 function markCoordinatorReviewResolved(record: Record<string, unknown>, disposition: string): Record<string, unknown> {
+  const existingOriginalReasons = stringArray(record.originalReasons);
+  const originalReasons = existingOriginalReasons.length ? existingOriginalReasons : stringArray(record.reasons);
+  const retainedReasons = originalReasons.filter((reason) => !isOpenCoordinatorReviewReason(reason));
+  const decisionReason = textValue(recordValue(record.coordinatorDecision).reason, '');
+  const reasons = uniquePaths([
+    ...retainedReasons,
+    ...(decisionReason ? [decisionReason] : [])
+  ]);
   return {
     ...record,
     reviewResolved: true,
     originalBucket: record.originalBucket ?? record.bucket,
     originalStatus: record.originalStatus ?? record.status,
+    ...(originalReasons.length ? { originalReasons } : {}),
     bucket: 'review-resolved',
     status: 'completed',
     disposition: disposition || 'review-resolved',
     mergeReadiness: 'review-resolved',
+    reasons,
     health: ['failed', 'warning'].includes(normalized(record.health)) ? 'resolved' : record.health
   };
 }
@@ -2126,6 +2158,15 @@ function isCoordinatorPortBucket(value: unknown): boolean {
     || bucket === 'needs-coordinator-port'
     || bucket === 'needs-coordinator-review'
     || bucket === 'needs-coordinator-decision';
+}
+
+function isOpenCoordinatorReviewReason(value: unknown): boolean {
+  const reason = normalized(value);
+  return isCoordinatorPortBucket(reason)
+    || reason === 'needs-port'
+    || reason === 'needs-review'
+    || reason === 'manual-port-required'
+    || reason === 'manual port required';
 }
 
 function coordinatorFacingMachineKey(value: string): string {
@@ -2256,6 +2297,7 @@ function lifetimeDashboardSummary(jobs: Array<Record<string, unknown>>): Record<
     averageDurationMs: jobs.length ? Math.round(durationMs / jobs.length) : 0,
     maxDurationMs: jobs.reduce((max, job) => Math.max(max, numberValue(job.durationMs)), 0),
     actualInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.actualInputTokens), 0),
+    estimatedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.estimatedInputTokens), 0),
     cachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.cachedInputTokens), 0),
     uncachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.uncachedInputTokens), 0),
     bucketCounts: countJobsByBucket(jobs)
@@ -2468,17 +2510,18 @@ function groupRecordsByText(
 
 function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<Record<string, unknown>>): Record<string, unknown> {
   const bucketMs = 24 * 60 * 60 * 1000;
-  const buckets = new Map<number, { at: number; terminalJobCount: number; warningJobCount: number; failureJobCount: number; durationMs: number; actualInputTokens: number; uncachedInputTokens: number; eventCount: number }>();
+  const buckets = new Map<number, { at: number; terminalJobCount: number; warningJobCount: number; failureJobCount: number; durationMs: number; actualInputTokens: number; estimatedInputTokens: number; uncachedInputTokens: number; eventCount: number }>();
   for (const job of jobs) {
     const at = numberValue(job.finishedAt) || numberValue(job.generatedAt) || numberValue(job.startedAt);
     if (!at) continue;
     const bucketAt = startOfLocalDay(at);
-    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
+    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, estimatedInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
     if (['completed', 'failed', 'blocked'].includes(textValue(job.status, '').toLowerCase())) bucket.terminalJobCount += 1;
     if (textValue(job.health, '') === 'warning') bucket.warningJobCount += 1;
     if (isLifetimeFailedJob(job)) bucket.failureJobCount += 1;
     bucket.durationMs += numberValue(job.durationMs);
     bucket.actualInputTokens += numberValue(job.actualInputTokens);
+    bucket.estimatedInputTokens += numberValue(job.estimatedInputTokens);
     bucket.uncachedInputTokens += numberValue(job.uncachedInputTokens);
     buckets.set(bucketAt, bucket);
   }
@@ -2486,7 +2529,7 @@ function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<
     const at = numberValue(event.at);
     if (!at) continue;
     const bucketAt = startOfLocalDay(at);
-    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
+    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, estimatedInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
     bucket.eventCount += 1;
     buckets.set(bucketAt, bucket);
   }
@@ -2501,6 +2544,7 @@ function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<
       failureJobCount: points.reduce((sum, point) => sum + point.failureJobCount, 0),
       durationMs: points.reduce((sum, point) => sum + point.durationMs, 0),
       actualInputTokens: points.reduce((sum, point) => sum + point.actualInputTokens, 0),
+      estimatedInputTokens: points.reduce((sum, point) => sum + point.estimatedInputTokens, 0),
       uncachedInputTokens: points.reduce((sum, point) => sum + point.uncachedInputTokens, 0),
       missingTimestampJobCount: jobs.filter((job) => !numberValue(job.finishedAt) && !numberValue(job.generatedAt) && !numberValue(job.startedAt)).length
     }
@@ -2787,6 +2831,7 @@ function mergeActiveRunJobTelemetry(jobs: unknown[], activeJobs: Array<Record<st
       ...record,
       ...(numberValue(activeJob.actualInputTokens) ? { actualInputTokens: numberValue(activeJob.actualInputTokens) } : {}),
       ...(numberValue(activeJob.inputTokens) ? { inputTokens: numberValue(activeJob.inputTokens) } : {}),
+      ...(numberValue(activeJob.estimatedInputTokens) ? { estimatedInputTokens: numberValue(activeJob.estimatedInputTokens) } : {}),
       ...(numberValue(activeJob.cachedInputTokens) ? { cachedInputTokens: numberValue(activeJob.cachedInputTokens) } : {}),
       ...(numberValue(activeJob.uncachedInputTokens) ? { uncachedInputTokens: numberValue(activeJob.uncachedInputTokens) } : {}),
       ...(numberValue(activeJob.actualOutputTokens) ? { actualOutputTokens: numberValue(activeJob.actualOutputTokens) } : {}),
@@ -2813,6 +2858,7 @@ function jobTelemetryKeys(job: Record<string, unknown>): string[] {
 function hasTokenTelemetry(job: Record<string, unknown>): boolean {
   return numberValue(job.actualInputTokens)
     + numberValue(job.inputTokens)
+    + numberValue(job.estimatedInputTokens)
     + numberValue(job.cachedInputTokens)
     + numberValue(job.uncachedInputTokens)
     + numberValue(job.outputTokens)

@@ -1349,7 +1349,9 @@ tr.risk-review td:first-child { color: var(--review); }
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
-  overflow: hidden;
+  padding: 8px;
+  overflow: auto;
+  scrollbar-gutter: stable;
 }
 .lane-roster-panel {
   --lane-roster-columns: minmax(180px, 1.1fr) minmax(210px, 1.2fr) minmax(116px, .55fr) minmax(260px, 1.4fr);
@@ -1368,7 +1370,7 @@ tr.risk-review td:first-child { color: var(--review); }
   min-width: 0;
   display: grid;
   grid-template-columns: var(--lane-roster-columns);
-  gap: 12px;
+  gap: 10px;
   align-items: center;
 }
 .lane-roster-head {
@@ -1399,7 +1401,7 @@ tr.risk-review td:first-child { color: var(--review); }
 .lane-roster-row {
   border-bottom: 1px solid var(--line);
   background: #0d0f10;
-  padding: 8px 10px;
+  padding: 7px 10px;
 }
 .lane-roster-row:last-child {
   border-bottom: 0;
@@ -1410,7 +1412,7 @@ tr.risk-review td:first-child { color: var(--review); }
 .lane-cell {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 2px;
 }
 .lane-cell b,
 .lane-cell small,
@@ -1422,11 +1424,14 @@ tr.risk-review td:first-child { color: var(--review); }
 }
 .lane-cell b {
   color: var(--text);
+  font-size: 13px;
+  line-height: 1.2;
 }
 .lane-cell small,
 .lane-cell span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.2;
 }
 .lane-cell-agents {
   display: flex;
@@ -1443,8 +1448,9 @@ tr.risk-review td:first-child { color: var(--review); }
   border-radius: 999px;
   background: #090a0b;
   color: var(--muted);
-  padding: 2px 7px;
+  padding: 2px 6px;
   font-size: 11px;
+  line-height: 1.2;
 }
 .lane-roster-empty {
   margin: 0;
