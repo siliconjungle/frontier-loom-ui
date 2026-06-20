@@ -22,6 +22,7 @@ function linkLocalPackages() {
     ...Object.keys(packageJson.devDependencies ?? {})
   ]);
   for (const name of names) {
+    if (!name.startsWith('@shapeshift-labs/')) continue;
     const target = localPackageDir(name) ?? installedPackageDir(name);
     if (target) linkPackage(name, target);
   }
@@ -72,6 +73,11 @@ function linkPackageBins(name, linkPath, targetDir) {
     if (!binName || typeof binPath !== 'string') continue;
     const shimPath = path.join(binDir, binName);
     const scriptPath = path.relative(binDir, path.join(linkPath, binPath)).replaceAll(path.sep, '/');
+    try {
+      fs.unlinkSync(shimPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
     fs.writeFileSync(shimPath, [
       '#!/usr/bin/env node',
       "const { spawnSync } = require('node:child_process');",
