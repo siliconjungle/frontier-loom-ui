@@ -539,7 +539,7 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
       continue;
     }
   }
-  const lifetime = combineLifetimeDashboardSnapshots(
+  const lifetime = await combineLifetimeDashboardSnapshots(
     options,
     sources,
     snapshots,
@@ -1007,13 +1007,13 @@ async function findLifetimeDashboardArtifactFiles(
   return out;
 }
 
-function combineLifetimeDashboardSnapshots(
+async function combineLifetimeDashboardSnapshots(
   options: NormalizedLoomUiServerOptions,
   discoveredSources: LifetimeDashboardSource[],
   snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }>,
   reviewDecisions: CoordinatorReviewDecision[],
   queueBacklog: LifetimeQueueBacklog
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const drainedRunRoots = new Set(snapshots
     .filter((entry) => entry.source.kind === 'run' && isDrainedAutonomousRunSnapshot(entry.snapshot))
     .map((entry) => lifetimeRunRootKey(entry.source)));
@@ -1044,7 +1044,7 @@ function combineLifetimeDashboardSnapshots(
       };
     });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
-  const humanActionAnswers = recordArray(awaitNoop([]));
+  const humanActionAnswers = await readHumanActionAnswers(options);
   const summary = {
     ...lifetimeDashboardSummary(jobs),
     coordinationDelayCount: autoDrainDelays.length,
@@ -1073,6 +1073,7 @@ function combineLifetimeDashboardSnapshots(
       suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
       queueSourceCount: queueBacklog.sourceCount,
       coordinationDelayCount: autoDrainDelays.length,
+      ...(humanActionAnswers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {}),
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
     summary,
@@ -2586,10 +2587,6 @@ function isLifetimeFailedJob(job: Record<string, unknown>): boolean {
   const bucket = textValue(job.bucket, '').toLowerCase();
   if (bucket === 'rerun-work') return false;
   return status === 'failed' || health === 'failed' || bucket === 'failed-evidence';
-}
-
-function awaitNoop<T>(value: T): T {
-  return value;
 }
 
 function shouldPreferActiveRunSnapshot(jobs: unknown[], activeJobs: Array<Record<string, unknown>>): boolean {

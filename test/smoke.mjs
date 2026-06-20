@@ -689,6 +689,15 @@ try {
   } finally {
     await activeServer.close();
   }
+  const lifetimeAnswerDir = path.join(tmp, 'agent-runs', 'loom-ui-human-actions');
+  await fs.mkdir(lifetimeAnswerDir, { recursive: true });
+  await fs.writeFile(path.join(lifetimeAnswerDir, 'human-action-answers.jsonl'), JSON.stringify({
+    type: 'human-action.answer',
+    at: Date.parse('2026-06-16T00:02:00.000Z'),
+    code: 'Q-SCOPE',
+    answer: 'Q-SCOPE lifetime answer',
+    source: 'frontier-loom-ui'
+  }) + '\n');
   const lifetimeServer = await startLoomUiServer({ cwd: tmp });
   try {
     const lifetimeDashboard = await fetchJson(new URL('/api/dashboard', lifetimeServer.url));
@@ -706,6 +715,10 @@ try {
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['worker-failed'] ?? 0, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['rerun-work'] ?? 0, 1);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0, 5);
+    assert.equal(lifetimeDashboard.humanActionAnswers.length, 1);
+    assert.equal(lifetimeDashboard.humanActionAnswers[0].code, 'Q-SCOPE');
+    assert.match(lifetimeDashboard.humanActionAnswers[0].answer, /lifetime answer/);
+    assert.match(lifetimeDashboard.sources.humanActionAnswers.replace(/\\/g, '/'), /agent-runs\/loom-ui-human-actions\/human-action-answers\.jsonl$/);
     assert.equal(lifetimeDashboard.health.summary.readyToApplyJobCount, 0);
     assert.equal(lifetimeDashboard.health.summary.failedJobCount, 1);
     const dedupeJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'dedupe-job');
@@ -1067,10 +1080,11 @@ try {
 
 async function fetchJson(url, init) {
   const response = await fetch(url, init);
-  assert.equal(response.ok, true);
+  const body = await response.text();
+  assert.equal(response.ok, true, `${response.status} ${response.statusText}: ${body}`);
   assert.match(response.headers.get('content-type') ?? '', /application\/json/);
   assert.equal(response.headers.get('cache-control'), 'no-store, max-age=0');
-  return response.json();
+  return JSON.parse(body);
 }
 
 async function fetchText(url, expectedContentType) {
