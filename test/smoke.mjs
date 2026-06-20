@@ -313,13 +313,24 @@ await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-results.json'), JSON.
     }
   }
 }, null, 2) + '\n');
-await fs.mkdir(path.join(lifetimeDrainedRunDir, 'drained-job'), { recursive: true });
+await fs.mkdir(path.join(lifetimeDrainedRunDir, 'drained-job', 'evidence'), { recursive: true });
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'last-message.md'), 'Drained autonomous task completed.\n');
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'codex-events.jsonl'), [
   JSON.stringify({ type: 'turn.started' }),
   JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 123456, cached_input_tokens: 23000, output_tokens: 7890, reasoning_output_tokens: 1234 } }),
   ''
 ].join('\n'));
+await fs.writeFile(path.join(lifetimeDrainedRunDir, 'drained-job', 'evidence', 'evidence.json'), JSON.stringify({
+  jobId: 'drained-job',
+  taskId: 'drained-task',
+  verification: [
+    { command: 'npm run build', cwd: 'packages/frontier-swarm', status: 'passed' },
+    { command: 'node test/smoke.mjs', cwd: 'packages/frontier-swarm', status: 'passed' }
+  ],
+  commands: [
+    { command: 'node test/failing-smoke.mjs', cwd: 'packages/frontier-swarm', status: 'failed' }
+  ]
+}, null, 2) + '\n');
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'pids.json'), JSON.stringify({
   kind: 'frontier.swarm-codex.pid-manifest',
   version: 1,
@@ -735,6 +746,12 @@ try {
     assert.equal(drainedJob.cachedInputTokens, 23000);
     assert.equal(drainedJob.uncachedInputTokens, 100456);
     assert.equal(drainedJob.outputTokens, 7890);
+    assert.equal(drainedJob.commandsPassed.length, 2);
+    assert.equal(drainedJob.commandsFailed.length, 1);
+    assert.equal(drainedJob.commandsPassed[0].command, 'npm run build');
+    const drainedTaskDetails = await fetchJson(new URL('/api/task-details?id=drained-job&sourceRun=agent-runs/drained-autonomous-run/run-1', lifetimeServer.url));
+    assert.equal(drainedTaskDetails.commandsPassed.length, 2);
+    assert.equal(drainedTaskDetails.commandsFailed[0].command, 'node test/failing-smoke.mjs');
     const redrainJob = lifetimeDashboard.jobs.find((job) => job.originalJobId === 'redrain-job');
     assert.ok(redrainJob);
     assert.equal(redrainJob.status, 'completed');

@@ -1186,6 +1186,7 @@ async function enrichLifetimeRunJobEvidence(
   const eventsPath = path.join(jobDir, 'codex-events.jsonl');
   const rootMerge = recordValue(await readJsonFile(path.join(jobDir, 'merge.json')));
   const evidenceMerge = recordValue(await readJsonFile(path.join(evidenceDir, 'merge.json')));
+  const evidenceRecord = recordValue(await readJsonFile(path.join(evidenceDir, 'evidence.json')));
   const merge = Object.keys(rootMerge).length ? rootMerge : evidenceMerge;
   const rawPatchPath = await firstExistingRelativePath(cwd, rawRunPatchCandidates(jobDir));
   const usage = await readCodexEventUsageSummary(eventsPath);
@@ -1221,6 +1222,7 @@ async function enrichLifetimeRunJobEvidence(
     status === 'failed' && evidencePaths.length ? 'worker failed with evidence' : 'raw run evidence discovered'
   ]);
   const mergedEvidencePaths = uniquePaths([...stringArray(job.evidencePaths), ...evidencePaths]);
+  const commandEvidence = commandEvidenceFromRecords(job, merge, evidenceRecord);
   return {
     ...job,
     status,
@@ -1255,8 +1257,8 @@ async function enrichLifetimeRunJobEvidence(
     evidencePaths: mergedEvidencePaths,
     evidencePathCount: mergedEvidencePaths.length,
     reasons: stringArray(job.reasons).length ? stringArray(job.reasons) : stringArray(merge.reasons),
-    commandsPassed: recordArray(job.commandsPassed).length ? recordArray(job.commandsPassed) : recordArray(merge.commandsPassed),
-    commandsFailed: recordArray(job.commandsFailed).length ? recordArray(job.commandsFailed) : recordArray(merge.commandsFailed),
+    commandsPassed: commandEvidence.passed,
+    commandsFailed: commandEvidence.failed,
     collectReasonClasses,
     runEvidenceRecovered: true
   };
@@ -1488,6 +1490,7 @@ async function readDrainCoordinatorJob(
   const decisionsJson = path.join(evidenceDir, 'coordinator-decisions.json');
   const decisionsJsonl = path.join(evidenceDir, 'coordinator-decisions.jsonl');
   const modelAvailability = recordValue(await readJsonFile(path.join(evidenceDir, 'model-availability.json')));
+  const evidenceRecord = recordValue(await readJsonFile(path.join(evidenceDir, 'evidence.json')));
   const eventStat = await fs.stat(eventsPath).catch(() => undefined);
   const lastMessageStat = await fs.stat(lastMessagePath).catch(() => undefined);
   const decisionJsonStat = await fs.stat(decisionsJson).catch(() => undefined);
@@ -1517,6 +1520,7 @@ async function readDrainCoordinatorJob(
     path.join(evidenceDir, 'resource-allocation.json'),
     path.join(evidenceDir, 'model-availability.json')
   ]);
+  const commandEvidence = commandEvidenceFromRecords(evidenceRecord);
   return {
     id: jobId,
     originalJobId: jobId,
@@ -1542,6 +1546,8 @@ async function readDrainCoordinatorJob(
     ...(usage.eventCount ? { usage: { ...usage, source: 'codex-events.jsonl' } } : {}),
     evidencePaths,
     evidencePathCount: evidencePaths.length,
+    commandsPassed: commandEvidence.passed,
+    commandsFailed: commandEvidence.failed,
     changedPathCount: 0,
     collectReasonClasses: status === 'running' ? [`active drain ${runKind}`] : [`drain ${runKind}`],
     mergeReadiness: status,
@@ -2750,6 +2756,7 @@ async function activeRunJob(
   const lastMessagePath = path.join(jobDir, 'last-message.md');
   const mergePath = path.join(jobDir, 'merge.json');
   const eventsPath = path.join(jobDir, 'codex-events.jsonl');
+  const evidenceRecord = recordValue(await readJsonFile(path.join(jobDir, 'evidence', 'evidence.json')));
   const lastMessage = await fs.stat(lastMessagePath).catch(() => undefined);
   const merge = recordValue(await readJsonFile(mergePath));
   const live = isProcessLive(numberValue(entry.pid), entry);
@@ -2775,6 +2782,7 @@ async function activeRunJob(
     ...stringArray(merge.changedPaths),
     ...await readPatchChangedPathList(cwd, rawPatchPath)
   ]);
+  const commandEvidence = commandEvidenceFromRecords(merge, evidenceRecord);
   return {
     id: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
@@ -2821,8 +2829,8 @@ async function activeRunJob(
     ...(rawPatchPath ? { patchPath: rawPatchPath, artifactPaths: [rawPatchPath] } : {}),
     evidencePaths,
     evidencePathCount: evidencePaths.length,
-    commandsPassed: recordArray(merge.commandsPassed),
-    commandsFailed: recordArray(merge.commandsFailed),
+    commandsPassed: commandEvidence.passed,
+    commandsFailed: commandEvidence.failed,
     collectReasonClasses: status === 'running' ? ['active worker'] : quotaDeferred ? ['quota deferred'] : [],
     mergeReadiness: quotaDeferred ? 'quota-deferred' : textValue(merge.mergeReadiness, status)
   };
@@ -3100,6 +3108,133 @@ async function readJsonFile(file: string): Promise<unknown> {
   }
 }
 
+interface CommandEvidence {
+  passed: Array<Record<string, unknown>>;
+  failed: Array<Record<string, unknown>>;
+}
+
+async function commandEvidenceFromArtifactPaths(
+  cwd: string,
+  evidencePaths: readonly string[],
+  outputDir = ''
+): Promise<CommandEvidence> {
+  let out = emptyCommandEvidence();
+  for (const evidencePath of evidencePaths.slice(0, 60)) {
+    if (!evidencePath.endsWith('.json')) continue;
+    const displayPath = resolveRelativeArtifactPath(outputDir, evidencePath);
+    const absolute = path.isAbsolute(displayPath) ? displayPath : path.resolve(cwd, displayPath);
+    const roots = uniquePaths([cwd, outputDir].filter(Boolean).map((root) => path.resolve(root)));
+    if (!roots.some((root) => isPathInside(root, absolute))) continue;
+    out = mergeCommandEvidence(out, commandEvidenceFromRecords(recordValue(await readJsonFile(absolute))));
+  }
+  return out;
+}
+
+function commandEvidenceFromRecords(...records: Array<Record<string, unknown>>): CommandEvidence {
+  let out = emptyCommandEvidence();
+  for (const record of records) {
+    out = mergeCommandEvidence(out, {
+      passed: [
+        ...commandRecordsFromKnownBucket(record.commandsPassed, 'passed'),
+        ...commandRecordsFromKnownBucket(record.passedCommands, 'passed')
+      ],
+      failed: [
+        ...commandRecordsFromKnownBucket(record.commandsFailed, 'failed'),
+        ...commandRecordsFromKnownBucket(record.failedCommands, 'failed')
+      ]
+    });
+    for (const key of ['verification', 'commands', 'checks', 'testResults', 'results']) {
+      const classified = classifyCommandRecords(recordArray(record[key]));
+      out = mergeCommandEvidence(out, classified);
+    }
+  }
+  return out;
+}
+
+function commandRecordsFromKnownBucket(value: unknown, fallbackStatus: 'passed' | 'failed'): Array<Record<string, unknown>> {
+  return recordArray(value)
+    .map((record) => normalizedCommandRecord(record, fallbackStatus))
+    .filter((record): record is Record<string, unknown> => Boolean(record));
+}
+
+function classifyCommandRecords(records: Array<Record<string, unknown>>): CommandEvidence {
+  const out = emptyCommandEvidence();
+  for (const record of records) {
+    const classified = classifyCommandRecord(record);
+    if (classified.status === 'passed') out.passed.push(classified.record);
+    else if (classified.status === 'failed') out.failed.push(classified.record);
+  }
+  return normalizeCommandEvidence(out);
+}
+
+function classifyCommandRecord(record: Record<string, unknown>): { status: 'passed' | 'failed' | ''; record: Record<string, unknown> } {
+  const statusText = normalized(record.status ?? record.result ?? record.outcome ?? record.state);
+  const exitCode = hasOwnKey(record, 'exitCode') ? numberValue(record.exitCode) : undefined;
+  const status = commandStatus(statusText, exitCode);
+  return { status, record: normalizedCommandRecord(record, status || undefined) ?? record };
+}
+
+function commandStatus(statusText: string, exitCode: number | undefined): 'passed' | 'failed' | '' {
+  if (['passed', 'pass', 'ok', 'success', 'succeeded', 'completed', 'green'].includes(statusText)) return 'passed';
+  if (['failed', 'fail', 'failure', 'error', 'errored', 'red', 'timeout', 'timed-out', 'blocked', 'nonzero'].includes(statusText)) return 'failed';
+  if (exitCode !== undefined) return exitCode === 0 ? 'passed' : 'failed';
+  return '';
+}
+
+function normalizedCommandRecord(
+  record: Record<string, unknown>,
+  fallbackStatus?: 'passed' | 'failed'
+): Record<string, unknown> | undefined {
+  const command = textValue(record.command ?? record.cmd ?? record.name ?? record.label, '');
+  const cwd = textValue(record.cwd ?? record.dir, '');
+  const status = textValue(record.status ?? record.result ?? record.outcome ?? record.state, fallbackStatus ?? '');
+  if (!command && !cwd && !status) return undefined;
+  return {
+    ...record,
+    ...(command && !record.command ? { command } : {}),
+    ...(cwd && !record.cwd ? { cwd } : {}),
+    ...(status && !record.status ? { status } : {})
+  };
+}
+
+function mergeCommandEvidence(...entries: CommandEvidence[]): CommandEvidence {
+  return normalizeCommandEvidence({
+    passed: entries.flatMap((entry) => entry.passed),
+    failed: entries.flatMap((entry) => entry.failed)
+  });
+}
+
+function normalizeCommandEvidence(evidence: CommandEvidence): CommandEvidence {
+  return {
+    passed: uniqueCommandRecords(evidence.passed),
+    failed: uniqueCommandRecords(evidence.failed)
+  };
+}
+
+function uniqueCommandRecords(records: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const seen = new Set<string>();
+  const out: Array<Record<string, unknown>> = [];
+  for (const record of records) {
+    const key = [
+      textValue(record.command ?? record.name, ''),
+      textValue(record.cwd, ''),
+      normalized(record.status ?? record.result ?? record.outcome)
+    ].join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(record);
+  }
+  return out;
+}
+
+function emptyCommandEvidence(): CommandEvidence {
+  return { passed: [], failed: [] };
+}
+
+function hasOwnKey(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
 function isProcessLive(pid: number, entry?: Record<string, unknown>): boolean {
   if (!pid) return false;
   try {
@@ -3146,13 +3281,15 @@ async function readTaskDetails(
   const { bundle, outputDir } = entry;
   const patchPath = textValue(bundle.patchPath, '');
   const evidencePaths = stringArray(bundle.evidencePaths).slice(0, 40);
+  const evidenceCommands = await commandEvidenceFromArtifactPaths(options.cwd, evidencePaths, outputDir);
+  const commandEvidence = mergeCommandEvidence(commandEvidenceFromRecords(bundle), evidenceCommands);
   return {
     ok: true,
     jobId,
     ...(patchPath ? { patchArtifact: artifactRecord(patchPath) } : {}),
     files: patchPath ? await readPatchFiles(options, patchPath) : [],
-    commandsPassed: recordArray(bundle.commandsPassed).slice(0, 20),
-    commandsFailed: recordArray(bundle.commandsFailed).slice(0, 20),
+    commandsPassed: commandEvidence.passed.slice(0, 20),
+    commandsFailed: commandEvidence.failed.slice(0, 20),
     evidenceArtifacts: evidencePaths.map((evidencePath) => artifactRecord(resolveRelativeArtifactPath(outputDir, evidencePath), evidencePath))
   };
 }
@@ -3191,14 +3328,15 @@ async function findRawRunTaskBundle(
     path.join(match, 'evidence', 'resource-allocation.json'),
     ...rawRunPatchCandidates(match)
   ]);
+  const evidenceCommands = await commandEvidenceFromArtifactPaths(options.cwd, evidencePaths);
   return {
     bundle: {
       jobId: path.basename(match),
       patchPath,
       changedPaths: await readPatchChangedPathList(options.cwd, patchPath),
       evidencePaths,
-      commandsPassed: [],
-      commandsFailed: []
+      commandsPassed: evidenceCommands.passed,
+      commandsFailed: evidenceCommands.failed
     }
   };
 }
