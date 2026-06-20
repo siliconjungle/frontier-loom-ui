@@ -1,4 +1,4 @@
-import { watch, type FSWatcher } from 'node:fs';
+import { existsSync, watch, type FSWatcher } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -253,6 +253,8 @@ async function handleRequest(
     await serveFile(response, path.join(packageDir, 'client.js'), 'application/javascript; charset=utf-8');
   } else if (request.method === 'GET' && url.pathname === '/vendor/frontier-dom/jsx-runtime.js') {
     await serveFile(response, resolveFrontierDomRuntime(), 'application/javascript; charset=utf-8');
+  } else if (request.method === 'GET' && url.pathname === '/favicon.ico') {
+    serveFavicon(response);
   } else if (request.method === 'GET') {
     const file = staticFile(options.staticDir, url.pathname);
     await serveFile(response, file, contentType(file));
@@ -4026,6 +4028,11 @@ function writeJson(response: http.ServerResponse, status: number, value: unknown
   response.end(JSON.stringify(value, null, 2));
 }
 
+function serveFavicon(response: http.ServerResponse): void {
+  response.writeHead(200, responseHeaders('image/svg+xml; charset=utf-8'));
+  response.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="4" fill="#0b0d0f"/><path d="M4 5h8v2H6v2h5v2H4z" fill="#d6d9de"/></svg>');
+}
+
 async function readJsonBody(request: http.IncomingMessage, maxBytes: number): Promise<unknown> {
   let bytes = 0;
   const chunks: Buffer[] = [];
@@ -4049,7 +4056,11 @@ function responseHeaders(contentType: string): Record<string, string> {
 }
 
 function resolveFrontierDomRuntime(): string {
-  return path.join(packageDir, '..', 'node_modules', '@shapeshift-labs', 'frontier-dom', 'dist', 'jsx-runtime.js');
+  const candidates = [
+    path.join(packageDir, '..', 'node_modules', '@shapeshift-labs', 'frontier-dom', 'dist', 'jsx-runtime.js'),
+    path.join(packageDir, '..', '..', 'frontier-dom', 'dist', 'jsx-runtime.js')
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
 }
 
 function contentType(file: string): string {
