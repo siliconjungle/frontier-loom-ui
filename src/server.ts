@@ -509,7 +509,9 @@ async function readScopedDashboardSnapshot(
   const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions).map(withRecomputedCostFields);
   const normalizedSummary = recordValue(normalizedSnapshot.summary);
   const adjustedSummary = reviewDecisionAdjustedSummary(normalizedSummary, mergedJobs);
+  const rawCollectionSummary = recordValue(recordValue(recordValue(record.raw).collection).summary);
   const semanticSummary = {
+    ...rawCollectionSummary,
     ...adjustedSummary,
     bucketCounts: recordValue(normalizedSummary.bucketCounts)
   };
@@ -2810,7 +2812,7 @@ function semanticWithHealth(
   summary: Record<string, unknown>,
   jobs: Array<Record<string, unknown>>
 ): Record<string, unknown> {
-  if (Object.keys(recordValue(semantic.health)).length) return semantic;
+  const existingHealth = recordValue(semantic.health);
   const sourceSummary = { ...recordValue(summary.bucketCounts), ...summary };
   const imports = recordValue(semantic.import);
   const edit = recordValue(semantic.edit);
@@ -2885,6 +2887,38 @@ function semanticWithHealth(
     ...(blockedCount ? ['semantic-blocked'] : []),
     ...(openCoordinatorReviewCount ? ['open-coordinator-review'] : [])
   ]).slice(0, 12);
+  const parserHealth = {
+    lossCount: parserLosses,
+    lossSeverityCounts: parserLossSeverityCounts,
+    warningCount: parserWarnings,
+    expectedMissingReasonCodes
+  };
+  const ledgerHealth = {
+    totalCount: numberValue(ledger.total),
+    landedCount: ledgerLanded,
+    skippedCount: ledgerSkipped,
+    failedCount: ledgerFailed
+  };
+  const mergeHealth = {
+    autoMergeCandidateCount: autoMergeCandidates,
+    reviewRequiredCount,
+    conflictCount,
+    staleCount,
+    blockedCount,
+    needsPortCount,
+    reasonCodes: reviewReasonCodes
+  };
+  const gatesHealth = {
+    status: semanticGateStatus({ failedCount, warningCount, passedCount }),
+    passedCount,
+    warningCount,
+    failedCount,
+    reasonCodes: gateReasonCodes
+  };
+  const outcomesHealth = {
+    openCoordinatorReviewCount,
+    synthesizedResearchCompleteCount
+  };
   return {
     ...semantic,
     import: {
@@ -2893,40 +2927,290 @@ function semanticWithHealth(
       lossSeverityCounts: parserLossSeverityCounts
     },
     health: {
-      parser: {
-        lossCount: parserLosses,
-        lossSeverityCounts: parserLossSeverityCounts,
-        warningCount: parserWarnings,
-        expectedMissingReasonCodes
-      },
-      ledger: {
-        totalCount: numberValue(ledger.total),
-        landedCount: ledgerLanded,
-        skippedCount: ledgerSkipped,
-        failedCount: ledgerFailed
-      },
-      merge: {
-        autoMergeCandidateCount: autoMergeCandidates,
-        reviewRequiredCount,
+      ...existingHealth,
+      parser: { ...parserHealth, ...recordValue(existingHealth.parser) },
+      ledger: { ...ledgerHealth, ...recordValue(existingHealth.ledger) },
+      merge: { ...mergeHealth, ...recordValue(existingHealth.merge) },
+      gates: { ...gatesHealth, ...recordValue(existingHealth.gates) },
+      outcomes: { ...outcomesHealth, ...recordValue(existingHealth.outcomes) },
+      admission: semanticAdmissionHealth({
+        sourceSummary,
+        semantic,
+        existingHealth,
+        imports,
+        replay,
+        jobAdmission,
+        scriptAdmission,
+        jobAdmissionStatusCounts,
+        scriptAdmissionStatusCounts,
+        jobs,
+        parserLosses,
+        parserWarnings,
+        ledgerLanded,
+        autoMergeCandidates,
         conflictCount,
         staleCount,
-        blockedCount,
-        needsPortCount,
-        reasonCodes: reviewReasonCodes
-      },
-      gates: {
-        status: semanticGateStatus({ failedCount, warningCount, passedCount }),
-        passedCount,
-        warningCount,
-        failedCount,
-        reasonCodes: gateReasonCodes
-      },
-      outcomes: {
+        reviewRequiredCount,
         openCoordinatorReviewCount,
-        synthesizedResearchCompleteCount
-      }
+        expectedMissingReasonCodes
+      })
     }
   };
+}
+
+const SEMANTIC_ADMISSION_STATUS_KEYS = [
+  'safe-merged',
+  'safe-with-losses',
+  'conflict',
+  'no-op',
+  'stale',
+  'missing-sidecar',
+  'coordinator-review',
+  'tests-missing'
+] as const;
+
+type SemanticAdmissionStatusKey = typeof SEMANTIC_ADMISSION_STATUS_KEYS[number];
+
+function semanticAdmissionHealth(input: {
+  sourceSummary: Record<string, unknown>;
+  semantic: Record<string, unknown>;
+  existingHealth: Record<string, unknown>;
+  imports: Record<string, unknown>;
+  replay: Record<string, unknown>;
+  jobAdmission: Record<string, unknown>;
+  scriptAdmission: Record<string, unknown>;
+  jobAdmissionStatusCounts: Record<string, number>;
+  scriptAdmissionStatusCounts: Record<string, number>;
+  jobs: Array<Record<string, unknown>>;
+  parserLosses: number;
+  parserWarnings: number;
+  ledgerLanded: number;
+  autoMergeCandidates: number;
+  conflictCount: number;
+  staleCount: number;
+  reviewRequiredCount: number;
+  openCoordinatorReviewCount: number;
+  expectedMissingReasonCodes: string[];
+}): Record<string, unknown> {
+  const existingAdmission = recordValue(input.existingHealth.admission);
+  const reasonCodeCounts = semanticAdmissionReasonCodeCounts(input);
+  const statusCounts = emptySemanticAdmissionStatusCounts();
+  addSemanticAdmissionStatusCounts(statusCounts, input.jobAdmissionStatusCounts);
+  addSemanticAdmissionStatusCounts(statusCounts, input.scriptAdmissionStatusCounts);
+  addSemanticAdmissionStatusCounts(statusCounts, numberRecordValue(recordValue(existingAdmission.statusCounts)));
+  const replaySafeCount = firstNumber(input.replay.acceptedCleanCount, input.semantic.acceptedClean) +
+    numberValue(input.replay.alreadyAppliedCount);
+  setRecordMinimum(statusCounts, 'safe-merged', Math.max(replaySafeCount, input.ledgerLanded, input.autoMergeCandidates));
+  setRecordMinimum(statusCounts, 'safe-with-losses', Math.max(
+    numberValue(reasonCodeCounts['lossy-import']),
+    input.parserLosses + input.parserWarnings > 0 && numberValue(statusCounts['safe-merged']) > 0 ? input.parserLosses + input.parserWarnings : 0
+  ));
+  setRecordMinimum(statusCounts, 'conflict', Math.max(
+    input.conflictCount,
+    numberValue(reasonCodeCounts['symbol-conflict']) + numberValue(reasonCodeCounts['effect-conflict'])
+  ));
+  setRecordMinimum(statusCounts, 'stale', Math.max(
+    input.staleCount,
+    numberValue(reasonCodeCounts['stale-source-hash']),
+    numberValue(input.sourceSummary['stale-against-head'])
+  ));
+  setRecordMinimum(statusCounts, 'missing-sidecar', Math.max(
+    numberValue(reasonCodeCounts['missing-sidecar']),
+    input.expectedMissingReasonCodes.filter((reason) => semanticAdmissionReasonCode(reason) === 'missing-sidecar').length
+  ));
+  setRecordMinimum(statusCounts, 'coordinator-review', Math.max(
+    input.reviewRequiredCount,
+    input.openCoordinatorReviewCount,
+    numberValue(input.sourceSummary['needs-coordinator-review'])
+  ));
+  setRecordMinimum(statusCounts, 'tests-missing', numberValue(reasonCodeCounts['tests-missing']));
+  return {
+    ...existingAdmission,
+    statusCounts,
+    reasonCodeCounts,
+    totalCount: sumNumberRecordValues(statusCounts),
+    reasonTotalCount: sumNumberRecordValues(reasonCodeCounts)
+  };
+}
+
+function emptySemanticAdmissionStatusCounts(): Record<string, number> {
+  return SEMANTIC_ADMISSION_STATUS_KEYS.reduce<Record<string, number>>((out, key) => {
+    out[key] = 0;
+    return out;
+  }, {});
+}
+
+function addSemanticAdmissionStatusCounts(
+  out: Record<string, number>,
+  counts: Record<string, number>
+): void {
+  for (const [status, count] of Object.entries(counts)) {
+    const key = semanticAdmissionStateKey(status);
+    if (key && count > 0) out[key] += count;
+  }
+}
+
+function semanticAdmissionReasonCodeCounts(input: {
+  sourceSummary: Record<string, unknown>;
+  semantic: Record<string, unknown>;
+  existingHealth: Record<string, unknown>;
+  imports: Record<string, unknown>;
+  replay: Record<string, unknown>;
+  jobAdmission: Record<string, unknown>;
+  scriptAdmission: Record<string, unknown>;
+  jobs: Array<Record<string, unknown>>;
+  parserLosses: number;
+  parserWarnings: number;
+  conflictCount: number;
+  staleCount: number;
+  reviewRequiredCount: number;
+  openCoordinatorReviewCount: number;
+  expectedMissingReasonCodes: string[];
+}): Record<string, number> {
+  const counts: Record<string, number> = {};
+  const existingAdmission = recordValue(input.existingHealth.admission);
+  const admission = recordValue(input.semantic.admission);
+  addReasonCodeCountRecord(counts, recordValue(input.sourceSummary.semanticAdmissionReasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(input.sourceSummary.semanticCollectAdmissionReasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(input.sourceSummary.semanticEditAdmissionReasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(input.sourceSummary.semanticEditScriptAdmissionReasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(admission.reasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(input.jobAdmission.reasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(input.scriptAdmission.reasonCodeCounts));
+  addReasonCodeCountRecord(counts, recordValue(existingAdmission.reasonCodeCounts));
+  addReasonCodeSignals(counts, [
+    ...stringArray(input.sourceSummary.semanticAdmissionReasonCodes),
+    ...stringArray(input.sourceSummary.semanticCollectAdmissionReasonCodes),
+    ...stringArray(input.sourceSummary.semanticImportExpectedMissingReasonCodes),
+    ...stringArray(input.sourceSummary.semanticLineageReasonCodes),
+    ...stringArray(input.sourceSummary.semanticEditScriptReasonCodes),
+    ...stringArray(input.sourceSummary.semanticEditProjectionReasonCodes),
+    ...stringArray(input.sourceSummary.semanticEditReplayReasonCodes),
+    ...input.expectedMissingReasonCodes,
+    ...stringArray(input.imports.expectedMissingReasonCodes),
+    ...stringArray(input.replay.reasonCodes)
+  ]);
+  for (const job of input.jobs) {
+    addReasonCodeSignals(counts, [
+      textValue(job.semanticAdmissionStatus, ''),
+      textValue(job.semanticReadiness, ''),
+      textValue(job.bucket, ''),
+      textValue(job.disposition, ''),
+      textValue(job.mergeReadiness, ''),
+      ...stringArray(job.semanticReadinessReasons),
+      ...stringArray(job.collectReasonClasses),
+      ...stringArray(job.reasons)
+    ]);
+  }
+  setRecordMinimum(counts, 'lossy-import', input.parserLosses + input.parserWarnings);
+  setRecordMinimum(counts, 'stale-source-hash', input.staleCount);
+  setRecordMinimum(counts, 'symbol-conflict', input.conflictCount);
+  setRecordMinimum(counts, 'coordinator-review', input.reviewRequiredCount + input.openCoordinatorReviewCount);
+  return counts;
+}
+
+function addReasonCodeCountRecord(out: Record<string, number>, counts: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(counts)) {
+    const count = numberValue(value);
+    if (count <= 0) continue;
+    const code = semanticAdmissionReasonCode(key) ?? normalizedStatusKey(key);
+    out[code] = (out[code] ?? 0) + count;
+  }
+}
+
+function addReasonCodeSignals(out: Record<string, number>, values: string[]): void {
+  for (const value of values) {
+    const code = semanticAdmissionReasonCode(value);
+    if (code) out[code] = (out[code] ?? 0) + 1;
+  }
+}
+
+function semanticAdmissionStateKey(value: unknown): SemanticAdmissionStatusKey | undefined {
+  const signal = normalizedStatusKey(value);
+  if (!signal) return undefined;
+  if (signal === 'safe-merged' ||
+    signal === 'safe' ||
+    signal === 'accepted' ||
+    signal === 'accepted-clean' ||
+    signal === 'clean' ||
+    signal === 'ready' ||
+    signal === 'pass' ||
+    signal === 'auto-merge-candidate' ||
+    signal === 'already-applied' ||
+    signal === 'portable') return 'safe-merged';
+  if (signal === 'safe-with-losses' ||
+    signal === 'lossy' ||
+    signal === 'lossy-import' ||
+    signal === 'warning' ||
+    signal === 'warnings' ||
+    signal === 'clean-with-losses') return 'safe-with-losses';
+  if (signal === 'conflict' ||
+    signal === 'conflicts' ||
+    signal === 'symbol-conflict' ||
+    signal === 'effect-conflict' ||
+    signal === 'blocked') return 'conflict';
+  if (signal === 'no-op' ||
+    signal === 'noop' ||
+    signal === 'not-applicable' ||
+    signal === 'no-semantic-edit-script' ||
+    signal === 'evidence-only') return 'no-op';
+  if (signal === 'stale' ||
+    signal === 'rerun' ||
+    signal === 'stale-against-head' ||
+    signal === 'stale-source-hash') return 'stale';
+  if (signal === 'missing-sidecar' ||
+    signal === 'empty-sidecar') return 'missing-sidecar';
+  if (signal === 'coordinator-review' ||
+    signal === 'needs-coordinator-review' ||
+    signal === 'needs-coordinator-port' ||
+    signal === 'needs-human-port' ||
+    signal === 'needs-human-review' ||
+    signal === 'review' ||
+    signal === 'review-required' ||
+    signal === 'needs-review' ||
+    signal === 'needs-port') return 'coordinator-review';
+  if (signal === 'tests-missing' ||
+    signal === 'missing-tests') return 'tests-missing';
+  return undefined;
+}
+
+function semanticAdmissionReasonCode(value: unknown): string | undefined {
+  const signal = normalizedStatusKey(value);
+  if (!signal) return undefined;
+  if (signal.includes('tests-missing') || signal.includes('missing-tests') || (signal.includes('test') && signal.includes('missing'))) return 'tests-missing';
+  if (signal.includes('missing-sidecar') ||
+    signal.includes('empty-sidecar') ||
+    signal.includes('missing-semantic-import-sidecar') ||
+    (signal.includes('missing') && signal.includes('sidecar'))) return 'missing-sidecar';
+  if (signal.includes('stale-source-hash') ||
+    signal.includes('stale-against-head') ||
+    signal.includes('stale') ||
+    ((signal.includes('current') || signal.includes('head')) && (signal.includes('hash') || signal.includes('anchor') || signal.includes('source') || signal.includes('base')))) return 'stale-source-hash';
+  if (signal.includes('effect-conflict') || (signal.includes('effect') && (signal.includes('conflict') || signal.includes('mismatch') || signal.includes('blocked')))) return 'effect-conflict';
+  if (signal.includes('symbol-conflict') ||
+    signal.includes('semantic-conflict') ||
+    signal.includes('symbol-anchor') ||
+    signal.includes('anchor-content-mismatch') ||
+    signal.includes('anchor-changed') ||
+    signal.includes('conflict')) return 'symbol-conflict';
+  if (signal.includes('lossy-import') ||
+    signal.includes('parser-error-loss') ||
+    signal.includes('loss')) return 'lossy-import';
+  if (signal.includes('coordinator-review') ||
+    signal.includes('open-coordinator-review') ||
+    signal.includes('review-required') ||
+    signal.includes('needs-review') ||
+    signal.includes('needs-port') ||
+    signal.includes('human-port')) return 'coordinator-review';
+  return undefined;
+}
+
+function setRecordMinimum(record: Record<string, number>, key: string, value: number): void {
+  if (value > (record[key] ?? 0)) record[key] = value;
+}
+
+function sumNumberRecordValues(record: Record<string, number>): number {
+  return Object.values(record).reduce((sum, value) => sum + numberValue(value), 0);
 }
 
 function isSynthesizedResearchCompleteRecord(job: Record<string, unknown>): boolean {
@@ -2961,7 +3245,7 @@ function admissionStatusCount(record: Record<string, number>, wanted: string): n
 }
 
 function normalizedStatusKey(value: unknown): string {
-  return textValue(value, '').trim().replace(/_/g, '-').toLowerCase();
+  return textValue(value, '').trim().replace(/[\s_]+/g, '-').toLowerCase();
 }
 
 function semanticGateStatus(input: { failedCount: number; warningCount: number; passedCount: number }): string {
@@ -3514,8 +3798,9 @@ async function readJsonFile(file: string): Promise<unknown> {
 }
 
 function withRecomputedCostFields(record: Record<string, unknown>): Record<string, unknown> {
+  const sourceRecord = withSourceOutputState(record);
   const model = textValue(record.model ?? record.pricingModel ?? record.pricingMatchedModel, '');
-  if (!model || !hasCostTokenEvidence(record)) return record;
+  if (!model || !hasCostTokenEvidence(record)) return sourceRecord;
   const cost = estimateCodexModelCost({
     model,
     estimatedInputTokens: firstCostTokenNumber(record.estimatedInputTokens, record.estimated_input_tokens),
@@ -3525,7 +3810,7 @@ function withRecomputedCostFields(record: Record<string, unknown>): Record<strin
     outputTokens: optionalCostTokenNumber(record.actualOutputTokens, record.outputTokens, record.completionTokens, record.responseTokens, record.actual_output_tokens, record.output_tokens, record.completion_tokens, record.response_tokens)
   });
   return {
-    ...record,
+    ...sourceRecord,
     billableInputTokens: cost.billableInputTokens,
     priceKnown: cost.priceKnown,
     ...(cost.pricingModel ? { pricingModel: cost.pricingModel } : {}),
@@ -3544,6 +3829,88 @@ function withRecomputedCostFields(record: Record<string, unknown>): Record<strin
     costEstimateLongContext: cost.costEstimateLongContext,
     ...(cost.unknownPricingReason ? { unknownPricingReason: cost.unknownPricingReason } : { unknownPricingReason: undefined })
   };
+}
+
+function withSourceOutputState(record: Record<string, unknown>): Record<string, unknown> {
+  if (textValue(record.sourceOutputState, '')) return record;
+  const summary = sourceOutputSummary(record);
+  if (!summary.state) return record;
+  return {
+    ...record,
+    sourceOutputState: summary.state,
+    sourceOutputLabel: summary.label,
+    sourceOutputDetail: summary.detail
+  };
+}
+
+function sourceOutputSummary(record: Record<string, unknown>): { state: string; label: string; detail: string } {
+  const changedPathCount = numberValue(record.changedPathCount) || stringArray(record.changedPaths).length;
+  const evidencePathCount = numberValue(record.evidencePathCount) || stringArray(record.evidencePaths).length;
+  const hasPatch = sourceOutputHasPatchArtifact(record);
+  const signals = sourceOutputSignals(record);
+  const recoveryStatus = sourceOutputRecoveryStatus(record);
+  const workspaceRecovery = Boolean(recoveryStatus) || signals.some((signal) => signal.includes('collector-workspace-only-recovery'));
+  const failedPatch = recoveryStatus === 'failed-patch'
+    || signals.some((signal) => signal.includes('collector-workspace-only-recovery-failed-patch') || signal === 'empty patch' || signal === 'empty-patch');
+
+  if (failedPatch) return {
+    state: 'recovered-patch-failed',
+    label: changedPathCount ? `${changedPathCount} ${changedPathCount === 1 ? 'path' : 'paths'}, patch failed` : 'patch generation failed',
+    detail: changedPathCount
+      ? 'Source changed, but recovered patch generation failed.'
+      : 'Patch generation failed before a source diff could be attached.'
+  };
+  if (workspaceRecovery && (hasPatch || changedPathCount)) return {
+    state: 'recovered-patch',
+    label: changedPathCount ? `${changedPathCount} recovered ${changedPathCount === 1 ? 'path' : 'paths'}` : 'recovered patch',
+    detail: changedPathCount
+      ? 'Source changed and the collector recovered a patch from the worker workspace.'
+      : 'The collector recovered a patch, but changed paths are not indexed yet.'
+  };
+  if (!changedPathCount && hasPatch) return {
+    state: 'patch-unindexed',
+    label: 'patch not indexed yet',
+    detail: 'A patch artifact exists, but changed paths are not indexed yet.'
+  };
+  if (!changedPathCount && evidencePathCount) return {
+    state: 'evidence-only',
+    label: 'evidence only',
+    detail: 'No source files changed; this task produced evidence only.'
+  };
+  if (!changedPathCount) return {
+    state: 'no-source-files',
+    label: 'no source files',
+    detail: 'No source files are reported for this task.'
+  };
+  return { state: '', label: '', detail: '' };
+}
+
+function sourceOutputSignals(record: Record<string, unknown>): string[] {
+  return uniquePaths([
+    ...stringArray(record.collectReasonClasses),
+    ...stringArray(record.reasons),
+    ...stringArray(record.semanticReadinessReasons),
+    textValue(record.disposition, ''),
+    textValue(record.mergeReadiness, ''),
+    textValue(record.status, '')
+  ].map(normalized));
+}
+
+function sourceOutputRecoveryStatus(record: Record<string, unknown>): string {
+  const metadata = recordValue(record.metadata);
+  const swarmCodex = recordValue(metadata.frontierSwarmCodex);
+  const workspaceOnly = recordValue(swarmCodex.workspaceOnlyCollection);
+  return normalized(workspaceOnly.recoveryStatus);
+}
+
+function sourceOutputHasPatchArtifact(record: Record<string, unknown>): boolean {
+  const paths = [
+    textValue(record.patchPath, ''),
+    textValue(record.patchArtifactPath, ''),
+    ...stringArray(record.artifactPaths),
+    ...stringArray(record.evidencePaths)
+  ];
+  return paths.some((entry) => /\.patch(?:$|[?#])/.test(entry));
 }
 
 function hasCostTokenEvidence(record: Record<string, unknown>): boolean {

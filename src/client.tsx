@@ -131,6 +131,8 @@ type SemanticHealthSummary = {
   gateFailed: number;
   synthesizedResearchComplete: number;
   openCoordinatorReview: number;
+  admissionStatusCounts: Record<string, number>;
+  admissionReasonCodeCounts: Record<string, number>;
   reasonCodes: string[];
 };
 
@@ -1153,7 +1155,7 @@ function AgentWorkerCard({ worker, index, now }: { worker: AgentWorker; index: n
   const model = agentModelSummary(worker);
   const files = agentTouchedFiles(worker);
   const evidenceCount = agentEvidenceCount(worker);
-  const fileFallback = evidenceCount ? 'Evidence only' : worker.status === 'active' ? 'Files pending' : 'No source files';
+  const fileFallback = agentFileFallback(worker, evidenceCount);
   const visibleJobs = worker.currentJobs.slice(0, 2);
   const hiddenJobCount = Math.max(0, worker.currentJobs.length - visibleJobs.length);
   return <article
@@ -1315,12 +1317,12 @@ function TaskFileDiffs({ job, details }: { job: TaskBoardItem; details?: TaskDet
   </section>;
   if (changedPaths.length) return <section className="task-dialog-section">
     <h4>Files changed</h4>
-    <p className="empty tight">{details?.error ? `Diff unavailable: ${details.error}` : 'No patch diff was available in the collected evidence.'}</p>
+    <p className="empty tight">{fileDiffFallbackText(job, details)}</p>
     <ArtifactPathList paths={changedPaths} />
   </section>;
   return <section className="task-dialog-section">
     <h4>Files changed</h4>
-    <p className="empty tight">{job.boardKind === 'backlog' ? 'No files yet. This item has not produced an implementation patch.' : 'No changed files reported.'}</p>
+    <p className="empty tight">{noChangedFilesText(job)}</p>
   </section>;
 }
 
@@ -1777,6 +1779,14 @@ function agentEvidenceCount(worker: AgentWorker): number {
   return worker.jobs.reduce((sum, job) => sum + numberValue(job.evidencePathCount), 0);
 }
 
+function agentFileFallback(worker: AgentWorker, evidenceCount: number): string {
+  const summaries = worker.jobs.map(sourceOutputSummary);
+  if (summaries.some((summary) => summary.state === 'recovered-patch-failed')) return 'Patch failed';
+  if (summaries.some((summary) => summary.state === 'recovered-patch')) return 'Recovered patch';
+  if (evidenceCount) return 'Evidence only';
+  return worker.status === 'active' ? 'Files pending' : 'No source files';
+}
+
 function agentWorkerSort(left: TaskBoardItem, right: TaskBoardItem): number {
   return agentStatusRank(agentStatus(left)) - agentStatusRank(agentStatus(right))
     || taskBoardJobSort(left, right);
@@ -1887,9 +1897,11 @@ function taskDetailSummary(job: Record<string, unknown>): string {
 function taskMarkdownSummary(job: Record<string, unknown>): string {
   const changed = formatNumber(numberValue(job.changedPathCount));
   const evidence = formatNumber(numberValue(job.evidencePathCount));
+  const sourceOutput = sourceOutputSummary(job);
   const reasons = taskReasonItems(job);
   const reasonText = reasons.length ? ` Main signal: ${reasons[0]}.` : '';
-  return `${taskTitle(job)} is in ${taskBoardColumnTitle(taskBoardColumnId(job)).toLowerCase()} with ${changed} changed paths and ${evidence} evidence artifacts.${reasonText}`;
+  const sourceText = sourceOutput.detail ? ` ${sourceOutput.detail}` : '';
+  return `${taskTitle(job)} is in ${taskBoardColumnTitle(taskBoardColumnId(job)).toLowerCase()} with ${changed} changed paths and ${evidence} evidence artifacts.${sourceText}${reasonText}`;
 }
 
 function coordinatorDecisionStatus(job: Record<string, unknown>): string {
@@ -3991,13 +4003,114 @@ function pathSummaryText(job: Record<string, unknown>): string {
   const changedPathCount = numberValue(job.changedPathCount);
   const evidencePathCount = numberValue(job.evidencePathCount);
   const ignoredCount = ignoredOwnership.length + ignoredChangedPathCount;
+  const sourceOutput = sourceOutputSummary(job);
   if (sourceOwnership.length) return `${text(sourceOwnership.length)} source issue`;
   if (quarantinedChangedPathCount) return `${text(quarantinedChangedPathCount)} quarantined`;
   if (ignoredCount) return `${text(ignoredCount)} generated noise`;
+  if (sourceOutput.state === 'recovered-patch' || sourceOutput.state === 'recovered-patch-failed') return sourceOutput.label;
   if (!changedPathCount && hasPatchArtifact(job)) return 'patch not indexed yet';
-  if (!changedPathCount && evidencePathCount) return 'evidence only';
+  if (!changedPathCount && evidencePathCount) return sourceOutput.label;
   if (!changedPathCount && isActiveAgentJob(job as TaskBoardItem)) return 'files pending';
   return `${text(changedPathCount)} changed ${changedPathCount === 1 ? 'path' : 'paths'}`;
+}
+
+type SourceOutputSummary = {
+  state: 'recovered-patch' | 'recovered-patch-failed' | 'patch-unindexed' | 'evidence-only' | 'no-source-files' | '';
+  label: string;
+  detail: string;
+};
+
+function sourceOutputSummary(job: Record<string, unknown>): SourceOutputSummary {
+  const explicitState = normalized(job.sourceOutputState);
+  const explicitLabel = textValue(job.sourceOutputLabel, '');
+  const explicitDetail = textValue(job.sourceOutputDetail, '');
+  if (explicitState) return {
+    state: sourceOutputStateValue(explicitState),
+    label: explicitLabel || sentenceCaseIdentifier(explicitState),
+    detail: explicitDetail
+  };
+
+  const changedPathCount = numberValue(job.changedPathCount) || stringArray(job.changedPaths).length;
+  const evidencePathCount = numberValue(job.evidencePathCount) || stringArray(job.evidencePaths).length;
+  const hasPatch = hasPatchArtifact(job);
+  const signals = sourceOutputSignals(job);
+  const recoveryStatus = sourceOutputRecoveryStatus(job);
+  const workspaceRecovery = recoveryStatus !== '' || signals.some((signal) => signal.includes('collector-workspace-only-recovery'));
+  const failedPatch = recoveryStatus === 'failed-patch'
+    || signals.some((signal) => signal.includes('collector-workspace-only-recovery-failed-patch') || signal === 'empty patch' || signal === 'empty-patch');
+
+  if (failedPatch) return {
+    state: 'recovered-patch-failed',
+    label: changedPathCount ? `${text(changedPathCount)} ${changedPathCount === 1 ? 'path' : 'paths'}, patch failed` : 'patch generation failed',
+    detail: changedPathCount
+      ? 'Source changed, but recovered patch generation failed.'
+      : 'Patch generation failed before a source diff could be attached.'
+  };
+  if (workspaceRecovery && (hasPatch || changedPathCount)) return {
+    state: 'recovered-patch',
+    label: changedPathCount ? `${text(changedPathCount)} recovered ${changedPathCount === 1 ? 'path' : 'paths'}` : 'recovered patch',
+    detail: changedPathCount
+      ? 'Source changed and the collector recovered a patch from the worker workspace.'
+      : 'The collector recovered a patch, but changed paths are not indexed yet.'
+  };
+  if (!changedPathCount && hasPatch) return {
+    state: 'patch-unindexed',
+    label: 'patch not indexed yet',
+    detail: 'A patch artifact exists, but changed paths are not indexed yet.'
+  };
+  if (!changedPathCount && evidencePathCount) return {
+    state: 'evidence-only',
+    label: 'evidence only',
+    detail: 'No source files changed; this task produced evidence only.'
+  };
+  if (!changedPathCount) return {
+    state: 'no-source-files',
+    label: 'no source files',
+    detail: 'No source files are reported for this task.'
+  };
+  return { state: '', label: '', detail: '' };
+}
+
+function sourceOutputStateValue(value: string): SourceOutputSummary['state'] {
+  if (value === 'recovered-patch') return 'recovered-patch';
+  if (value === 'recovered-patch-failed') return 'recovered-patch-failed';
+  if (value === 'patch-unindexed') return 'patch-unindexed';
+  if (value === 'evidence-only') return 'evidence-only';
+  if (value === 'no-source-files') return 'no-source-files';
+  return '';
+}
+
+function sourceOutputSignals(job: Record<string, unknown>): string[] {
+  return uniqueStrings([
+    ...stringArray(job.collectReasonClasses),
+    ...stringArray(job.reasons),
+    ...stringArray(job.semanticReadinessReasons),
+    textValue(job.disposition, ''),
+    textValue(job.mergeReadiness, ''),
+    textValue(job.status, '')
+  ].map(normalized));
+}
+
+function sourceOutputRecoveryStatus(job: Record<string, unknown>): string {
+  const metadata = recordValue(job.metadata);
+  const swarmCodex = recordValue(metadata.frontierSwarmCodex);
+  const workspaceOnly = recordValue(swarmCodex.workspaceOnlyCollection);
+  return normalized(workspaceOnly.recoveryStatus);
+}
+
+function fileDiffFallbackText(job: TaskBoardItem, details?: TaskDetails): string {
+  if (details?.error) return `Diff unavailable: ${details.error}`;
+  const sourceOutput = sourceOutputSummary(job);
+  if (sourceOutput.state === 'recovered-patch-failed') return 'Source changed, but recovered patch generation failed. Review the listed paths and evidence.';
+  if (sourceOutput.state === 'recovered-patch') return 'Recovered source paths are known, but patch text is not available in the dashboard.';
+  return 'No patch diff was available in the collected evidence.';
+}
+
+function noChangedFilesText(job: TaskBoardItem): string {
+  const sourceOutput = sourceOutputSummary(job);
+  if (sourceOutput.state === 'evidence-only') return 'No source files changed; this task produced evidence only.';
+  if (job.boardKind === 'backlog') return 'No files yet. This item has not produced an implementation patch.';
+  return 'No changed files reported.';
 }
 
 function hasPatchArtifact(job: Record<string, unknown>): boolean {
@@ -5809,6 +5922,7 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
   const merge = recordValue(health.merge);
   const gates = recordValue(health.gates);
   const outcomes = recordValue(health.outcomes);
+  const admissionHealth = recordValue(health.admission);
   const admissionRows = [
     ...semanticAdmissionRows(admission.jobs, 'Jobs'),
     ...semanticAdmissionRows(admission.scripts, 'Scripts')
@@ -5821,6 +5935,20 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
     acceptedClean: firstNumber(replay.acceptedCleanCount, input.acceptedClean),
     conflicts: firstNumber(merge.conflictCount, replay.conflictCount, input.conflicts)
   };
+  const admissionReasonCodeCounts = numberRecordValue(recordValue(admissionHealth.reasonCodeCounts));
+  const admissionStatusCounts = semanticAdmissionStatusCounts(
+    admission,
+    admissionHealth,
+    {
+      safeMerged: Math.max(metrics.autoMerge, metrics.acceptedClean, numberValue(replay.alreadyAppliedCount), numberValue(ledger.landedCount)),
+      safeWithLosses: numberValue(admissionReasonCodeCounts['lossy-import']) || firstNumber(parser.lossCount, imports.lossCount),
+      conflict: metrics.conflicts,
+      stale: numberValue(merge.staleCount) || numberValue(admissionReasonCodeCounts['stale-source-hash']),
+      missingSidecar: numberValue(admissionReasonCodeCounts['missing-sidecar']),
+      coordinatorReview: Math.max(numberValue(merge.reviewRequiredCount), numberValue(outcomes.openCoordinatorReviewCount)),
+      testsMissing: numberValue(admissionReasonCodeCounts['tests-missing'])
+    }
+  );
   const semanticHealth: SemanticHealthSummary = {
     parserLosses: firstNumber(parser.lossCount, imports.lossCount),
     parserWarnings: firstNumber(parser.warningCount, imports.warningCount),
@@ -5836,6 +5964,8 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
     gateFailed: numberValue(gates.failedCount),
     synthesizedResearchComplete: numberValue(outcomes.synthesizedResearchCompleteCount),
     openCoordinatorReview: numberValue(outcomes.openCoordinatorReviewCount),
+    admissionStatusCounts,
+    admissionReasonCodeCounts,
     reasonCodes: uniqueStrings([
       ...stringArray(parser.expectedMissingReasonCodes),
       ...stringArray(merge.reasonCodes),
@@ -5945,12 +6075,158 @@ function semanticHealthRows(semantic: SemanticMetricsSummary): Array<{ label: st
     { label: 'Parser losses', value: formatNumber(health.parserLosses), detail: `${formatNumber(health.parserWarnings)} warnings · ${reasonDetail}` },
     { label: 'Ledger losses', value: formatNumber(ledgerLosses), detail: `${formatNumber(health.ledgerFailed)} failed · ${formatNumber(health.ledgerSkipped)} skipped · ${formatNumber(health.ledgerLanded)} landed` },
     { label: 'Auto-merge candidates', value: formatNumber(health.autoMergeCandidates), detail: `${formatNumber(semantic.acceptedClean)} replay clean` },
+    ...semanticAdmissionHealthRows(semantic),
     { label: 'Review-required reasons', value: formatNumber(health.reviewRequired), detail: reasonDetail },
     { label: 'Conflicts', value: formatNumber(health.conflicts), detail: 'semantic script, replay, or admission conflicts' },
     { label: 'Gate status', value: semanticGateLabel(health.gateStatus), detail: `${formatNumber(health.gateFailed)} failed · ${formatNumber(health.gateWarnings)} review · ${formatNumber(health.gatePassed)} pass` },
     { label: 'Synthesized/research complete', value: formatNumber(health.synthesizedResearchComplete), detail: 'completed discovery or synthesized outputs' },
     { label: 'Open coordinator review', value: formatNumber(health.openCoordinatorReview), detail: 'outputs still waiting on coordinator decision' }
   ];
+}
+
+const SEMANTIC_ADMISSION_STATUS_KEYS = [
+  'safe-merged',
+  'safe-with-losses',
+  'conflict',
+  'no-op',
+  'stale',
+  'missing-sidecar',
+  'coordinator-review',
+  'tests-missing'
+] as const;
+
+type SemanticAdmissionStatusKey = typeof SEMANTIC_ADMISSION_STATUS_KEYS[number];
+
+const SEMANTIC_ADMISSION_STATUS_ROWS: Array<{
+  key: SemanticAdmissionStatusKey;
+  label: string;
+  detail: string;
+  reasonCodes: string[];
+}> = [
+  { key: 'safe-merged', label: 'Safe merged', detail: 'semantic admission passed or replay is already clean', reasonCodes: [] },
+  { key: 'safe-with-losses', label: 'Safe with losses', detail: 'safe admission with parser or import losses attached', reasonCodes: ['lossy-import'] },
+  { key: 'conflict', label: 'Conflict', detail: 'symbol, effect, replay, or admission conflicts', reasonCodes: ['symbol-conflict', 'effect-conflict'] },
+  { key: 'no-op', label: 'No-op', detail: 'semantic evidence produced no source edit to apply', reasonCodes: [] },
+  { key: 'stale', label: 'Stale', detail: 'semantic anchor or source hash is stale against head', reasonCodes: ['stale-source-hash'] },
+  { key: 'missing-sidecar', label: 'Missing sidecar', detail: 'semantic import sidecar was expected but unavailable', reasonCodes: ['missing-sidecar'] },
+  { key: 'coordinator-review', label: 'Coordinator review', detail: 'semantic admission requires coordinator review or porting', reasonCodes: ['coordinator-review'] },
+  { key: 'tests-missing', label: 'Tests missing', detail: 'patch changed source without reported verification commands', reasonCodes: ['tests-missing'] }
+];
+
+function semanticAdmissionHealthRows(semantic: SemanticMetricsSummary): Array<{ label: string; value: string; detail: string }> {
+  return SEMANTIC_ADMISSION_STATUS_ROWS.map((row) => ({
+    label: row.label,
+    value: formatNumber(numberValue(semantic.health.admissionStatusCounts[row.key])),
+    detail: admissionReasonDetail(semantic.health.admissionReasonCodeCounts, row.reasonCodes, row.detail)
+  }));
+}
+
+function admissionReasonDetail(reasonCounts: Record<string, number>, reasonCodes: string[], fallback: string): string {
+  const reasons = reasonCodes
+    .map((code) => {
+      const count = numberValue(reasonCounts[code]);
+      return count > 0 ? `${code} ${formatNumber(count)}` : '';
+    })
+    .filter(Boolean);
+  return reasons.length ? `${fallback} · ${reasons.join(', ')}` : fallback;
+}
+
+function semanticAdmissionStatusCounts(
+  admission: Record<string, unknown>,
+  admissionHealth: Record<string, unknown>,
+  fallback: {
+    safeMerged: number;
+    safeWithLosses: number;
+    conflict: number;
+    stale: number;
+    missingSidecar: number;
+    coordinatorReview: number;
+    testsMissing: number;
+  }
+): Record<string, number> {
+  const counts = emptySemanticAdmissionStatusCounts();
+  const healthCounts = numberRecordValue(recordValue(admissionHealth.statusCounts));
+  if (Object.keys(healthCounts).length) {
+    addSemanticAdmissionStatusCounts(counts, healthCounts);
+  } else {
+    addSemanticAdmissionStatusCounts(counts, numberRecordValue(recordValue(recordValue(admission.jobs).statusCounts)));
+    addSemanticAdmissionStatusCounts(counts, numberRecordValue(recordValue(recordValue(admission.scripts).statusCounts)));
+  }
+  setRecordMinimum(counts, 'safe-merged', fallback.safeMerged);
+  setRecordMinimum(counts, 'safe-with-losses', fallback.safeWithLosses);
+  setRecordMinimum(counts, 'conflict', fallback.conflict);
+  setRecordMinimum(counts, 'stale', fallback.stale);
+  setRecordMinimum(counts, 'missing-sidecar', fallback.missingSidecar);
+  setRecordMinimum(counts, 'coordinator-review', fallback.coordinatorReview);
+  setRecordMinimum(counts, 'tests-missing', fallback.testsMissing);
+  return counts;
+}
+
+function emptySemanticAdmissionStatusCounts(): Record<string, number> {
+  return SEMANTIC_ADMISSION_STATUS_KEYS.reduce<Record<string, number>>((out, key) => {
+    out[key] = 0;
+    return out;
+  }, {});
+}
+
+function addSemanticAdmissionStatusCounts(out: Record<string, number>, counts: Record<string, number>): void {
+  for (const [status, count] of Object.entries(counts)) {
+    const key = semanticAdmissionStateKey(status);
+    if (key && count > 0) out[key] += count;
+  }
+}
+
+function semanticAdmissionStateKey(value: unknown): SemanticAdmissionStatusKey | undefined {
+  const signal = normalizedStatusKey(value);
+  if (!signal) return undefined;
+  if (signal === 'safe-merged' ||
+    signal === 'safe' ||
+    signal === 'accepted' ||
+    signal === 'accepted-clean' ||
+    signal === 'clean' ||
+    signal === 'ready' ||
+    signal === 'pass' ||
+    signal === 'auto-merge-candidate' ||
+    signal === 'already-applied' ||
+    signal === 'portable') return 'safe-merged';
+  if (signal === 'safe-with-losses' ||
+    signal === 'lossy' ||
+    signal === 'lossy-import' ||
+    signal === 'warning' ||
+    signal === 'warnings' ||
+    signal === 'clean-with-losses') return 'safe-with-losses';
+  if (signal === 'conflict' ||
+    signal === 'conflicts' ||
+    signal === 'symbol-conflict' ||
+    signal === 'effect-conflict' ||
+    signal === 'blocked') return 'conflict';
+  if (signal === 'no-op' ||
+    signal === 'noop' ||
+    signal === 'not-applicable' ||
+    signal === 'no-semantic-edit-script' ||
+    signal === 'evidence-only') return 'no-op';
+  if (signal === 'stale' ||
+    signal === 'rerun' ||
+    signal === 'stale-against-head' ||
+    signal === 'stale-source-hash') return 'stale';
+  if (signal === 'missing-sidecar' ||
+    signal === 'empty-sidecar') return 'missing-sidecar';
+  if (signal === 'coordinator-review' ||
+    signal === 'needs-coordinator-review' ||
+    signal === 'needs-coordinator-port' ||
+    signal === 'needs-human-port' ||
+    signal === 'needs-human-review' ||
+    signal === 'review' ||
+    signal === 'review-required' ||
+    signal === 'needs-review' ||
+    signal === 'needs-port') return 'coordinator-review';
+  if (signal === 'tests-missing' ||
+    signal === 'missing-tests') return 'tests-missing';
+  return undefined;
+}
+
+function setRecordMinimum(record: Record<string, number>, key: string, value: number): void {
+  if (value > (record[key] ?? 0)) record[key] = value;
 }
 
 function semanticGateLabel(value: string): string {
@@ -6020,6 +6296,15 @@ function recordValue(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+function numberRecordValue(value: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const count = numberValue(entry);
+    if (count > 0) out[key] = count;
+  }
+  return out;
+}
+
 function arrayRecords(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.map(recordValue).filter((entry) => Object.keys(entry).length > 0) : [];
 }
@@ -6030,6 +6315,10 @@ function stringArray(value: unknown): string[] {
 
 function normalized(value: unknown): string {
   return textValue(value, '').toLowerCase();
+}
+
+function normalizedStatusKey(value: unknown): string {
+  return textValue(value, '').trim().replace(/[\s_]+/g, '-').toLowerCase();
 }
 
 function formatTime(value: unknown): string {

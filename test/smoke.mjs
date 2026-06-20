@@ -82,15 +82,23 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     semanticLineageNeedsReview: 1,
     semanticLineageReasonCodes: ['ambiguous-lineage-candidates'],
     semanticProofSpecFailedObligations: 1,
+    semanticCollectAdmissionReasonCodeCounts: {
+      'lossy-import': 1,
+      'symbol-conflict': 1,
+      'stale-source-hash': 1,
+      'missing-sidecar': 2,
+      'coordinator-review': 1,
+      'tests-missing': 1
+    },
     semanticEditAdmission: {
-      statusCounts: { accepted: 2, blocked: 1 },
+      statusCounts: { accepted: 2, blocked: 1, 'safe-with-losses': 1, 'not-applicable': 1, stale: 1, 'review-required': 1 },
       autoMergeCandidateCount: 1,
       cleanEligibleCount: 1,
       portableCount: 1,
       cleanEligibleCandidateCount: 1
     },
     semanticEditScriptAdmission: {
-      statusCounts: { clean: 1, conflict: 1 },
+      statusCounts: { clean: 1, conflict: 1, 'no-semantic-edit-script': 1 },
       autoMergeCandidateCount: 1,
       cleanEligibleCount: 1,
       portableCount: 1,
@@ -153,9 +161,9 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     }]
   },
   buckets: {
-    'ready-to-apply': [{ bucket: 'ready-to-apply', jobId: 'ui-job', mergePath: 'merge-ui.json', outputDir: collectionDir, bundle: { jobId: 'ui-job', taskId: 'ui-task', lane: 'ui', status: 'completed', mergeReadiness: 'ready-to-apply', disposition: 'ready', patchPath, evidencePaths: ['ui-evidence.json'], reasons: ['synthesized-research-complete'], commandsPassed: [{ command: 'npm test', summary: 'all smoke checks passed' }], commandsFailed: [], durationMs: 125000 } }],
+    'ready-to-apply': [{ bucket: 'ready-to-apply', jobId: 'ui-job', mergePath: 'merge-ui.json', outputDir: collectionDir, bundle: { jobId: 'ui-job', taskId: 'ui-task', lane: 'ui', status: 'completed', mergeReadiness: 'ready-to-apply', disposition: 'ready', patchPath, changedPaths: ['src/board.ts'], evidencePaths: ['ui-evidence.json'], reasons: ['collector-workspace-only-recovery', 'synthesized-research-complete'], commandsPassed: [{ command: 'npm test', summary: 'all smoke checks passed' }], commandsFailed: [], durationMs: 125000 } }],
     'needs-human-port': [{ bucket: 'needs-human-port', jobId: 'runtime-job', mergePath: 'merge-runtime.json', outputDir: collectionDir, bundle: { jobId: 'runtime-job', taskId: 'runtime-task', lane: 'runtime', status: 'completed', mergeReadiness: 'needs-port', disposition: 'needs-port', evidencePaths: ['runtime-evidence.json'], reasons: ['manual port required'], contextBudget: { status: 'warning', action: 'continue', measured: { promptBytes: 64000, estimatedInputTokens: 16000 }, usage: { inputTokens: 28000 }, warnings: ['actual input tokens 28000 exceeded warning budget 20000'], errors: [] } } }],
-    'failed-evidence': [{ bucket: 'failed-evidence', jobId: 'review-job', mergePath: 'merge-review.json', outputDir: collectionDir, bundle: { jobId: 'review-job', taskId: 'review-task', lane: 'review', status: 'failed', mergeReadiness: 'blocked', disposition: 'blocked', evidencePaths: [], reasons: ['missing proof'] } }],
+    'failed-evidence': [{ bucket: 'failed-evidence', jobId: 'review-job', mergePath: 'merge-review.json', outputDir: collectionDir, bundle: { jobId: 'review-job', taskId: 'review-task', lane: 'review', status: 'failed', mergeReadiness: 'rejected', disposition: 'rejected', changedPaths: ['src/review-worker.ts'], evidencePaths: [], reasons: ['collector-workspace-only-recovery', 'collector-workspace-only-recovery-failed-patch', 'empty patch'] } }],
     'stale-against-head': []
   }
 }, null, 2) + '\n');
@@ -734,12 +742,22 @@ try {
   assert.equal(dashboard.semantic.admission.jobs.statusCounts.accepted, 2);
   assert.equal(dashboard.semantic.health.parser.lossCount, 2);
   assert.equal(dashboard.semantic.health.ledger.failedCount, 1);
-  assert.equal(dashboard.semantic.health.merge.reviewRequiredCount, 2);
+  assert.equal(dashboard.semantic.health.merge.reviewRequiredCount, 3);
   assert.equal(dashboard.semantic.health.merge.conflictCount, 3);
   assert.equal(dashboard.semantic.health.gates.status, 'blocked');
   assert.ok(dashboard.semantic.health.gates.reasonCodes.includes('ambiguous-edit'));
   assert.equal(dashboard.semantic.health.outcomes.synthesizedResearchCompleteCount, 1);
   assert.equal(dashboard.semantic.health.outcomes.openCoordinatorReviewCount, 1);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['safe-merged'], 3);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['safe-with-losses'], 2);
+  assert.equal(dashboard.semantic.health.admission.statusCounts.conflict, 3);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['no-op'], 2);
+  assert.equal(dashboard.semantic.health.admission.statusCounts.stale, 2);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['missing-sidecar'], 2);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['coordinator-review'], 3);
+  assert.equal(dashboard.semantic.health.admission.statusCounts['tests-missing'], 1);
+  assert.equal(dashboard.semantic.health.admission.reasonCodeCounts['missing-sidecar'], 2);
+  assert.equal(dashboard.semantic.health.admission.reasonCodeCounts['tests-missing'], 1);
   assert.equal(dashboard.graph.nodeCount, 4);
   assert.equal(dashboard.graph.safeMergeCandidateCount, 1);
   assert.equal(dashboard.graph.status, 'ready');
@@ -870,8 +888,21 @@ try {
     await lifetimeServer.close();
   }
   assert.deepEqual(dashboard.lanes.map((lane) => lane.id), ['review', 'runtime', 'ui']);
-  assert.equal(dashboard.jobs.find((job) => job.id === 'runtime-job').bucket, 'needs-coordinator-review');
-  assert.equal(dashboard.jobs.find((job) => job.id === 'review-job').status, 'failed');
+  const recoveredPatchJob = dashboard.jobs.find((job) => job.id === 'ui-job');
+  assert.ok(recoveredPatchJob);
+  assert.equal(recoveredPatchJob.sourceOutputState, 'recovered-patch');
+  assert.equal(recoveredPatchJob.sourceOutputLabel, '1 recovered path');
+  assert.match(recoveredPatchJob.sourceOutputDetail, /Source changed/);
+  const evidenceOnlyJob = dashboard.jobs.find((job) => job.id === 'runtime-job');
+  assert.ok(evidenceOnlyJob);
+  assert.equal(evidenceOnlyJob.bucket, 'needs-coordinator-review');
+  assert.equal(evidenceOnlyJob.sourceOutputState, 'evidence-only');
+  assert.equal(evidenceOnlyJob.sourceOutputLabel, 'evidence only');
+  const failedRecoveryJob = dashboard.jobs.find((job) => job.id === 'review-job');
+  assert.ok(failedRecoveryJob);
+  assert.equal(failedRecoveryJob.status, 'failed');
+  assert.equal(failedRecoveryJob.sourceOutputState, 'recovered-patch-failed');
+  assert.equal(failedRecoveryJob.sourceOutputLabel, '1 path, patch failed');
   const taskDetails = await fetchJson(new URL('/api/task-details?id=ui-job', server.url));
   assert.equal(taskDetails.ok, true);
   assert.equal(taskDetails.jobId, 'ui-job');
@@ -1168,6 +1199,14 @@ try {
     'Semantic merge health',
     'Parser losses',
     'Ledger losses',
+    'Safe merged',
+    'Safe with losses',
+    'Conflict',
+    'No-op',
+    'Stale',
+    'Missing sidecar',
+    'Coordinator review',
+    'Tests missing',
     'Review-required reasons',
     'Gate status',
     'Synthesized/research complete',
