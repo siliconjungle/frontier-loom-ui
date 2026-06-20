@@ -5262,15 +5262,16 @@ const MODEL_PRICES_PER_MILLION: ModelPriceEntry[] = [
 
 function modelCostSummary(jobs: Array<Record<string, unknown>>): { value: string; detail: string } {
   const allCosts = jobs.map(modelCostForJob);
-  const costs = allCosts.filter((entry) => entry.price);
+  const costs = allCosts.filter((entry) => entry.costKnown);
   const unpricedCount = allCosts.length - costs.length;
   const total = costs.reduce((sum, entry) => sum + entry.cost, 0);
   if (!costs.length) return { value: '-', detail: 'no priced model labels in this run' };
-  const billableTokenJobs = costs.filter((entry) => entry.uncachedInputTokens > 0 || entry.cachedInputTokens > 0 || entry.outputTokens > 0).length;
+  const billableTokenJobs = costs.filter((entry) => entry.cost > 0 || entry.uncachedInputTokens > 0 || entry.cachedInputTokens > 0 || entry.outputTokens > 0).length;
   const models = uniqueStrings(costs.map((entry) => entry.model));
   const outputJobs = costs.filter((entry) => entry.outputTokens > 0).length;
   const estimated = costs.filter((entry) => entry.estimatedInput).length;
   const longContextJobs = costs.filter((entry) => entry.longContext).length;
+  const backendEstimated = costs.filter((entry) => entry.backendEstimate).length;
   const pricingSources = uniqueStrings(costs.map((entry) => entry.pricingSource).filter((value): value is string => Boolean(value)));
   const modelText = models.length > 3 ? `${models.slice(0, 3).join(', ')} +${models.length - 3}` : models.join(', ');
   const sourceText = pricingSources.length ? ` · ${pricingSources.join(', ')}` : '';
@@ -5281,21 +5282,22 @@ function modelCostSummary(jobs: Array<Record<string, unknown>>): { value: string
   const scope = outputJobs === 0 ? 'input-only' : outputJobs === costs.length ? 'input+output' : 'input+partial output';
   const estimatedText = estimated ? ` · ${formatNumber(estimated)} estimated-input jobs` : '';
   const longContextText = longContextJobs ? ` · ${formatNumber(longContextJobs)} long-context priced` : '';
+  const backendText = backendEstimated ? ` · ${formatNumber(backendEstimated)} backend-priced jobs` : '';
   const missingOutputText = outputJobs > 0 && outputJobs < costs.length ? ` · ${formatNumber(costs.length - outputJobs)} without output tokens` : '';
   const noOutputText = outputJobs === 0 ? ' · no output tokens reported' : '';
-  return { value: formatUsd(total), detail: `${scope} estimate · ${modelText}${sourceText}${longContextText}${estimatedText}${missingOutputText}${noOutputText}${unpricedText}` };
+  return { value: formatUsd(total), detail: `${scope} estimate · ${modelText}${sourceText}${longContextText}${backendText}${estimatedText}${missingOutputText}${noOutputText}${unpricedText}` };
 }
 
 function modelCostRows(jobs: Array<Record<string, unknown>>): Array<{ label: string; value: string; detail: string }> {
   return jobs
     .map((job) => ({ job, cost: modelCostForJob(job) }))
-    .filter((entry) => entry.cost.price && entry.cost.cost > 0)
+    .filter((entry) => entry.cost.costKnown && entry.cost.cost > 0)
     .sort((left, right) => right.cost.cost - left.cost.cost)
     .slice(0, 5)
     .map(({ job, cost }) => ({
       label: `${ticketId(job)} · ${taskTitle(job)}`,
       value: formatUsd(cost.cost),
-      detail: `${cost.model} estimate · ${formatNumber(cost.uncachedInputTokens)} uncached · ${formatNumber(cost.cachedInputTokens)} cached${cost.outputTokens ? ` · ${formatNumber(cost.outputTokens)} output` : ''}${cost.longContext ? ' · long context' : ''}${cost.estimatedInput ? ' · estimated input' : ''}`
+      detail: `${cost.model} estimate · ${formatNumber(cost.uncachedInputTokens)} uncached · ${formatNumber(cost.cachedInputTokens)} cached${cost.outputTokens ? ` · ${formatNumber(cost.outputTokens)} output` : ''}${cost.longContext ? ' · long context' : ''}${cost.backendEstimate ? ' · backend priced' : ''}${cost.estimatedInput ? ' · estimated input' : ''}`
     }));
 }
 
@@ -5309,17 +5311,39 @@ function modelCostForJob(job: Record<string, unknown>): {
   outputTokens: number;
   estimatedInput: boolean;
   longContext: boolean;
+  backendEstimate: boolean;
+  costKnown: boolean;
   cost: number;
 } {
   const model = agentModelLabel(job as TaskBoardItem);
   const priceEntry = modelPriceEntryForModel(model);
   const input = inputTokenBreakdownForJob(job);
   const outputTokens = jobOutputTokens(job);
+  const backendCost = backendCostEstimateForJob(job);
   const longContext = Boolean(priceEntry?.longContextPrice && priceEntry.longContextThreshold && input.inputTokens > priceEntry.longContextThreshold);
   const price = priceEntry ? (longContext ? priceEntry.longContextPrice ?? priceEntry.price : priceEntry.price) : undefined;
-  if (!price) return { model, ...input, outputTokens, longContext: false, cost: 0 };
+  if (backendCost > 0) {
+    return {
+      model: textValue(job.pricingModel ?? job.pricingMatchedModel, model),
+      price,
+      pricingSource: textValue(job.pricingSource, 'backend cost estimate'),
+      ...input,
+      outputTokens,
+      longContext,
+      backendEstimate: true,
+      costKnown: true,
+      cost: backendCost
+    };
+  }
+  if (!price) return { model, ...input, outputTokens, longContext: false, backendEstimate: false, costKnown: false, cost: 0 };
   const cost = ((input.uncachedInputTokens * price.input) + (input.cachedInputTokens * price.cachedInput) + (outputTokens * price.output)) / 1_000_000;
-  return { model, price, pricingSource: priceEntry?.source, ...input, outputTokens, longContext, cost };
+  return { model, price, pricingSource: priceEntry?.source, ...input, outputTokens, longContext, backendEstimate: false, costKnown: true, cost };
+}
+
+function backendCostEstimateForJob(job: Record<string, unknown>): number {
+  const microUsd = firstPositiveNumber(job.estimatedCostMicroUsd, job.estimated_cost_micro_usd);
+  if (microUsd > 0) return microUsd / 1_000_000;
+  return firstPositiveNumber(job.estimatedCostUsd, job.estimated_cost_usd);
 }
 
 function modelPriceEntryForModel(model: string): ModelPriceEntry | undefined {
