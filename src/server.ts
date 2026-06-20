@@ -26,6 +26,7 @@ const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
 const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 2500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
+const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
 const dashboardStreamListeners = new Set<() => void>();
 
 let dashboardSnapshotCache: {
@@ -472,11 +473,13 @@ async function readScopedDashboardSnapshot(
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return activeRunSnapshot ?? snapshot;
   const answers = await readHumanActionAnswers(options);
   const record = snapshot as unknown as Record<string, unknown>;
-  const graph = await readDashboardRunGraphSummary(options, record);
+  const collectionGraph = await readDashboardRunGraphSummary(options, record);
   const jobs = Array.isArray(record.jobs) ? record.jobs : [];
   const activeJobs = recordArray(activeRunSnapshot?.jobs);
   if (shouldPreferActiveRunSnapshot(jobs, activeJobs)) {
     const activeAgentRows = activeAgentsFromJobs(activeJobs);
+    const activeGraph = recordValue(activeRunSnapshot?.graph);
+    const graph = Object.keys(activeGraph).length ? activeGraph : collectionGraph;
     return {
       ...activeRunSnapshot,
       collectionJobs: jobs,
@@ -515,6 +518,7 @@ async function readScopedDashboardSnapshot(
     ...adjustedSummary,
     bucketCounts: recordValue(normalizedSummary.bucketCounts)
   };
+  const graph = withDashboardRunGraphJobHealth(collectionGraph, mergedJobs);
   return {
     ...normalizedSnapshot,
     ...(graph ? { graph } : {}),
@@ -540,22 +544,42 @@ async function readDashboardRunGraphSummary(
   snapshot: Record<string, unknown>
 ): Promise<Record<string, unknown> | undefined> {
   const embedded = recordValue(recordValue(recordValue(snapshot.raw).collection).runGraph);
-  const file = await resolveDashboardRunGraphFile(options, snapshot);
-  const graph = Object.keys(embedded).length ? embedded : file ? recordValue(await readJsonFile(file)) : {};
-  if (!Object.keys(graph).length) return undefined;
-  return summarizeDashboardRunGraph(graph, file ? path.relative(options.cwd, file).replaceAll(path.sep, '/') : textValue(graph.id, 'embedded'));
+  if (Object.keys(embedded).length) {
+    return summarizeDashboardRunGraph(embedded, {
+      sourceFile: textValue(embedded.id, 'embedded'),
+      sourceKind: 'embedded-run-graph',
+      sourceStatus: 'collected'
+    });
+  }
+  const source = await resolveDashboardRunGraphSource(options, snapshot);
+  if (source?.file) {
+    return summarizeDashboardRunGraph(recordValue(await readJsonFile(source.file)), {
+      sourceFile: path.relative(options.cwd, source.file).replaceAll(path.sep, '/'),
+      sourceKind: 'collected-run-graph',
+      sourceStatus: 'collected'
+    });
+  }
+  if (source?.expectedFile) {
+    return missingDashboardRunGraphSummary(options.cwd, {
+      expectedFile: source.expectedFile,
+      sourceKind: 'collected-run-graph',
+      warning: 'Collected dashboard source has no run-graph.json.'
+    });
+  }
+  return undefined;
 }
 
-async function resolveDashboardRunGraphFile(
+async function resolveDashboardRunGraphSource(
   options: NormalizedLoomUiServerOptions,
   snapshot: Record<string, unknown>
-): Promise<string | undefined> {
+): Promise<{ file?: string; expectedFile?: string } | undefined> {
   const sources = recordValue(snapshot.sources);
   const candidates = uniquePaths([
     textValue(options.collection, ''),
     textValue(sources.collectionDir, ''),
     path.dirname(textValue(sources.collectionFile, ''))
   ].filter(Boolean));
+  let expectedFile: string | undefined;
   for (const candidate of candidates) {
     const absolute = path.resolve(options.cwd, candidate);
     if (!isPathInside(options.cwd, absolute)) continue;
@@ -566,20 +590,75 @@ async function resolveDashboardRunGraphFile(
       : path.basename(absolute) === 'run-graph.json'
         ? absolute
         : path.join(path.dirname(absolute), 'run-graph.json');
+    expectedFile ??= file;
     const fileStat = await fs.stat(file).catch(() => undefined);
-    if (fileStat?.isFile() && isPathInside(options.cwd, file)) return file;
+    if (fileStat?.isFile() && isPathInside(options.cwd, file)) return { file, expectedFile: file };
   }
-  return undefined;
+  return expectedFile ? { expectedFile } : undefined;
 }
 
-function summarizeDashboardRunGraph(graph: Record<string, unknown>, sourceFile: string): Record<string, unknown> | undefined {
+function missingDashboardRunGraphSummary(
+  cwd: string,
+  input: { expectedFile: string; sourceKind: string; warning: string }
+): Record<string, unknown> {
+  const sourceFile = path.relative(cwd, input.expectedFile).replaceAll(path.sep, '/');
+  const warning = `${input.warning} Expected ${sourceFile}.`;
+  return {
+    sourceFile,
+    sourceFiles: [sourceFile],
+    sourceKind: input.sourceKind,
+    sourceKinds: [input.sourceKind],
+    sourceStatus: 'missing',
+    sourceStatuses: ['missing'],
+    graphMissing: true,
+    graphMissingWarningCount: 1,
+    graphMissingWarnings: [warning],
+    nodeCount: 0,
+    edgeCount: 0,
+    blockerCount: 0,
+    openBlockerCount: 0,
+    humanQuestionCount: 0,
+    openHumanQuestionCount: 0,
+    safeMergeCandidateCount: 0,
+    decisionCount: 0,
+    terminalDecisionCount: 0,
+    terminalAcceptedCount: 0,
+    terminalRejectedCount: 0,
+    terminalRerunCount: 0,
+    gateCount: 0,
+    gatePassedCount: 0,
+    gateFailedCount: 0,
+    staleCount: 0,
+    openStaleCount: 0,
+    rerunCount: 0,
+    openRerunCount: 0,
+    staleRerunCleanupCount: 0,
+    status: 'missing',
+    summaryLine: warning,
+    recentEvents: []
+  };
+}
+
+function summarizeDashboardRunGraph(
+  graph: Record<string, unknown>,
+  input: {
+    sourceFile: string;
+    sourceKind: string;
+    sourceStatus: string;
+    graphMissing?: boolean;
+    graphMissingWarnings?: string[];
+    liveEventCount?: number;
+  }
+): Record<string, unknown> | undefined {
   const summary = recordValue(graph.summary);
   const nodes = recordArray(graph.nodes);
   const edges = recordArray(graph.edges);
   const nodeCount = numberValue(summary.nodeCount) || nodes.length;
   const edgeCount = numberValue(summary.edgeCount) || edges.length;
-  if (!nodeCount && !edgeCount) return undefined;
+  if (!nodeCount && !edgeCount && !input.graphMissing) return undefined;
   const gateNodes = nodes.filter((node) => normalized(node.kind) === 'gate');
+  const decisionNodes = nodes.filter((node) => normalized(node.kind) === 'decision');
+  const terminalDecisionNodes = decisionNodes.filter(runGraphNodeIsTerminalDecision);
   const recentEvents = nodes
     .filter((node) => numberValue(node.generatedAt))
     .sort((left, right) => numberValue(left.generatedAt) - numberValue(right.generatedAt))
@@ -595,11 +674,38 @@ function summarizeDashboardRunGraph(graph: Record<string, unknown>, sourceFile: 
   const blockerCount = nodes.filter(runGraphNodeIsBlocker).length;
   const humanQuestionCount = nodes.filter(runGraphNodeIsHumanQuestion).length;
   const safeMergeCandidateCount = nodes.filter(runGraphNodeIsSafeMergeCandidate).length;
+  const terminalAcceptedCount = terminalDecisionNodes.filter(runGraphNodeIsAcceptedTerminalDecision).length;
+  const terminalRejectedCount = terminalDecisionNodes.filter(runGraphNodeIsRejectedTerminalDecision).length;
+  const terminalRerunCount = terminalDecisionNodes.filter(runGraphNodeIsRerunTerminalDecision).length;
   const gateFailedCount = gateNodes.filter((node) => normalized(node.status) === 'failed').length;
-  const status = blockerCount ? 'blocked' : humanQuestionCount ? 'questions' : gateFailedCount ? 'review' : safeMergeCandidateCount ? 'ready' : 'clear';
+  const staleCount = firstNumber(summary.staleCount, summary.staleAgainstHeadCount, summary['stale-against-head']) || nodes.filter(runGraphNodeIsStale).length;
+  const rerunCount = firstNumber(summary.rerunCount, summary['rerun-work']) || nodes.filter(runGraphNodeIsRerun).length;
+  const staleRerunCleanupCount = nodes.filter(runGraphNodeIsStaleRerunCleanup).length;
+  const graphMissingWarnings = uniquePaths(input.graphMissingWarnings ?? []);
+  const status = blockerCount
+    ? 'blocked'
+    : humanQuestionCount
+      ? 'questions'
+      : gateFailedCount
+        ? 'review'
+        : terminalRerunCount
+          ? 'rerun'
+          : input.graphMissing && !safeMergeCandidateCount
+            ? 'missing'
+            : safeMergeCandidateCount || terminalAcceptedCount
+              ? 'ready'
+              : 'clear';
   return {
-    sourceFile,
-    sourceFiles: [sourceFile],
+    sourceFile: input.sourceFile,
+    sourceFiles: input.sourceFile ? [input.sourceFile] : [],
+    sourceKind: input.sourceKind,
+    sourceKinds: [input.sourceKind],
+    sourceStatus: input.sourceStatus,
+    sourceStatuses: [input.sourceStatus],
+    graphMissing: input.graphMissing === true,
+    graphMissingWarningCount: graphMissingWarnings.length,
+    graphMissingWarnings,
+    ...(input.liveEventCount !== undefined ? { liveEventCount: input.liveEventCount } : {}),
     nodeCount,
     edgeCount,
     blockerCount,
@@ -607,12 +713,21 @@ function summarizeDashboardRunGraph(graph: Record<string, unknown>, sourceFile: 
     humanQuestionCount,
     openHumanQuestionCount: humanQuestionCount,
     safeMergeCandidateCount,
-    decisionCount: numberValue(summary.decisionCount) || nodes.filter((node) => normalized(node.kind) === 'decision').length,
+    decisionCount: numberValue(summary.decisionCount) || decisionNodes.length,
+    terminalDecisionCount: terminalDecisionNodes.length,
+    terminalAcceptedCount,
+    terminalRejectedCount,
+    terminalRerunCount,
     gateCount: numberValue(summary.gateCount) || gateNodes.length,
     gatePassedCount: gateNodes.filter((node) => normalized(node.status) === 'passed').length,
     gateFailedCount,
+    staleCount,
+    openStaleCount: staleCount,
+    rerunCount,
+    openRerunCount: rerunCount,
+    staleRerunCleanupCount,
     status,
-    summaryLine: `${nodeCount} nodes, ${edgeCount} edges, ${numberValue(summary.decisionCount)} decisions, and ${numberValue(summary.gateCount) || gateNodes.length} gates.`,
+    summaryLine: `${nodeCount} nodes, ${edgeCount} edges, ${numberValue(summary.decisionCount) || decisionNodes.length} decisions, and ${numberValue(summary.gateCount) || gateNodes.length} gates.`,
     recentEvents
   };
 }
@@ -634,6 +749,94 @@ function runGraphNodeIsSafeMergeCandidate(node: Record<string, unknown>): boolea
   const bucket = normalized(node.bucket);
   const data = recordValue(node.data);
   return bucket === 'ready-to-apply' || data.autoMergeable === true || normalized(data.mergeReadiness) === 'ready-to-apply';
+}
+
+function runGraphNodeIsTerminalDecision(node: Record<string, unknown>): boolean {
+  const kind = normalized(node.kind);
+  if (kind === 'terminal-outcome') return true;
+  if (kind !== 'decision') return false;
+  return textValue(node.id, '').startsWith('decision:terminal:')
+    || normalized(recordValue(node.data).terminal) === 'true'
+    || runGraphTerminalOutcome(node) !== '';
+}
+
+function runGraphNodeIsAcceptedTerminalDecision(node: Record<string, unknown>): boolean {
+  return ['accepted', 'accepted-applied', 'applied', 'committed', 'completed', 'ok', 'ready', 'ready-to-apply', 'verified-patch'].includes(runGraphTerminalOutcome(node));
+}
+
+function runGraphNodeIsRejectedTerminalDecision(node: Record<string, unknown>): boolean {
+  return ['blocked', 'conflict', 'conflict-blocked', 'failed', 'rejected'].includes(runGraphTerminalOutcome(node));
+}
+
+function runGraphNodeIsRerunTerminalDecision(node: Record<string, unknown>): boolean {
+  return ['needs-rerun', 'rerun', 'rerun-work', 'stale', 'stale-against-head'].includes(runGraphTerminalOutcome(node));
+}
+
+function runGraphTerminalOutcome(node: Record<string, unknown>): string {
+  const data = recordValue(node.data);
+  const values = [
+    node.outcome,
+    node.status,
+    data.outcome,
+    data.status,
+    data.mergeReadiness,
+    data.disposition
+  ].map(normalized).filter(Boolean);
+  return values.find((value) => [
+    'accepted',
+    'accepted-applied',
+    'applied',
+    'blocked',
+    'committed',
+    'completed',
+    'conflict',
+    'conflict-blocked',
+    'failed',
+    'needs-rerun',
+    'ok',
+    'ready',
+    'ready-to-apply',
+    'rejected',
+    'rerun',
+    'rerun-work',
+    'stale',
+    'stale-against-head',
+    'verified-patch'
+  ].includes(value)) ?? '';
+}
+
+function runGraphNodeIsStale(node: Record<string, unknown>): boolean {
+  if (normalized(node.kind) === 'bucket') return false;
+  const data = recordValue(node.data);
+  const values = [
+    node.bucket,
+    node.status,
+    node.outcome,
+    data.disposition,
+    data.mergeReadiness,
+    ...(stringArray(data.reasons))
+  ].map(normalized);
+  return data.staleAgainstHead === true || values.some((value) => value.includes('stale'));
+}
+
+function runGraphNodeIsRerun(node: Record<string, unknown>): boolean {
+  if (normalized(node.kind) === 'bucket') return false;
+  const data = recordValue(node.data);
+  const values = [
+    node.bucket,
+    node.status,
+    node.outcome,
+    data.disposition,
+    data.mergeReadiness,
+    ...(stringArray(data.reasons))
+  ].map(normalized);
+  return values.some((value) => value.includes('rerun'));
+}
+
+function runGraphNodeIsStaleRerunCleanup(node: Record<string, unknown>): boolean {
+  if (!runGraphNodeIsTerminalDecision(node)) return false;
+  if (!runGraphNodeIsStale(node) && !runGraphNodeIsRerun(node)) return false;
+  return runGraphNodeIsAcceptedTerminalDecision(node) || runGraphNodeIsRejectedTerminalDecision(node) || runGraphNodeIsRerunTerminalDecision(node);
 }
 
 async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown>> {
@@ -1169,7 +1372,7 @@ async function combineLifetimeDashboardSnapshots(
     });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = await readHumanActionAnswers(options);
-  const graph = lifetimeDecisionGraphSummary(visibleSnapshots);
+  const graph = withDashboardRunGraphJobHealth(lifetimeDecisionGraphSummary(visibleSnapshots), jobs);
   const summary = {
     ...lifetimeDashboardSummary(jobs),
     coordinationDelayCount: autoDrainDelays.length,
@@ -1252,6 +1455,9 @@ function lifetimeDecisionGraphSummary(
   const sourceFiles = uniquePaths(graphs.flatMap(({ graph }) => stringArray(graph.sourceFiles).length
     ? stringArray(graph.sourceFiles)
     : [textValue(graph.sourceFile, '')]).filter(Boolean));
+  const sourceKinds = uniquePaths(graphs.map(({ graph }) => textValue(graph.sourceKind, '')).filter(Boolean));
+  const sourceStatuses = uniquePaths(graphs.map(({ graph }) => textValue(graph.sourceStatus, '')).filter(Boolean));
+  const graphMissingWarnings = uniquePaths(graphs.flatMap(({ graph }) => stringArray(graph.graphMissingWarnings)));
   const nodeCount = graphNumberSum(graphs, 'nodeCount');
   const edgeCount = graphNumberSum(graphs, 'edgeCount');
   const blockerCount = graphNumberSum(graphs, 'blockerCount');
@@ -1260,8 +1466,17 @@ function lifetimeDecisionGraphSummary(
   const openHumanQuestionCount = graphNumberSum(graphs, 'openHumanQuestionCount');
   const safeMergeCandidateCount = graphNumberSum(graphs, 'safeMergeCandidateCount');
   const decisionCount = graphNumberSum(graphs, 'decisionCount');
+  const terminalDecisionCount = graphNumberSum(graphs, 'terminalDecisionCount');
+  const terminalAcceptedCount = graphNumberSum(graphs, 'terminalAcceptedCount');
+  const terminalRejectedCount = graphNumberSum(graphs, 'terminalRejectedCount');
+  const terminalRerunCount = graphNumberSum(graphs, 'terminalRerunCount');
   const gateCount = graphNumberSum(graphs, 'gateCount');
   const gateFailedCount = graphNumberSum(graphs, 'gateFailedCount');
+  const staleCount = graphNumberSum(graphs, 'staleCount');
+  const openStaleCount = graphNumberSum(graphs, 'openStaleCount');
+  const rerunCount = graphNumberSum(graphs, 'rerunCount');
+  const openRerunCount = graphNumberSum(graphs, 'openRerunCount');
+  const staleRerunCleanupCount = graphNumberSum(graphs, 'staleRerunCleanupCount');
   const recentEvents = graphs.flatMap(({ source, graph }) => recordArray(graph.recentEvents).map((event) => ({
     ...event,
     sourceLabel: source.label,
@@ -1271,6 +1486,13 @@ function lifetimeDecisionGraphSummary(
   return {
     sourceFile: sourceFiles[0],
     sourceFiles,
+    sourceKind: 'lifetime-rollup',
+    sourceKinds,
+    sourceStatus: sourceStatuses.length === 1 ? sourceStatuses[0] : sourceStatuses.length ? 'mixed' : 'unknown',
+    sourceStatuses,
+    graphMissing: graphMissingWarnings.length > 0,
+    graphMissingWarningCount: graphMissingWarnings.length,
+    graphMissingWarnings: graphMissingWarnings.slice(0, 12),
     nodeCount,
     edgeCount,
     blockerCount,
@@ -1279,9 +1501,18 @@ function lifetimeDecisionGraphSummary(
     openHumanQuestionCount,
     safeMergeCandidateCount,
     decisionCount,
+    terminalDecisionCount,
+    terminalAcceptedCount,
+    terminalRejectedCount,
+    terminalRerunCount,
     gateCount,
     gatePassedCount: graphNumberSum(graphs, 'gatePassedCount'),
     gateFailedCount,
+    staleCount,
+    openStaleCount,
+    rerunCount,
+    openRerunCount,
+    staleRerunCleanupCount,
     status,
     summaryLine: `${nodeCount} nodes, ${edgeCount} edges, ${decisionCount} decisions, and ${gateCount} gates across loaded runs.`,
     recentEvents
@@ -1290,6 +1521,65 @@ function lifetimeDecisionGraphSummary(
 
 function graphNumberSum(graphs: Array<{ graph: Record<string, unknown> }>, key: string): number {
   return graphs.reduce((sum, entry) => sum + numberValue(entry.graph[key]), 0);
+}
+
+function withDashboardRunGraphJobHealth(
+  graph: Record<string, unknown> | undefined,
+  jobs: Array<Record<string, unknown>>
+): Record<string, unknown> | undefined {
+  if (!graph) return undefined;
+  const staleJobs = jobs.filter(dashboardGraphJobIsStale);
+  const rerunJobs = jobs.filter(dashboardGraphJobIsRerun);
+  const staleCleanupCount = staleJobs.filter(dashboardGraphJobIsCleanup).length;
+  const rerunCleanupCount = rerunJobs.filter(dashboardGraphJobIsCleanup).length;
+  const staleCount = Math.max(numberValue(graph.staleCount), staleJobs.length);
+  const rerunCount = Math.max(numberValue(graph.rerunCount), rerunJobs.length);
+  const staleRerunCleanupCount = Math.max(numberValue(graph.staleRerunCleanupCount), staleCleanupCount + rerunCleanupCount);
+  return {
+    ...graph,
+    staleCount,
+    rerunCount,
+    staleRerunCleanupCount,
+    openStaleCount: Math.max(numberValue(graph.openStaleCount), Math.max(0, staleJobs.length - staleCleanupCount)),
+    openRerunCount: Math.max(numberValue(graph.openRerunCount), Math.max(0, rerunJobs.length - rerunCleanupCount))
+  };
+}
+
+function dashboardGraphJobIsStale(job: Record<string, unknown>): boolean {
+  const values = [
+    job.bucket,
+    job.originalBucket,
+    job.status,
+    job.originalStatus,
+    job.disposition,
+    job.originalDisposition,
+    job.mergeReadiness,
+    ...(stringArray(job.reasons)),
+    ...(stringArray(job.originalReasons))
+  ].map(normalized);
+  return job.staleAgainstHead === true || values.some((value) => value.includes('stale'));
+}
+
+function dashboardGraphJobIsRerun(job: Record<string, unknown>): boolean {
+  const values = [
+    job.bucket,
+    job.originalBucket,
+    job.status,
+    job.originalStatus,
+    job.disposition,
+    job.originalDisposition,
+    job.mergeReadiness,
+    ...(stringArray(job.reasons)),
+    ...(stringArray(job.originalReasons))
+  ].map(normalized);
+  return values.some((value) => value.includes('rerun'));
+}
+
+function dashboardGraphJobIsCleanup(job: Record<string, unknown>): boolean {
+  if (isResolvedCoordinatorReviewRecord(job)) return true;
+  const status = normalized(job.status);
+  const decision = normalized(job.coordinatorDecisionStatus ?? recordValue(job.coordinatorDecision).status);
+  return status === 'completed' && ['accepted', 'accepted-applied', 'applied', 'committed', 'rejected', 'rerun', 'superseded'].includes(decision);
 }
 
 function lifetimeScopedId(source: LifetimeDashboardSource, id: string): string {
@@ -3391,6 +3681,7 @@ async function readActiveRunSnapshot(
   const actualInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.actualInputTokens), 0);
   const estimatedInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.estimatedInputTokens), 0);
   const cachedInputTokens = jobs.reduce((sum, job) => sum + numberValue(job.cachedInputTokens), 0);
+  const graph = await readDashboardLiveRunGraphSummary(options.cwd, runDir, jobs, now);
   return {
     ok: true,
     generatedAt: now,
@@ -3411,16 +3702,19 @@ async function readActiveRunSnapshot(
         running: runningCount,
         completed: completedCount,
         'failed-evidence': failedCount
-      }
+      },
+      ...(graph ? { graph } : {})
     },
     lanes: activeRunLanes(jobs),
     jobs,
     activeAgents: activeAgentsFromJobs(jobs),
     events: activeRunEvents(jobs),
+    ...(graph ? { graph } : {}),
     sources: {
       run: runDir,
       activeRun: pidPath,
-      plan: planPath
+      plan: planPath,
+      ...(graph ? { graph: textValue(graph.sourceFile, '') } : {})
     },
     raw: {
       activeRun: {
@@ -3430,6 +3724,154 @@ async function readActiveRunSnapshot(
       }
     }
   };
+}
+
+async function readDashboardLiveRunGraphSummary(
+  cwd: string,
+  runDir: string,
+  jobs: Array<Record<string, unknown>>,
+  now: number
+): Promise<Record<string, unknown> | undefined> {
+  const file = path.join(runDir, LIVE_RUN_GRAPH_EVENTS_FILE);
+  const stat = await fs.stat(file).catch(() => undefined);
+  if (stat?.isFile() && stat.size <= CODEX_EVENTS_USAGE_MAX_BYTES) {
+    const events = await readLiveRunGraphEvents(file);
+    if (events.length) {
+      return summarizeDashboardRunGraph(liveRunGraphFromEvents(events, path.basename(runDir), now), {
+        sourceFile: path.relative(cwd, file).replaceAll(path.sep, '/'),
+        sourceKind: 'live-run-graph-events',
+        sourceStatus: 'live',
+        liveEventCount: events.length
+      });
+    }
+  }
+  return activeRunGraphFallback(cwd, runDir, jobs, now, stat?.isFile() && stat.size > CODEX_EVENTS_USAGE_MAX_BYTES
+    ? `${LIVE_RUN_GRAPH_EVENTS_FILE} is too large to parse for dashboard health.`
+    : `${LIVE_RUN_GRAPH_EVENTS_FILE} is missing; projected graph health from the active PID manifest.`);
+}
+
+async function readLiveRunGraphEvents(file: string): Promise<Array<Record<string, unknown>>> {
+  const text = await fs.readFile(file, 'utf8').catch(() => '');
+  const out: Array<Record<string, unknown>> = [];
+  for (const line of text.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parsed = safeJsonObject(trimmed);
+    if (parsed && textValue(parsed.kind, '') === 'frontier.swarm-codex.live-run-graph-event') out.push(parsed);
+  }
+  return out;
+}
+
+function liveRunGraphFromEvents(events: Array<Record<string, unknown>>, runId: string, generatedAt: number): Record<string, unknown> {
+  const nodes = new Map<string, Record<string, unknown>>();
+  const edges = new Map<string, Record<string, unknown>>();
+  let latestGeneratedAt = generatedAt;
+  for (const event of events) {
+    latestGeneratedAt = Math.max(latestGeneratedAt, numberValue(event.generatedAt));
+    for (const node of recordArray(event.nodes)) {
+      const id = textValue(node.id, '');
+      if (!id) continue;
+      const current = nodes.get(id);
+      nodes.set(id, current ? mergeDashboardRunGraphNode(current, node) : node);
+    }
+    for (const edge of recordArray(event.edges)) {
+      const id = textValue(edge.id, `${textValue(edge.kind, 'edge')}:${textValue(edge.from, '')}->${textValue(edge.to, '')}`);
+      if (id) edges.set(id, { ...edge, id });
+    }
+  }
+  const nodeList = Array.from(nodes.values());
+  const edgeList = Array.from(edges.values());
+  return {
+    kind: 'frontier.swarm-codex.run-graph',
+    version: 1,
+    id: `live:${runId}`,
+    generatedAt: latestGeneratedAt,
+    nodes: nodeList,
+    edges: edgeList,
+    summary: {
+      nodeCount: nodeList.length,
+      edgeCount: edgeList.length,
+      decisionCount: nodeList.filter((node) => normalized(node.kind) === 'decision').length,
+      gateCount: nodeList.filter((node) => normalized(node.kind) === 'gate').length
+    }
+  };
+}
+
+function mergeDashboardRunGraphNode(left: Record<string, unknown>, right: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...left,
+    ...right,
+    data: {
+      ...recordValue(left.data),
+      ...recordValue(right.data)
+    }
+  };
+}
+
+function activeRunGraphFallback(
+  cwd: string,
+  runDir: string,
+  jobs: Array<Record<string, unknown>>,
+  now: number,
+  warning: string
+): Record<string, unknown> | undefined {
+  if (!jobs.length) return undefined;
+  const nodes: Array<Record<string, unknown>> = [];
+  const edges: Array<Record<string, unknown>> = [];
+  for (const job of jobs) {
+    const jobId = textValue(job.id ?? job.jobId, 'job');
+    const jobNodeId = `job:${jobId}`;
+    nodes.push({
+      id: jobNodeId,
+      kind: 'job',
+      label: textValue(job.title ?? jobId, jobId),
+      jobId,
+      taskId: textValue(job.taskId, ''),
+      lane: textValue(job.lane, ''),
+      status: textValue(job.status, ''),
+      generatedAt: numberValue(job.generatedAt) || now
+    });
+    if (textValue(job.status, '') !== 'running') {
+      const decisionNodeId = `decision:terminal:${jobId}`;
+      nodes.push({
+        id: decisionNodeId,
+        kind: 'decision',
+        label: textValue(job.status, 'terminal'),
+        jobId,
+        taskId: textValue(job.taskId, ''),
+        lane: textValue(job.lane, ''),
+        status: textValue(job.status, ''),
+        outcome: textValue(job.disposition ?? job.mergeReadiness ?? job.status, ''),
+        generatedAt: numberValue(job.finishedAt) || numberValue(job.generatedAt) || now
+      });
+      edges.push({
+        id: `decides:${decisionNodeId}->${jobNodeId}`,
+        kind: 'decides',
+        from: decisionNodeId,
+        to: jobNodeId
+      });
+    }
+  }
+  return summarizeDashboardRunGraph({
+    kind: 'frontier.swarm-codex.run-graph',
+    version: 1,
+    id: `active-pid:${path.basename(runDir)}`,
+    generatedAt: now,
+    nodes,
+    edges,
+    summary: {
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      decisionCount: nodes.filter((node) => normalized(node.kind) === 'decision').length,
+      gateCount: 0
+    }
+  }, {
+    sourceFile: path.relative(cwd, path.join(runDir, LIVE_RUN_GRAPH_EVENTS_FILE)).replaceAll(path.sep, '/'),
+    sourceKind: 'active-pid-fallback',
+    sourceStatus: 'live',
+    graphMissing: true,
+    graphMissingWarnings: [warning]
+  });
 }
 
 async function activeRunJob(

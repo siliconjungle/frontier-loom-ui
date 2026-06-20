@@ -709,6 +709,30 @@ await fs.writeFile(path.join(activeRunDir, 'swarm-plan.json'), JSON.stringify({
     { id: 'active-done', taskId: 'done-task', title: 'Completed worker proof', lane: 'verification', compute: { id: 'codex.fast', model: 'gpt-5.5', reasoningEffort: 'medium' }, task: { id: 'done-task', title: 'Completed worker proof', lane: 'verification' } }
   ]
 }, null, 2) + '\n');
+await fs.writeFile(path.join(activeRunDir, 'live-run-graph-events.jsonl'), [
+  JSON.stringify({
+    kind: 'frontier.swarm-codex.live-run-graph-event',
+    version: 1,
+    type: 'job.started',
+    jobId: 'active-live',
+    taskId: 'live-task',
+    lane: 'verification',
+    generatedAt: Date.now() - 2500,
+    nodes: [{ id: 'job:active-live', kind: 'job', label: 'Live worker proof', jobId: 'active-live', taskId: 'live-task', lane: 'verification', status: 'running', generatedAt: Date.now() - 2500 }]
+  }),
+  JSON.stringify({
+    kind: 'frontier.swarm-codex.live-run-graph-event',
+    version: 1,
+    type: 'terminal.outcome',
+    jobId: 'active-done',
+    taskId: 'done-task',
+    lane: 'verification',
+    generatedAt: Date.now() - 1000,
+    nodes: [{ id: 'decision:terminal:active-done', kind: 'decision', label: 'completed', jobId: 'active-done', taskId: 'done-task', lane: 'verification', status: 'completed', outcome: 'completed', generatedAt: Date.now() - 1000 }],
+    edges: [{ id: 'decides:decision:terminal:active-done->job:active-done', kind: 'decides', from: 'decision:terminal:active-done', to: 'job:active-done' }]
+  }),
+  ''
+].join('\n'));
 
 const manifest = createLoomUiViewManifest();
 assert.equal(manifest.id, 'frontier-loom-ui.dashboard');
@@ -759,7 +783,13 @@ try {
   assert.equal(dashboard.semantic.health.admission.reasonCodeCounts['missing-sidecar'], 2);
   assert.equal(dashboard.semantic.health.admission.reasonCodeCounts['tests-missing'], 1);
   assert.equal(dashboard.graph.nodeCount, 4);
+  assert.equal(dashboard.graph.edgeCount, 2);
+  assert.equal(dashboard.graph.sourceKind, 'collected-run-graph');
+  assert.equal(dashboard.graph.sourceStatus, 'collected');
   assert.equal(dashboard.graph.safeMergeCandidateCount, 1);
+  assert.equal(dashboard.graph.terminalDecisionCount, 1);
+  assert.equal(dashboard.graph.terminalAcceptedCount, 1);
+  assert.equal(dashboard.graph.graphMissingWarningCount, 0);
   assert.equal(dashboard.graph.status, 'ready');
   assert.match(dashboard.graph.sourceFile, /run-graph\.json$/);
   assert.ok(Array.isArray(dashboard.humanActions));
@@ -775,6 +805,11 @@ try {
     assert.equal(activeDashboard.summary.jobCount, 2);
     assert.equal(activeDashboard.summary.runningCount, 1);
     assert.equal(activeDashboard.summary.completedCount, 1);
+    assert.equal(activeDashboard.graph.sourceKind, 'live-run-graph-events');
+    assert.equal(activeDashboard.graph.sourceStatus, 'live');
+    assert.equal(activeDashboard.graph.liveEventCount, 2);
+    assert.equal(activeDashboard.graph.terminalDecisionCount, 1);
+    assert.equal(activeDashboard.graph.graphMissingWarningCount, 0);
     assert.equal(activeDashboard.jobs[0].model, 'gpt-5.5');
     const liveJob = activeDashboard.jobs.find((job) => job.id === 'active-live' || job.jobId === 'active-live');
     assert.ok(liveJob);
@@ -802,6 +837,13 @@ try {
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
     assert.equal(lifetimeDashboard.graph.nodeCount >= 2, true);
     assert.equal(lifetimeDashboard.graph.safeMergeCandidateCount >= 1, true);
+    assert.equal(lifetimeDashboard.graph.sourceKind, 'lifetime-rollup');
+    assert.equal(lifetimeDashboard.graph.sourceStatuses.includes('collected'), true);
+    assert.equal(lifetimeDashboard.graph.graphMissingWarningCount >= 1, true);
+    assert.equal(lifetimeDashboard.graph.graphMissingWarnings.some((warning) => /run-graph\.json/.test(warning)), true);
+    assert.equal(lifetimeDashboard.graph.staleCount >= 1, true);
+    assert.equal(lifetimeDashboard.graph.rerunCount >= 1, true);
+    assert.equal(lifetimeDashboard.graph.staleRerunCleanupCount >= 1, true);
     assert.equal(lifetimeDashboard.summary.graph.nodeCount, lifetimeDashboard.graph.nodeCount);
     assert.equal(lifetimeDashboard.summary.jobCount, 9);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
@@ -1210,7 +1252,11 @@ try {
     'Review-required reasons',
     'Gate status',
     'Synthesized/research complete',
-    'Open coordinator review'
+    'Open coordinator review',
+    'Decision graph source',
+    'Graph missing warning',
+    'Terminal decisions',
+    'Stale/rerun cleanup'
   ]);
   assert.doesNotMatch(client, /Read-only operator shell|Frontier swarm operations|selectedLane|selected lane|data-lane-filter|Lane efficiency|Lane load|Epics \/ task groups|Merge readiness|Quality gates|Agent questions only|Artifact viewer|action-options|action-scope/);
   assertNoOperatorSteeringSurface(`${html}\n${client}`);

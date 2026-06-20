@@ -34,6 +34,14 @@ type DecisionGraphEvent = {
 type DecisionGraphSummary = {
   sourceFile?: string;
   sourceFiles?: string[];
+  sourceKind?: string;
+  sourceKinds?: string[];
+  sourceStatus?: string;
+  sourceStatuses?: string[];
+  graphMissing?: boolean;
+  graphMissingWarningCount?: number;
+  graphMissingWarnings?: string[];
+  liveEventCount?: number;
   nodeCount?: number;
   edgeCount?: number;
   blockerCount?: number;
@@ -42,9 +50,18 @@ type DecisionGraphSummary = {
   openHumanQuestionCount?: number;
   safeMergeCandidateCount?: number;
   decisionCount?: number;
+  terminalDecisionCount?: number;
+  terminalAcceptedCount?: number;
+  terminalRejectedCount?: number;
+  terminalRerunCount?: number;
   gateCount?: number;
   gatePassedCount?: number;
   gateFailedCount?: number;
+  staleCount?: number;
+  openStaleCount?: number;
+  rerunCount?: number;
+  openRerunCount?: number;
+  staleRerunCleanupCount?: number;
   status?: string;
   summaryLine?: string;
   recentEvents?: DecisionGraphEvent[];
@@ -5990,6 +6007,7 @@ function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | unde
   const humanQuestionCount = numberValue(graph.humanQuestionCount);
   const safeMergeCandidateCount = numberValue(graph.safeMergeCandidateCount);
   const decisionCount = numberValue(graph.decisionCount);
+  const terminalDecisionCount = numberValue(graph.terminalDecisionCount);
   const gateCount = numberValue(graph.gateCount);
   const recentEvents = arrayRecords(graph.recentEvents).map((event) => ({
     type: textValue(event.type, ''),
@@ -5999,12 +6017,21 @@ function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | unde
     status: textValue(event.status, ''),
     message: textValue(event.message, '')
   }));
-  if (!nodeCount && !edgeCount && !blockerCount && !humanQuestionCount && !safeMergeCandidateCount && !decisionCount && !gateCount && !recentEvents.length) {
+  const graphMissingWarnings = stringArray(graph.graphMissingWarnings);
+  if (!nodeCount && !edgeCount && !blockerCount && !humanQuestionCount && !safeMergeCandidateCount && !decisionCount && !terminalDecisionCount && !gateCount && !recentEvents.length && !graphMissingWarnings.length) {
     return undefined;
   }
   return {
     sourceFile: textValue(graph.sourceFile, ''),
     sourceFiles: stringArray(graph.sourceFiles),
+    sourceKind: textValue(graph.sourceKind, ''),
+    sourceKinds: stringArray(graph.sourceKinds),
+    sourceStatus: textValue(graph.sourceStatus, ''),
+    sourceStatuses: stringArray(graph.sourceStatuses),
+    graphMissing: graph.graphMissing === true,
+    graphMissingWarningCount: numberValue(graph.graphMissingWarningCount),
+    graphMissingWarnings,
+    liveEventCount: numberValue(graph.liveEventCount),
     nodeCount,
     edgeCount,
     blockerCount,
@@ -6013,9 +6040,18 @@ function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | unde
     openHumanQuestionCount: numberValue(graph.openHumanQuestionCount),
     safeMergeCandidateCount,
     decisionCount,
+    terminalDecisionCount,
+    terminalAcceptedCount: numberValue(graph.terminalAcceptedCount),
+    terminalRejectedCount: numberValue(graph.terminalRejectedCount),
+    terminalRerunCount: numberValue(graph.terminalRerunCount),
     gateCount,
     gatePassedCount: numberValue(graph.gatePassedCount),
     gateFailedCount: numberValue(graph.gateFailedCount),
+    staleCount: numberValue(graph.staleCount),
+    openStaleCount: numberValue(graph.openStaleCount),
+    rerunCount: numberValue(graph.rerunCount),
+    openRerunCount: numberValue(graph.openRerunCount),
+    staleRerunCleanupCount: numberValue(graph.staleRerunCleanupCount),
     status: textValue(graph.status, 'unknown'),
     summaryLine: textValue(graph.summaryLine, ''),
     recentEvents
@@ -6023,6 +6059,9 @@ function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | unde
 }
 
 function decisionGraphRows(graph: DecisionGraphSummary): Array<{ label: string; value: string; detail: string }> {
+  const sourceKinds = (graph.sourceKinds?.length ? graph.sourceKinds : [graph.sourceKind]).filter(Boolean).join(', ') || 'unknown source';
+  const sourceStatuses = (graph.sourceStatuses?.length ? graph.sourceStatuses : [graph.sourceStatus]).filter(Boolean).join(', ') || 'unknown status';
+  const warnings = graph.graphMissingWarnings?.slice(0, 2).join(' ') || '';
   const recent = graph.recentEvents?.slice(-3).map((event) => {
     const label = event.message || event.type || 'graph event';
     const subject = event.taskId || event.jobId;
@@ -6030,9 +6069,19 @@ function decisionGraphRows(graph: DecisionGraphSummary): Array<{ label: string; 
   }).filter(Boolean).join('; ') || 'no recent graph events';
   return [
     {
+      label: 'Decision graph source',
+      value: graphSourceStatusLabel(graph),
+      detail: warnings || `${sourceKinds} · ${sourceStatuses}${graph.liveEventCount ? ` · ${formatNumber(graph.liveEventCount)} live events` : ''}`
+    },
+    {
       label: 'Graph shape',
       value: `${formatNumber(numberValue(graph.nodeCount))} / ${formatNumber(numberValue(graph.edgeCount))}`,
       detail: graph.summaryLine || `${formatNumber(numberValue(graph.nodeCount))} nodes and ${formatNumber(numberValue(graph.edgeCount))} edges`
+    },
+    {
+      label: 'Terminal decisions',
+      value: formatNumber(numberValue(graph.terminalDecisionCount)),
+      detail: `${formatNumber(numberValue(graph.terminalAcceptedCount))} accepted · ${formatNumber(numberValue(graph.terminalRejectedCount))} rejected · ${formatNumber(numberValue(graph.terminalRerunCount))} rerun`
     },
     {
       label: 'Open blockers',
@@ -6043,6 +6092,11 @@ function decisionGraphRows(graph: DecisionGraphSummary): Array<{ label: string; 
       label: 'Human questions',
       value: formatNumber(numberValue(graph.openHumanQuestionCount)),
       detail: `${formatNumber(numberValue(graph.humanQuestionCount))} questions tracked`
+    },
+    {
+      label: 'Stale/rerun cleanup',
+      value: formatNumber(numberValue(graph.staleRerunCleanupCount)),
+      detail: `${formatNumber(numberValue(graph.openStaleCount))} stale open · ${formatNumber(numberValue(graph.openRerunCount))} rerun open`
     },
     {
       label: 'Safe merge candidates',
@@ -6057,11 +6111,22 @@ function decisionGraphRows(graph: DecisionGraphSummary): Array<{ label: string; 
   ];
 }
 
+function graphSourceStatusLabel(graph: DecisionGraphSummary): string {
+  const status = normalized(graph.sourceStatus);
+  if (graph.graphMissing || status === 'missing') return 'Graph missing warning';
+  if (status === 'live') return 'Live graph';
+  if (status === 'collected') return 'Collected graph';
+  if (status === 'mixed') return 'Mixed graph';
+  return 'Graph source';
+}
+
 function decisionGraphStatusLabel(value: unknown): string {
   const status = normalized(value);
   if (status === 'blocked') return 'Blocked';
   if (status === 'questions') return 'Questions';
   if (status === 'review') return 'Review';
+  if (status === 'rerun') return 'Rerun';
+  if (status === 'missing') return 'Missing';
   if (status === 'ready') return 'Ready';
   if (status === 'clear') return 'Clear';
   return 'Unknown';
