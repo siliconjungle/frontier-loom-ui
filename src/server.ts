@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readCodexDashboardSnapshot } from '@shapeshift-labs/frontier-swarm-codex';
+import { estimateCodexModelCost, readCodexDashboardSnapshot } from '@shapeshift-labs/frontier-swarm-codex';
 
 const packageDir = path.dirname(fileURLToPath(import.meta.url));
 const HEALTH_JSON_PARSE_MAX_BYTES = 16 * 1024 * 1024;
@@ -497,7 +497,7 @@ async function readScopedDashboardSnapshot(
       }
     };
   }
-  const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions);
+  const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions).map(withRecomputedCostFields);
   return {
     ...normalizeCoordinatorFacingSnapshot(record),
     jobs: mergedJobs,
@@ -1026,7 +1026,7 @@ async function combineLifetimeDashboardSnapshots(
     const autoDrainDelay = lifetimeAutoDrainDelayRecord(source, snapshot);
     return recordArray(snapshot.jobs).map((job) => {
       const sourceJobId = textValue(job.id ?? job.jobId ?? job.taskId, 'job');
-      return {
+      return withRecomputedCostFields({
         ...job,
         id: lifetimeScopedId(source, sourceJobId),
         sourceJobId,
@@ -1041,7 +1041,7 @@ async function combineLifetimeDashboardSnapshots(
           autoDrainDirtyPathCount: autoDrainDelay.dirtyPathCount
         } : {}),
         generatedAt: numberValue(job.generatedAt) || numberValue(snapshot.generatedAt) || source.mtimeMs
-      };
+      });
     });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = await readHumanActionAnswers(options);
@@ -1223,7 +1223,7 @@ async function enrichLifetimeRunJobEvidence(
   ]);
   const mergedEvidencePaths = uniquePaths([...stringArray(job.evidencePaths), ...evidencePaths]);
   const commandEvidence = commandEvidenceFromRecords(job, merge, evidenceRecord);
-  return {
+  return withRecomputedCostFields({
     ...job,
     status,
     bucket,
@@ -1261,7 +1261,7 @@ async function enrichLifetimeRunJobEvidence(
     commandsFailed: commandEvidence.failed,
     collectReasonClasses,
     runEvidenceRecovered: true
-  };
+  });
 }
 
 function rawRunJobIdCandidates(job: Record<string, unknown>): string[] {
@@ -1443,7 +1443,7 @@ function readDrainPidManifestJob(
   const status = live ? 'running' : 'failed';
   const startedAt = numberValue(entry.startedAt);
   const lane = textValue(planJob?.lane ?? task.lane, drainCoordinatorLane(jobId, runKind));
-  return {
+  return withRecomputedCostFields({
     id: jobId,
     originalJobId: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
@@ -1467,7 +1467,7 @@ function readDrainPidManifestJob(
     sourceRun: path.relative(cwd, coordinatorRunDir),
     sourceLabel: path.relative(cwd, coordinatorRunDir),
     generatedAt: now
-  };
+  });
 }
 
 function commandOptionValue(command: readonly string[], option: string): string {
@@ -1521,7 +1521,7 @@ async function readDrainCoordinatorJob(
     path.join(evidenceDir, 'model-availability.json')
   ]);
   const commandEvidence = commandEvidenceFromRecords(evidenceRecord);
-  return {
+  return withRecomputedCostFields({
     id: jobId,
     originalJobId: jobId,
     taskId: jobId,
@@ -1554,7 +1554,7 @@ async function readDrainCoordinatorJob(
     sourceRun: path.relative(cwd, coordinatorRunDir),
     sourceLabel: path.relative(cwd, coordinatorRunDir),
     generatedAt: numberValue(finishedAt) || numberValue(eventStat?.mtimeMs) || now
-  };
+  });
 }
 
 function liveProcessLinesForPath(needle: string): string[] {
@@ -2307,6 +2307,13 @@ function lifetimeDashboardSummary(jobs: Array<Record<string, unknown>>): Record<
     estimatedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.estimatedInputTokens), 0),
     cachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.cachedInputTokens), 0),
     uncachedInputTokens: jobs.reduce((sum, job) => sum + numberValue(job.uncachedInputTokens), 0),
+    estimatedCostUsd: roundUsd(jobs.reduce((sum, job) => sum + numberValue(job.estimatedCostUsd), 0)),
+    estimatedInputCostUsd: roundUsd(jobs.reduce((sum, job) => sum + numberValue(job.estimatedInputCostUsd), 0)),
+    estimatedCachedInputCostUsd: roundUsd(jobs.reduce((sum, job) => sum + numberValue(job.estimatedCachedInputCostUsd), 0)),
+    estimatedUncachedInputCostUsd: roundUsd(jobs.reduce((sum, job) => sum + numberValue(job.estimatedUncachedInputCostUsd), 0)),
+    estimatedOutputCostUsd: roundUsd(jobs.reduce((sum, job) => sum + numberValue(job.estimatedOutputCostUsd), 0)),
+    estimatedCostMicroUsd: jobs.reduce((sum, job) => sum + numberValue(job.estimatedCostMicroUsd), 0),
+    priceKnownJobCount: jobs.filter((job) => job.priceKnown === true).length,
     bucketCounts: countJobsByBucket(jobs)
   };
 }
@@ -2517,12 +2524,12 @@ function groupRecordsByText(
 
 function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<Record<string, unknown>>): Record<string, unknown> {
   const bucketMs = 24 * 60 * 60 * 1000;
-  const buckets = new Map<number, { at: number; terminalJobCount: number; warningJobCount: number; failureJobCount: number; durationMs: number; actualInputTokens: number; estimatedInputTokens: number; uncachedInputTokens: number; eventCount: number }>();
+  const buckets = new Map<number, { at: number; terminalJobCount: number; warningJobCount: number; failureJobCount: number; durationMs: number; actualInputTokens: number; estimatedInputTokens: number; uncachedInputTokens: number; estimatedCostUsd: number; estimatedCostMicroUsd: number; eventCount: number }>();
   for (const job of jobs) {
     const at = numberValue(job.finishedAt) || numberValue(job.generatedAt) || numberValue(job.startedAt);
     if (!at) continue;
     const bucketAt = startOfLocalDay(at);
-    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, estimatedInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
+    const bucket = buckets.get(bucketAt) ?? emptyLifetimeTimeBucket(bucketAt);
     if (['completed', 'failed', 'blocked'].includes(textValue(job.status, '').toLowerCase())) bucket.terminalJobCount += 1;
     if (textValue(job.health, '') === 'warning') bucket.warningJobCount += 1;
     if (isLifetimeFailedJob(job)) bucket.failureJobCount += 1;
@@ -2530,13 +2537,15 @@ function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<
     bucket.actualInputTokens += numberValue(job.actualInputTokens);
     bucket.estimatedInputTokens += numberValue(job.estimatedInputTokens);
     bucket.uncachedInputTokens += numberValue(job.uncachedInputTokens);
+    bucket.estimatedCostUsd = roundUsd(bucket.estimatedCostUsd + numberValue(job.estimatedCostUsd));
+    bucket.estimatedCostMicroUsd += numberValue(job.estimatedCostMicroUsd);
     buckets.set(bucketAt, bucket);
   }
   for (const event of events) {
     const at = numberValue(event.at);
     if (!at) continue;
     const bucketAt = startOfLocalDay(at);
-    const bucket = buckets.get(bucketAt) ?? { at: bucketAt, terminalJobCount: 0, warningJobCount: 0, failureJobCount: 0, durationMs: 0, actualInputTokens: 0, estimatedInputTokens: 0, uncachedInputTokens: 0, eventCount: 0 };
+    const bucket = buckets.get(bucketAt) ?? emptyLifetimeTimeBucket(bucketAt);
     bucket.eventCount += 1;
     buckets.set(bucketAt, bucket);
   }
@@ -2553,8 +2562,26 @@ function lifetimeTimeSeries(jobs: Array<Record<string, unknown>>, events: Array<
       actualInputTokens: points.reduce((sum, point) => sum + point.actualInputTokens, 0),
       estimatedInputTokens: points.reduce((sum, point) => sum + point.estimatedInputTokens, 0),
       uncachedInputTokens: points.reduce((sum, point) => sum + point.uncachedInputTokens, 0),
+      estimatedCostUsd: roundUsd(points.reduce((sum, point) => sum + point.estimatedCostUsd, 0)),
+      estimatedCostMicroUsd: points.reduce((sum, point) => sum + point.estimatedCostMicroUsd, 0),
       missingTimestampJobCount: jobs.filter((job) => !numberValue(job.finishedAt) && !numberValue(job.generatedAt) && !numberValue(job.startedAt)).length
     }
+  };
+}
+
+function emptyLifetimeTimeBucket(at: number): { at: number; terminalJobCount: number; warningJobCount: number; failureJobCount: number; durationMs: number; actualInputTokens: number; estimatedInputTokens: number; uncachedInputTokens: number; estimatedCostUsd: number; estimatedCostMicroUsd: number; eventCount: number } {
+  return {
+    at,
+    terminalJobCount: 0,
+    warningJobCount: 0,
+    failureJobCount: 0,
+    durationMs: 0,
+    actualInputTokens: 0,
+    estimatedInputTokens: 0,
+    uncachedInputTokens: 0,
+    estimatedCostUsd: 0,
+    estimatedCostMicroUsd: 0,
+    eventCount: 0
   };
 }
 
@@ -2783,7 +2810,7 @@ async function activeRunJob(
     ...await readPatchChangedPathList(cwd, rawPatchPath)
   ]);
   const commandEvidence = commandEvidenceFromRecords(merge, evidenceRecord);
-  return {
+  return withRecomputedCostFields({
     id: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
     title: textValue(planJob?.title ?? task.title, jobId),
@@ -2833,7 +2860,7 @@ async function activeRunJob(
     commandsFailed: commandEvidence.failed,
     collectReasonClasses: status === 'running' ? ['active worker'] : quotaDeferred ? ['quota deferred'] : [],
     mergeReadiness: quotaDeferred ? 'quota-deferred' : textValue(merge.mergeReadiness, status)
-  };
+  });
 }
 
 function activeRunLanes(jobs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -3106,6 +3133,85 @@ async function readJsonFile(file: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function withRecomputedCostFields(record: Record<string, unknown>): Record<string, unknown> {
+  const model = textValue(record.model ?? record.pricingModel ?? record.pricingMatchedModel, '');
+  if (!model || !hasCostTokenEvidence(record)) return record;
+  const cost = estimateCodexModelCost({
+    model,
+    estimatedInputTokens: firstCostTokenNumber(record.estimatedInputTokens, record.estimated_input_tokens),
+    actualInputTokens: firstCostTokenNumber(record.actualInputTokens, record.inputTokens, record.promptTokens, record.actual_input_tokens, record.input_tokens, record.prompt_tokens),
+    cachedInputTokens: firstCostTokenNumber(record.cachedInputTokens, record.cachedPromptTokens, record.cached_input_tokens, record.cached_prompt_tokens),
+    uncachedInputTokens: firstCostTokenNumber(record.uncachedInputTokens, record.uncached_input_tokens),
+    outputTokens: optionalCostTokenNumber(record.actualOutputTokens, record.outputTokens, record.completionTokens, record.responseTokens, record.actual_output_tokens, record.output_tokens, record.completion_tokens, record.response_tokens)
+  });
+  return {
+    ...record,
+    billableInputTokens: cost.billableInputTokens,
+    priceKnown: cost.priceKnown,
+    ...(cost.pricingModel ? { pricingModel: cost.pricingModel } : {}),
+    ...(cost.pricingMatchedModel ? { pricingMatchedModel: cost.pricingMatchedModel } : {}),
+    ...(cost.pricingSource ? { pricingSource: cost.pricingSource } : {}),
+    ...(cost.pricingUpdatedAt ? { pricingUpdatedAt: cost.pricingUpdatedAt } : {}),
+    estimatedCostUsd: cost.estimatedCostUsd,
+    estimatedInputCostUsd: cost.estimatedInputCostUsd,
+    estimatedCachedInputCostUsd: cost.estimatedCachedInputCostUsd,
+    estimatedUncachedInputCostUsd: cost.estimatedUncachedInputCostUsd,
+    estimatedOutputCostUsd: cost.estimatedOutputCostUsd,
+    estimatedCostMicroUsd: cost.estimatedCostMicroUsd,
+    costEstimateInputOnly: cost.costEstimateInputOnly,
+    costEstimateEstimatedInput: cost.costEstimateEstimatedInput,
+    costEstimateMissingOutputTokens: cost.costEstimateMissingOutputTokens,
+    costEstimateLongContext: cost.costEstimateLongContext,
+    ...(cost.unknownPricingReason ? { unknownPricingReason: cost.unknownPricingReason } : { unknownPricingReason: undefined })
+  };
+}
+
+function hasCostTokenEvidence(record: Record<string, unknown>): boolean {
+  return [
+    record.actualInputTokens,
+    record.inputTokens,
+    record.promptTokens,
+    record.estimatedInputTokens,
+    record.cachedInputTokens,
+    record.uncachedInputTokens,
+    record.actualOutputTokens,
+    record.outputTokens,
+    record.completionTokens,
+    record.responseTokens,
+    record.actual_input_tokens,
+    record.input_tokens,
+    record.prompt_tokens,
+    record.estimated_input_tokens,
+    record.cached_input_tokens,
+    record.uncached_input_tokens,
+    record.actual_output_tokens,
+    record.output_tokens,
+    record.completion_tokens,
+    record.response_tokens
+  ].some((value) => optionalCostTokenNumber(value) !== undefined && optionalCostTokenNumber(value)! > 0);
+}
+
+function firstCostTokenNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const number = optionalCostTokenNumber(value);
+    if (number !== undefined && number > 0) return number;
+  }
+  return 0;
+}
+
+function optionalCostTokenNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (value === undefined || value === null || value === '') continue;
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) return number;
+  }
+  return undefined;
+}
+
+function roundUsd(value: number): number {
+  return Math.round(value * 1_000_000_000) / 1_000_000_000;
 }
 
 interface CommandEvidence {

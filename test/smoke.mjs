@@ -262,7 +262,8 @@ await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-results.json'), JSON.
       taskId: 'drained-task',
       title: 'Drained autonomous task',
       lane: 'drained',
-      status: 'completed'
+      status: 'completed',
+      compute: { id: 'codex.proof', model: 'gpt-5.5' }
     }],
     results: [{
       jobId: 'drained-job',
@@ -746,6 +747,12 @@ try {
     assert.equal(drainedJob.cachedInputTokens, 23000);
     assert.equal(drainedJob.uncachedInputTokens, 100456);
     assert.equal(drainedJob.outputTokens, 7890);
+    assert.equal(drainedJob.priceKnown, true);
+    assert.equal(drainedJob.pricingModel, 'gpt-5.5');
+    assert.equal(drainedJob.estimatedCostUsd, 0.75048);
+    assert.equal(drainedJob.estimatedCostMicroUsd, 750480);
+    assert.equal(lifetimeDashboard.summary.estimatedCostMicroUsd >= drainedJob.estimatedCostMicroUsd, true);
+    assert.equal(lifetimeDashboard.timeSeries.summary.estimatedCostMicroUsd >= drainedJob.estimatedCostMicroUsd, true);
     assert.equal(drainedJob.commandsPassed.length, 2);
     assert.equal(drainedJob.commandsFailed.length, 1);
     assert.equal(drainedJob.commandsPassed[0].command, 'npm run build');
