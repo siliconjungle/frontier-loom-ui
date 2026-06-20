@@ -499,9 +499,11 @@ async function readScopedDashboardSnapshot(
       }
     };
   }
+  const normalizedSnapshot = normalizeCoordinatorFacingSnapshot(record);
   const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions).map(withRecomputedCostFields);
   return {
-    ...normalizeCoordinatorFacingSnapshot(record),
+    ...normalizedSnapshot,
+    summary: reviewDecisionAdjustedSummary(recordValue(normalizedSnapshot.summary), mergedJobs),
     jobs: mergedJobs,
     activeAgents: activeAgentsFromJobs(mergedJobs),
     humanActionAnswers: answers,
@@ -2042,6 +2044,26 @@ function applyCoordinatorReviewDecisions(jobs: unknown[], decisions: Coordinator
     };
     return resolved ? markCoordinatorReviewResolved(decided, status) : decided;
   });
+}
+
+function reviewDecisionAdjustedSummary(
+  summary: Record<string, unknown>,
+  jobs: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  const recomputed = lifetimeDashboardSummary(jobs);
+  const bucketCounts = countJobsByBucket(jobs);
+  const openReviewCount = jobs.filter(isOpenCoordinatorReviewRecord).length;
+  const resolvedReviewCount = jobs.filter(isResolvedCoordinatorReviewRecord).length;
+  return {
+    ...summary,
+    ...recomputed,
+    bucketCounts: {
+      total: jobs.length,
+      ...bucketCounts
+    },
+    needsCoordinatorReviewCount: openReviewCount,
+    reviewResolvedCount: resolvedReviewCount
+  };
 }
 
 function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<string, unknown> {
