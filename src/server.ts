@@ -1087,7 +1087,7 @@ async function combineLifetimeDashboardSnapshots(
     humanActions: visibleSnapshots.flatMap(({ snapshot }) => recordArray(snapshot.humanActions)).slice(-100),
     humanActionAnswers,
     events,
-    routing: lifetimeRoutingSummary(visibleSnapshots.map((entry) => entry.snapshot)),
+    routing: await lifetimeRoutingSummary(options.cwd, visibleSnapshots),
     backlog: {
       id: 'workspace-lifetime',
       entryCount: queueOverlay.totalCount,
@@ -2567,17 +2567,95 @@ function lifetimeSemanticSummary(jobs: Array<Record<string, unknown>>): Record<s
   };
 }
 
-function lifetimeRoutingSummary(snapshots: Record<string, unknown>[]): Record<string, unknown> | undefined {
-  const routingRows = snapshots.map((snapshot) => recordValue(snapshot.routing)).filter((entry) => Object.keys(entry).length);
-  if (!routingRows.length) return undefined;
+async function lifetimeRoutingSummary(
+  cwd: string,
+  entries: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }>
+): Promise<Record<string, unknown> | undefined> {
+  const routingRows = entries.map(({ snapshot }) => recordValue(snapshot.routing)).filter((entry) => Object.keys(entry).length);
+  const sidecars = await readLifetimeRoutingSidecars(cwd, entries.map(({ source }) => source));
+  if (!routingRows.length && !sidecars.tournamentCount && !sidecars.feedbackArtifactCount && !sidecars.historyCount) return undefined;
   return {
     policyId: 'workspace-lifetime',
     preferenceCount: routingRows.reduce((sum, row) => sum + numberValue(row.preferenceCount), 0),
     preferCount: routingRows.reduce((sum, row) => sum + numberValue(row.preferCount), 0),
     avoidCount: routingRows.reduce((sum, row) => sum + numberValue(row.avoidCount), 0),
-    tournamentObservationCount: routingRows.reduce((sum, row) => sum + numberValue(row.tournamentObservationCount), 0),
-    tournamentRecommendationCount: routingRows.reduce((sum, row) => sum + numberValue(row.tournamentRecommendationCount), 0)
+    feedbackCount: routingRows.reduce((sum, row) => sum + numberValue(row.feedbackCount), 0) + sidecars.feedbackSignalCount,
+    tournamentObservationCount: routingRows.reduce((sum, row) => sum + numberValue(row.tournamentObservationCount), 0) + sidecars.tournamentObservationCount,
+    tournamentRecommendationCount: routingRows.reduce((sum, row) => sum + numberValue(row.tournamentRecommendationCount), 0) + sidecars.tournamentRecommendationCount,
+    tournamentCount: sidecars.tournamentCount,
+    tournamentMatchCount: sidecars.tournamentMatchCount,
+    tournamentVerifiedCount: sidecars.tournamentVerifiedCount,
+    tournamentTopStrategyId: sidecars.topStrategyId,
+    tournamentDecisionGrade: sidecars.decisionGrade,
+    strategyHistoryCount: sidecars.historyCount,
+    feedbackArtifactCount: sidecars.feedbackArtifactCount
   };
+}
+
+async function readLifetimeRoutingSidecars(
+  cwd: string,
+  sources: LifetimeDashboardSource[]
+): Promise<{
+  tournamentCount: number;
+  tournamentMatchCount: number;
+  tournamentVerifiedCount: number;
+  tournamentObservationCount: number;
+  tournamentRecommendationCount: number;
+  feedbackSignalCount: number;
+  feedbackArtifactCount: number;
+  historyCount: number;
+  topStrategyId: string;
+  decisionGrade: string;
+}> {
+  const out = {
+    tournamentCount: 0,
+    tournamentMatchCount: 0,
+    tournamentVerifiedCount: 0,
+    tournamentObservationCount: 0,
+    tournamentRecommendationCount: 0,
+    feedbackSignalCount: 0,
+    feedbackArtifactCount: 0,
+    historyCount: 0,
+    topStrategyId: '',
+    decisionGrade: ''
+  };
+  const seen = new Set<string>();
+  for (const source of sources) {
+    const dir = lifetimeRoutingSidecarDir(cwd, source);
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    const tournament = recordValue(await readJsonFile(path.join(dir, 'strategy-tournament.json')));
+    const tournamentSummary = recordValue(tournament.summary);
+    if (Object.keys(tournament).length) {
+      out.tournamentCount += 1;
+      out.tournamentMatchCount += numberValue(tournamentSummary.matchCount);
+      out.tournamentVerifiedCount += numberValue(tournamentSummary.verifiedCount);
+      out.tournamentObservationCount += numberValue(tournamentSummary.matchCount) || recordArray(tournament.matches).length;
+      out.tournamentRecommendationCount += textValue(tournament.winnerId ?? tournamentSummary.topStrategyId, '') ? 1 : 0;
+      if (!out.topStrategyId) out.topStrategyId = textValue(tournamentSummary.topStrategyId ?? tournament.winnerId, '');
+      if (!out.decisionGrade) out.decisionGrade = textValue(tournamentSummary.decisionGrade, '');
+    }
+    const feedback = recordValue(await readJsonFile(path.join(dir, 'tournament-adaptive-feedback.json')));
+    const feedbackSummary = recordValue(feedback.summary);
+    if (Object.keys(feedback).length) {
+      out.feedbackArtifactCount += 1;
+      out.tournamentObservationCount += numberValue(feedbackSummary.observationCount) || recordArray(feedback.observations).length;
+      out.tournamentRecommendationCount += numberValue(feedbackSummary.recommendationCount) || recordArray(feedback.recommendations).length;
+      out.feedbackSignalCount += numberValue(feedbackSummary.reduceSignals) + numberValue(feedbackSummary.increaseSignals) + numberValue(feedbackSummary.holdSignals);
+    }
+    const history = recordValue(await readJsonFile(path.join(dir, 'strategy-history.json')));
+    if (Object.keys(history).length) {
+      out.historyCount += recordArray(history.tournaments).length || 1;
+    }
+  }
+  return out;
+}
+
+function lifetimeRoutingSidecarDir(cwd: string, source: LifetimeDashboardSource): string | undefined {
+  const relative = source.collection ?? source.continuation ?? source.run;
+  if (!relative) return undefined;
+  const absolute = path.resolve(cwd, relative);
+  return isPathInside(cwd, absolute) ? absolute : undefined;
 }
 
 function isLifetimeFailedJob(job: Record<string, unknown>): boolean {
