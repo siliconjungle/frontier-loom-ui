@@ -159,6 +159,23 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     'stale-against-head': []
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(collectionDir, 'run-graph.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.run-graph',
+  version: 1,
+  id: 'fixture-run-graph',
+  generatedAt: Date.now(),
+  nodes: [
+    { id: 'job:ui-job', kind: 'job', label: 'UI job', jobId: 'ui-job', taskId: 'ui-task', generatedAt: Date.now() - 4000 },
+    { id: 'candidate:ui-job', kind: 'candidate', label: 'UI candidate', jobId: 'ui-job', taskId: 'ui-task', bucket: 'ready-to-apply', generatedAt: Date.now() - 3000, data: { autoMergeable: true } },
+    { id: 'gate:ui-job:test', kind: 'gate', label: 'npm test', jobId: 'ui-job', taskId: 'ui-task', status: 'passed', generatedAt: Date.now() - 2000 },
+    { id: 'decision:ui-job', kind: 'decision', label: 'ready', jobId: 'ui-job', taskId: 'ui-task', outcome: 'ready', generatedAt: Date.now() - 1000 }
+  ],
+  edges: [
+    { id: 'produces:job:ui-job->candidate:ui-job', kind: 'produces', from: 'job:ui-job', to: 'candidate:ui-job' },
+    { id: 'verifies:gate:ui-job:test->candidate:ui-job', kind: 'verifies', from: 'gate:ui-job:test', to: 'candidate:ui-job' }
+  ],
+  summary: { nodeCount: 4, edgeCount: 2, jobCount: 1, candidateCount: 1, evidenceCount: 0, decisionCount: 1, gateCount: 1 }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(lifetimeCurrentDir, 'collection.json'), JSON.stringify({
   ok: false,
   generatedAt: Date.now() - 1000,
@@ -260,6 +277,18 @@ await fs.writeFile(path.join(lifetimeResolvedDir, 'collection.json'), JSON.strin
       }
     }]
   }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeResolvedDir, 'run-graph.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.run-graph',
+  version: 1,
+  id: 'lifetime-run-graph',
+  generatedAt: Date.now(),
+  nodes: [
+    { id: 'candidate:dedupe-job', kind: 'candidate', label: 'Dedupe candidate', jobId: 'dedupe-job', taskId: 'dedupe-task', bucket: 'ready-to-apply', generatedAt: Date.now() - 2000, data: { autoMergeable: true } },
+    { id: 'decision:dedupe-job', kind: 'decision', label: 'committed', jobId: 'dedupe-job', taskId: 'dedupe-task', outcome: 'committed', generatedAt: Date.now() - 1000 }
+  ],
+  edges: [{ id: 'decides:decision:dedupe-job->candidate:dedupe-job', kind: 'decides', from: 'decision:dedupe-job', to: 'candidate:dedupe-job' }],
+  summary: { nodeCount: 2, edgeCount: 1, candidateCount: 1, decisionCount: 1, gateCount: 0 }
 }, null, 2) + '\n');
 await fs.writeFile(path.join(lifetimeDrainedRunDir, 'swarm-results.json'), JSON.stringify({
   ok: true,
@@ -396,6 +425,18 @@ await fs.writeFile(path.join(lifetimeDrainedCollectionDir, 'collection.json'), J
       }
     }]
   }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(lifetimeDrainedCollectionDir, 'run-graph.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.run-graph',
+  version: 1,
+  id: 'lifetime-run-graph',
+  generatedAt: Date.now(),
+  nodes: [
+    { id: 'candidate:drained-job', kind: 'candidate', label: 'Drained candidate', jobId: 'drained-job', taskId: 'drained-task', bucket: 'ready-to-apply', generatedAt: Date.now() - 2000, data: { autoMergeable: true } },
+    { id: 'decision:drained-job', kind: 'decision', label: 'committed', jobId: 'drained-job', taskId: 'drained-task', outcome: 'committed', generatedAt: Date.now() - 1000 }
+  ],
+  edges: [{ id: 'decides:decision:drained-job->candidate:drained-job', kind: 'decides', from: 'decision:drained-job', to: 'candidate:drained-job' }],
+  summary: { nodeCount: 2, edgeCount: 1, candidateCount: 1, decisionCount: 1, gateCount: 0 }
 }, null, 2) + '\n');
 await fs.writeFile(path.join(lifetimeDirtySkipRunDir, 'swarm-results.json'), JSON.stringify({
   ok: false,
@@ -699,6 +740,10 @@ try {
   assert.ok(dashboard.semantic.health.gates.reasonCodes.includes('ambiguous-edit'));
   assert.equal(dashboard.semantic.health.outcomes.synthesizedResearchCompleteCount, 1);
   assert.equal(dashboard.semantic.health.outcomes.openCoordinatorReviewCount, 1);
+  assert.equal(dashboard.graph.nodeCount, 4);
+  assert.equal(dashboard.graph.safeMergeCandidateCount, 1);
+  assert.equal(dashboard.graph.status, 'ready');
+  assert.match(dashboard.graph.sourceFile, /run-graph\.json$/);
   assert.ok(Array.isArray(dashboard.humanActions));
   assert.equal(dashboard.humanActions.length, 2);
   assert.deepEqual(dashboard.humanActions.map((action) => action.code).sort(), ['C-ROUTING', 'Q-SCOPE']);
@@ -737,6 +782,9 @@ try {
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
     assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
+    assert.equal(lifetimeDashboard.graph.nodeCount >= 2, true);
+    assert.equal(lifetimeDashboard.graph.safeMergeCandidateCount >= 1, true);
+    assert.equal(lifetimeDashboard.summary.graph.nodeCount, lifetimeDashboard.graph.nodeCount);
     assert.equal(lifetimeDashboard.summary.jobCount, 9);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
     assert.equal(lifetimeDashboard.summary.dirtyAutoDrainSkipCount, 1);

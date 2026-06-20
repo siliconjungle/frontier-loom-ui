@@ -17,8 +17,37 @@ type Dashboard = {
   backlog?: Record<string, unknown>;
   capacity?: Record<string, unknown>;
   semantic?: Record<string, unknown>;
+  graph?: DecisionGraphSummary;
   sources: Record<string, unknown>;
   raw?: Record<string, unknown>;
+};
+
+type DecisionGraphEvent = {
+  type?: string;
+  at?: number;
+  jobId?: string;
+  taskId?: string;
+  status?: string;
+  message?: string;
+};
+
+type DecisionGraphSummary = {
+  sourceFile?: string;
+  sourceFiles?: string[];
+  nodeCount?: number;
+  edgeCount?: number;
+  blockerCount?: number;
+  openBlockerCount?: number;
+  humanQuestionCount?: number;
+  openHumanQuestionCount?: number;
+  safeMergeCandidateCount?: number;
+  decisionCount?: number;
+  gateCount?: number;
+  gatePassedCount?: number;
+  gateFailedCount?: number;
+  status?: string;
+  summaryLine?: string;
+  recentEvents?: DecisionGraphEvent[];
 };
 
 type LaneRollup = {
@@ -774,6 +803,7 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
   const health = dashboardHealthSummary(dashboard, jobs, attention);
   const contribution = contributionGrid(dashboard, jobs, dashboard.events);
   const semantic = semanticMetrics(dashboard.semantic);
+  const graph = decisionGraphSummary(dashboard);
   const resolvedWorkCount = resolvedWorkJobCount(jobs);
   const workerSuccessCount = successLikeJobCount(jobs);
   const progressRatio = health.jobCount ? resolvedWorkCount / health.jobCount : 0;
@@ -810,6 +840,14 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
       </div>
       <SimpleRows rows={semanticHealthRows(semantic)} />
     </section>
+
+    {graph ? <section className="work-section" data-smoke-marker="decision-graph-health">
+      <div className="metric-section-head">
+        <h3>Decision graph health</h3>
+        <span>{decisionGraphStatusLabel(graph.status)}</span>
+      </div>
+      <SimpleRows rows={decisionGraphRows(graph)} />
+    </section> : null}
 
     <section className="work-section work-contribution-section">
       <div className="metric-section-head">
@@ -5812,6 +5850,91 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
     admissionTotal: admissionRows.reduce((sum, row) => sum + row.value, 0),
     health: semanticHealth
   };
+}
+
+function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | undefined {
+  const graph = recordValue(dashboard.graph ?? recordValue(dashboard.summary).graph);
+  const nodeCount = numberValue(graph.nodeCount);
+  const edgeCount = numberValue(graph.edgeCount);
+  const blockerCount = numberValue(graph.blockerCount);
+  const humanQuestionCount = numberValue(graph.humanQuestionCount);
+  const safeMergeCandidateCount = numberValue(graph.safeMergeCandidateCount);
+  const decisionCount = numberValue(graph.decisionCount);
+  const gateCount = numberValue(graph.gateCount);
+  const recentEvents = arrayRecords(graph.recentEvents).map((event) => ({
+    type: textValue(event.type, ''),
+    at: timeValue(event.at),
+    jobId: textValue(event.jobId, ''),
+    taskId: textValue(event.taskId, ''),
+    status: textValue(event.status, ''),
+    message: textValue(event.message, '')
+  }));
+  if (!nodeCount && !edgeCount && !blockerCount && !humanQuestionCount && !safeMergeCandidateCount && !decisionCount && !gateCount && !recentEvents.length) {
+    return undefined;
+  }
+  return {
+    sourceFile: textValue(graph.sourceFile, ''),
+    sourceFiles: stringArray(graph.sourceFiles),
+    nodeCount,
+    edgeCount,
+    blockerCount,
+    openBlockerCount: numberValue(graph.openBlockerCount),
+    humanQuestionCount,
+    openHumanQuestionCount: numberValue(graph.openHumanQuestionCount),
+    safeMergeCandidateCount,
+    decisionCount,
+    gateCount,
+    gatePassedCount: numberValue(graph.gatePassedCount),
+    gateFailedCount: numberValue(graph.gateFailedCount),
+    status: textValue(graph.status, 'unknown'),
+    summaryLine: textValue(graph.summaryLine, ''),
+    recentEvents
+  };
+}
+
+function decisionGraphRows(graph: DecisionGraphSummary): Array<{ label: string; value: string; detail: string }> {
+  const recent = graph.recentEvents?.slice(-3).map((event) => {
+    const label = event.message || event.type || 'graph event';
+    const subject = event.taskId || event.jobId;
+    return `${label}${subject ? ` (${subject})` : ''}`;
+  }).filter(Boolean).join('; ') || 'no recent graph events';
+  return [
+    {
+      label: 'Graph shape',
+      value: `${formatNumber(numberValue(graph.nodeCount))} / ${formatNumber(numberValue(graph.edgeCount))}`,
+      detail: graph.summaryLine || `${formatNumber(numberValue(graph.nodeCount))} nodes and ${formatNumber(numberValue(graph.edgeCount))} edges`
+    },
+    {
+      label: 'Open blockers',
+      value: formatNumber(numberValue(graph.openBlockerCount)),
+      detail: `${formatNumber(numberValue(graph.blockerCount))} blockers tracked`
+    },
+    {
+      label: 'Human questions',
+      value: formatNumber(numberValue(graph.openHumanQuestionCount)),
+      detail: `${formatNumber(numberValue(graph.humanQuestionCount))} questions tracked`
+    },
+    {
+      label: 'Safe merge candidates',
+      value: formatNumber(numberValue(graph.safeMergeCandidateCount)),
+      detail: `${formatNumber(numberValue(graph.decisionCount))} decisions · ${formatNumber(numberValue(graph.gateCount))} gates`
+    },
+    {
+      label: 'Recent graph events',
+      value: formatNumber(graph.recentEvents?.length ?? 0),
+      detail: recent
+    }
+  ];
+}
+
+function decisionGraphStatusLabel(value: unknown): string {
+  const status = normalized(value);
+  if (status === 'blocked') return 'Blocked';
+  if (status === 'questions') return 'Questions';
+  if (status === 'review') return 'Review';
+  if (status === 'ready') return 'Ready';
+  if (status === 'clear') return 'Clear';
+  return 'Unknown';
 }
 
 function semanticHealthRows(semantic: SemanticMetricsSummary): Array<{ label: string; value: string; detail: string }> {

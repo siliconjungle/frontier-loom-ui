@@ -472,6 +472,7 @@ async function readScopedDashboardSnapshot(
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return activeRunSnapshot ?? snapshot;
   const answers = await readHumanActionAnswers(options);
   const record = snapshot as unknown as Record<string, unknown>;
+  const graph = await readDashboardRunGraphSummary(options, record);
   const jobs = Array.isArray(record.jobs) ? record.jobs : [];
   const activeJobs = recordArray(activeRunSnapshot?.jobs);
   if (shouldPreferActiveRunSnapshot(jobs, activeJobs)) {
@@ -482,6 +483,11 @@ async function readScopedDashboardSnapshot(
       activeAgents: activeAgentRows,
       humanActions: recordArray(record.humanActions),
       humanActionAnswers: answers,
+      ...(graph ? { graph } : {}),
+      summary: {
+        ...recordValue(activeRunSnapshot?.summary),
+        ...(graph ? { graph } : {})
+      },
       sources: {
         ...recordValue(record.sources),
         ...recordValue(activeRunSnapshot?.sources),
@@ -509,7 +515,11 @@ async function readScopedDashboardSnapshot(
   };
   return {
     ...normalizedSnapshot,
-    summary: adjustedSummary,
+    ...(graph ? { graph } : {}),
+    summary: {
+      ...adjustedSummary,
+      ...(graph ? { graph } : {})
+    },
     semantic: semanticWithHealth(recordValue(normalizedSnapshot.semantic), semanticSummary, mergedJobs),
     jobs: mergedJobs,
     activeAgents: activeAgentsFromJobs(mergedJobs),
@@ -521,6 +531,107 @@ async function readScopedDashboardSnapshot(
       ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {})
     }
   };
+}
+
+async function readDashboardRunGraphSummary(
+  options: NormalizedLoomUiServerOptions,
+  snapshot: Record<string, unknown>
+): Promise<Record<string, unknown> | undefined> {
+  const embedded = recordValue(recordValue(recordValue(snapshot.raw).collection).runGraph);
+  const file = await resolveDashboardRunGraphFile(options, snapshot);
+  const graph = Object.keys(embedded).length ? embedded : file ? recordValue(await readJsonFile(file)) : {};
+  if (!Object.keys(graph).length) return undefined;
+  return summarizeDashboardRunGraph(graph, file ? path.relative(options.cwd, file).replaceAll(path.sep, '/') : textValue(graph.id, 'embedded'));
+}
+
+async function resolveDashboardRunGraphFile(
+  options: NormalizedLoomUiServerOptions,
+  snapshot: Record<string, unknown>
+): Promise<string | undefined> {
+  const sources = recordValue(snapshot.sources);
+  const candidates = uniquePaths([
+    textValue(options.collection, ''),
+    textValue(sources.collectionDir, ''),
+    path.dirname(textValue(sources.collectionFile, ''))
+  ].filter(Boolean));
+  for (const candidate of candidates) {
+    const absolute = path.resolve(options.cwd, candidate);
+    if (!isPathInside(options.cwd, absolute)) continue;
+    const stat = await fs.lstat(absolute).catch(() => undefined);
+    if (!stat) continue;
+    const file = stat.isDirectory()
+      ? path.join(absolute, 'run-graph.json')
+      : path.basename(absolute) === 'run-graph.json'
+        ? absolute
+        : path.join(path.dirname(absolute), 'run-graph.json');
+    const fileStat = await fs.stat(file).catch(() => undefined);
+    if (fileStat?.isFile() && isPathInside(options.cwd, file)) return file;
+  }
+  return undefined;
+}
+
+function summarizeDashboardRunGraph(graph: Record<string, unknown>, sourceFile: string): Record<string, unknown> | undefined {
+  const summary = recordValue(graph.summary);
+  const nodes = recordArray(graph.nodes);
+  const edges = recordArray(graph.edges);
+  const nodeCount = numberValue(summary.nodeCount) || nodes.length;
+  const edgeCount = numberValue(summary.edgeCount) || edges.length;
+  if (!nodeCount && !edgeCount) return undefined;
+  const gateNodes = nodes.filter((node) => normalized(node.kind) === 'gate');
+  const recentEvents = nodes
+    .filter((node) => numberValue(node.generatedAt))
+    .sort((left, right) => numberValue(left.generatedAt) - numberValue(right.generatedAt))
+    .slice(-8)
+    .map((node) => ({
+      type: textValue(node.kind, 'graph'),
+      at: numberValue(node.generatedAt),
+      jobId: textValue(node.jobId, ''),
+      taskId: textValue(node.taskId, ''),
+      status: textValue(node.status ?? node.outcome, ''),
+      message: textValue(node.label ?? node.id, 'graph node')
+    }));
+  const blockerCount = nodes.filter(runGraphNodeIsBlocker).length;
+  const humanQuestionCount = nodes.filter(runGraphNodeIsHumanQuestion).length;
+  const safeMergeCandidateCount = nodes.filter(runGraphNodeIsSafeMergeCandidate).length;
+  const gateFailedCount = gateNodes.filter((node) => normalized(node.status) === 'failed').length;
+  const status = blockerCount ? 'blocked' : humanQuestionCount ? 'questions' : gateFailedCount ? 'review' : safeMergeCandidateCount ? 'ready' : 'clear';
+  return {
+    sourceFile,
+    sourceFiles: [sourceFile],
+    nodeCount,
+    edgeCount,
+    blockerCount,
+    openBlockerCount: blockerCount,
+    humanQuestionCount,
+    openHumanQuestionCount: humanQuestionCount,
+    safeMergeCandidateCount,
+    decisionCount: numberValue(summary.decisionCount) || nodes.filter((node) => normalized(node.kind) === 'decision').length,
+    gateCount: numberValue(summary.gateCount) || gateNodes.length,
+    gatePassedCount: gateNodes.filter((node) => normalized(node.status) === 'passed').length,
+    gateFailedCount,
+    status,
+    summaryLine: `${nodeCount} nodes, ${edgeCount} edges, ${numberValue(summary.decisionCount)} decisions, and ${numberValue(summary.gateCount) || gateNodes.length} gates.`,
+    recentEvents
+  };
+}
+
+function runGraphNodeIsBlocker(node: Record<string, unknown>): boolean {
+  const status = normalized(node.status);
+  const outcome = normalized(node.outcome);
+  return status === 'blocked' || outcome === 'blocked' || outcome === 'conflict' || outcome === 'human-needed';
+}
+
+function runGraphNodeIsHumanQuestion(node: Record<string, unknown>): boolean {
+  const status = normalized(node.status);
+  const outcome = normalized(node.outcome);
+  return status.includes('human') || outcome.includes('human') || status.includes('question') || outcome.includes('question');
+}
+
+function runGraphNodeIsSafeMergeCandidate(node: Record<string, unknown>): boolean {
+  if (normalized(node.kind) !== 'candidate') return false;
+  const bucket = normalized(node.bucket);
+  const data = recordValue(node.data);
+  return bucket === 'ready-to-apply' || data.autoMergeable === true || normalized(data.mergeReadiness) === 'ready-to-apply';
 }
 
 async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOptions): Promise<Record<string, unknown>> {
@@ -1056,10 +1167,12 @@ async function combineLifetimeDashboardSnapshots(
     });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = await readHumanActionAnswers(options);
+  const graph = lifetimeDecisionGraphSummary(visibleSnapshots);
   const summary = {
     ...lifetimeDashboardSummary(jobs),
     coordinationDelayCount: autoDrainDelays.length,
-    dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length
+    dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length,
+    ...(graph ? { graph } : {})
   };
   const queueOverlay = lifetimeQueueBacklogOverlay(queueBacklog, jobs);
   const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...visibleSnapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
@@ -1092,6 +1205,7 @@ async function combineLifetimeDashboardSnapshots(
     health: lifetimeHealthSummary(jobs),
     quality: {},
     timeSeries: lifetimeTimeSeries(jobs, events),
+    ...(graph ? { graph } : {}),
     lanes: lifetimeLaneRows(jobs),
     capacity: lifetimeCapacitySummary(queueBacklog, jobs, queueOverlay.entries),
     jobs,
@@ -1116,12 +1230,64 @@ async function combineLifetimeDashboardSnapshots(
         loadedSourceCount: visibleSnapshots.length,
         suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
         autoDrainDelays,
+        ...(graph ? { graphSourceFiles: graph.sourceFiles } : {}),
         sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
         manifests: queueBacklog.manifests,
         queueSources: queueBacklog.paths
       }
     }
   };
+}
+
+function lifetimeDecisionGraphSummary(
+  snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }>
+): Record<string, unknown> | undefined {
+  const graphs = snapshots.map(({ source, snapshot }) => {
+    const graph = recordValue(snapshot.graph ?? recordValue(snapshot.summary).graph);
+    return Object.keys(graph).length ? { source, graph } : undefined;
+  }).filter((entry): entry is { source: LifetimeDashboardSource; graph: Record<string, unknown> } => Boolean(entry));
+  if (!graphs.length) return undefined;
+  const sourceFiles = uniquePaths(graphs.flatMap(({ graph }) => stringArray(graph.sourceFiles).length
+    ? stringArray(graph.sourceFiles)
+    : [textValue(graph.sourceFile, '')]).filter(Boolean));
+  const nodeCount = graphNumberSum(graphs, 'nodeCount');
+  const edgeCount = graphNumberSum(graphs, 'edgeCount');
+  const blockerCount = graphNumberSum(graphs, 'blockerCount');
+  const openBlockerCount = graphNumberSum(graphs, 'openBlockerCount');
+  const humanQuestionCount = graphNumberSum(graphs, 'humanQuestionCount');
+  const openHumanQuestionCount = graphNumberSum(graphs, 'openHumanQuestionCount');
+  const safeMergeCandidateCount = graphNumberSum(graphs, 'safeMergeCandidateCount');
+  const decisionCount = graphNumberSum(graphs, 'decisionCount');
+  const gateCount = graphNumberSum(graphs, 'gateCount');
+  const gateFailedCount = graphNumberSum(graphs, 'gateFailedCount');
+  const recentEvents = graphs.flatMap(({ source, graph }) => recordArray(graph.recentEvents).map((event) => ({
+    ...event,
+    sourceLabel: source.label,
+    at: numberValue(event.at) || source.mtimeMs
+  }))).sort((left, right) => numberValue(left.at) - numberValue(right.at)).slice(-12);
+  const status = openBlockerCount ? 'blocked' : openHumanQuestionCount ? 'questions' : gateFailedCount ? 'review' : safeMergeCandidateCount ? 'ready' : 'clear';
+  return {
+    sourceFile: sourceFiles[0],
+    sourceFiles,
+    nodeCount,
+    edgeCount,
+    blockerCount,
+    openBlockerCount,
+    humanQuestionCount,
+    openHumanQuestionCount,
+    safeMergeCandidateCount,
+    decisionCount,
+    gateCount,
+    gatePassedCount: graphNumberSum(graphs, 'gatePassedCount'),
+    gateFailedCount,
+    status,
+    summaryLine: `${nodeCount} nodes, ${edgeCount} edges, ${decisionCount} decisions, and ${gateCount} gates across loaded runs.`,
+    recentEvents
+  };
+}
+
+function graphNumberSum(graphs: Array<{ graph: Record<string, unknown> }>, key: string): number {
+  return graphs.reduce((sum, entry) => sum + numberValue(entry.graph[key]), 0);
 }
 
 function lifetimeScopedId(source: LifetimeDashboardSource, id: string): string {
@@ -1659,7 +1825,7 @@ function mergeLifetimeDrainCoordinatorSnapshot(
       ...recordValue(lifetime.sources),
       ...recordValue(drain?.sources)
     },
-    summary: lifetimeDashboardSummary(jobs),
+    summary: lifetimeSummaryWithExistingGraph(lifetime, jobs),
     health: lifetimeHealthSummary(jobs),
     lanes: lifetimeLaneRows(jobs),
     jobs,
@@ -1691,7 +1857,7 @@ function mergeLifetimeActiveRunSnapshot(
       ...recordValue(lifetime.sources),
       ...recordValue(active?.sources)
     },
-    summary: lifetimeDashboardSummary(jobs),
+    summary: lifetimeSummaryWithExistingGraph(lifetime, jobs),
     health: lifetimeHealthSummary(jobs),
     lanes: lifetimeLaneRows(jobs),
     capacity: lifetimeCapacitySummary(
@@ -2346,6 +2512,14 @@ function lifetimeDashboardSummary(jobs: Array<Record<string, unknown>>): Record<
     estimatedCostMicroUsd: jobs.reduce((sum, job) => sum + numberValue(job.estimatedCostMicroUsd), 0),
     priceKnownJobCount: jobs.filter((job) => job.priceKnown === true).length,
     bucketCounts: countJobsByBucket(jobs)
+  };
+}
+
+function lifetimeSummaryWithExistingGraph(lifetime: Record<string, unknown>, jobs: Array<Record<string, unknown>>): Record<string, unknown> {
+  const graph = recordValue(lifetime.graph ?? recordValue(lifetime.summary).graph);
+  return {
+    ...lifetimeDashboardSummary(jobs),
+    ...(Object.keys(graph).length ? { graph } : {})
   };
 }
 
