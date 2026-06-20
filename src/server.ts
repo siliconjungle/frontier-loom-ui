@@ -501,9 +501,16 @@ async function readScopedDashboardSnapshot(
   }
   const normalizedSnapshot = normalizeCoordinatorFacingSnapshot(record);
   const mergedJobs = applyCoordinatorReviewDecisions(mergeActiveRunJobTelemetry(jobs, activeJobs), decisions).map(withRecomputedCostFields);
+  const normalizedSummary = recordValue(normalizedSnapshot.summary);
+  const adjustedSummary = reviewDecisionAdjustedSummary(normalizedSummary, mergedJobs);
+  const semanticSummary = {
+    ...adjustedSummary,
+    bucketCounts: recordValue(normalizedSummary.bucketCounts)
+  };
   return {
     ...normalizedSnapshot,
-    summary: reviewDecisionAdjustedSummary(recordValue(normalizedSnapshot.summary), mergedJobs),
+    summary: adjustedSummary,
+    semantic: semanticWithHealth(recordValue(normalizedSnapshot.semantic), semanticSummary, mergedJobs),
     jobs: mergedJobs,
     activeAgents: activeAgentsFromJobs(mergedJobs),
     humanActionAnswers: answers,
@@ -1081,7 +1088,7 @@ async function combineLifetimeDashboardSnapshots(
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
     summary,
-    semantic: lifetimeSemanticSummary(jobs),
+    semantic: semanticWithHealth(lifetimeSemanticSummary(jobs), summary, jobs),
     health: lifetimeHealthSummary(jobs),
     quality: {},
     timeSeries: lifetimeTimeSeries(jobs, events),
@@ -2622,6 +2629,179 @@ function lifetimeSemanticSummary(jobs: Array<Record<string, unknown>>): Record<s
     acceptedClean: jobs.filter((job) => textValue(job.semanticReadiness, '') === 'clean').length,
     conflicts: jobs.filter((job) => textValue(job.semanticReadiness, '') === 'blocked').length
   };
+}
+
+function semanticWithHealth(
+  semantic: Record<string, unknown>,
+  summary: Record<string, unknown>,
+  jobs: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  if (Object.keys(recordValue(semantic.health)).length) return semantic;
+  const sourceSummary = { ...recordValue(summary.bucketCounts), ...summary };
+  const imports = recordValue(semantic.import);
+  const edit = recordValue(semantic.edit);
+  const script = recordValue(edit.script);
+  const projection = recordValue(edit.projection);
+  const replay = recordValue(semantic.replay);
+  const admission = recordValue(semantic.admission);
+  const jobAdmission = recordValue(admission.jobs);
+  const scriptAdmission = recordValue(admission.scripts);
+  const jobAdmissionStatusCounts = numberRecordValue(recordValue(jobAdmission.statusCounts));
+  const scriptAdmissionStatusCounts = numberRecordValue(recordValue(scriptAdmission.statusCounts));
+  const parserLosses = firstNumber(sourceSummary.semanticImportLossCount, imports.lossCount);
+  const parserLossSeverityCounts = numberRecordValue(recordValue(sourceSummary.semanticImportLossesBySeverity ?? imports.lossSeverityCounts));
+  const parserWarnings = firstNumber(sourceSummary.semanticImportWarningCount, imports.warningCount);
+  const expectedMissingReasonCodes = uniquePaths([
+    ...stringArray(sourceSummary.semanticImportExpectedMissingReasonCodes),
+    ...stringArray(imports.expectedMissingReasonCodes)
+  ]);
+  const ledger = recordValue(sourceSummary.applyLedger);
+  const ledgerFailed = numberValue(ledger.failed);
+  const ledgerSkipped = numberValue(ledger.skipped);
+  const ledgerLanded = firstNumber(ledger.landed, sourceSummary.landed);
+  const autoMergeCandidates = Math.max(
+    firstNumber(sourceSummary.semanticEditScriptAutoMergeCandidates, script.autoMergeCandidateCount, semantic.autoMerge),
+    numberValue(jobAdmission.autoMergeCandidateCount),
+    numberValue(scriptAdmission.autoMergeCandidateCount)
+  );
+  const scriptConflicts = firstNumber(sourceSummary.semanticEditScriptConflicts, script.conflictCount);
+  const replayConflicts = firstNumber(sourceSummary.semanticEditReplayConflicts, replay.conflictCount, semantic.conflicts);
+  const conflictCount = scriptConflicts + replayConflicts +
+    admissionStatusCount(jobAdmissionStatusCounts, 'conflict') +
+    admissionStatusCount(scriptAdmissionStatusCounts, 'conflict');
+  const scriptBlocked = firstNumber(sourceSummary.semanticEditScriptBlocked, script.blockedCount);
+  const projectionBlocked = firstNumber(sourceSummary.semanticEditProjectionBlocked, projection.blockedCount);
+  const replayBlocked = firstNumber(sourceSummary.semanticEditReplayBlocked, replay.blockedCount);
+  const lineageBlocked = firstNumber(sourceSummary.semanticLineageBlocked);
+  const blockedCount = scriptBlocked + projectionBlocked + replayBlocked + lineageBlocked +
+    admissionStatusCount(jobAdmissionStatusCounts, 'blocked') +
+    admissionStatusCount(scriptAdmissionStatusCounts, 'blocked');
+  const staleCount = firstNumber(sourceSummary.semanticEditScriptStale, script.staleCount) +
+    firstNumber(sourceSummary.semanticEditReplayStale, replay.staleCount);
+  const needsPortCount = firstNumber(sourceSummary.semanticEditScriptNeedsPort, script.needsPortCount) +
+    firstNumber(sourceSummary.semanticEditReplayNeedsPort, replay.needsPortCount);
+  const reviewRequiredCount = firstNumber(sourceSummary.semanticEditScriptReviewRequired, script.reviewRequiredCount) +
+    firstNumber(sourceSummary.semanticLineageNeedsReview) +
+    firstNumber(sourceSummary.semanticLineageAmbiguous) +
+    admissionStatusCount(jobAdmissionStatusCounts, 'review-required') +
+    admissionStatusCount(scriptAdmissionStatusCounts, 'review-required');
+  const reviewReasonCodes = uniquePaths([
+    ...expectedMissingReasonCodes,
+    ...stringArray(sourceSummary.semanticLineageReasonCodes),
+    ...stringArray(sourceSummary.semanticEditScriptReasonCodes),
+    ...stringArray(sourceSummary.semanticEditProjectionReasonCodes),
+    ...stringArray(sourceSummary.semanticEditReplayReasonCodes),
+    ...stringArray(replay.reasonCodes)
+  ]).slice(0, 12);
+  const proofFailed = firstNumber(sourceSummary.semanticProofSpecFailedObligations);
+  const openCoordinatorReviewCount = jobs.filter(isOpenCoordinatorReviewRecord).length;
+  const synthesizedResearchCompleteCount = jobs.filter(isSynthesizedResearchCompleteRecord).length;
+  const failedCount = numberValue(parserLossSeverityCounts.error) + proofFailed + ledgerFailed + conflictCount + blockedCount;
+  const warningCount = parserWarnings + reviewRequiredCount + ledgerSkipped + staleCount + needsPortCount + openCoordinatorReviewCount;
+  const passedCount = firstNumber(replay.acceptedCleanCount, semantic.acceptedClean) +
+    numberValue(replay.alreadyAppliedCount) +
+    ledgerLanded +
+    autoMergeCandidates;
+  const gateReasonCodes = uniquePaths([
+    ...reviewReasonCodes,
+    ...(numberValue(parserLossSeverityCounts.error) ? ['semantic-parser-error-loss'] : []),
+    ...(proofFailed ? ['semantic-proof-obligation-failed'] : []),
+    ...(ledgerFailed ? ['apply-ledger-failed'] : []),
+    ...(conflictCount ? ['semantic-conflict'] : []),
+    ...(blockedCount ? ['semantic-blocked'] : []),
+    ...(openCoordinatorReviewCount ? ['open-coordinator-review'] : [])
+  ]).slice(0, 12);
+  return {
+    ...semantic,
+    import: {
+      ...imports,
+      lossCount: parserLosses,
+      lossSeverityCounts: parserLossSeverityCounts
+    },
+    health: {
+      parser: {
+        lossCount: parserLosses,
+        lossSeverityCounts: parserLossSeverityCounts,
+        warningCount: parserWarnings,
+        expectedMissingReasonCodes
+      },
+      ledger: {
+        totalCount: numberValue(ledger.total),
+        landedCount: ledgerLanded,
+        skippedCount: ledgerSkipped,
+        failedCount: ledgerFailed
+      },
+      merge: {
+        autoMergeCandidateCount: autoMergeCandidates,
+        reviewRequiredCount,
+        conflictCount,
+        staleCount,
+        blockedCount,
+        needsPortCount,
+        reasonCodes: reviewReasonCodes
+      },
+      gates: {
+        status: semanticGateStatus({ failedCount, warningCount, passedCount }),
+        passedCount,
+        warningCount,
+        failedCount,
+        reasonCodes: gateReasonCodes
+      },
+      outcomes: {
+        openCoordinatorReviewCount,
+        synthesizedResearchCompleteCount
+      }
+    }
+  };
+}
+
+function isSynthesizedResearchCompleteRecord(job: Record<string, unknown>): boolean {
+  if (normalized(job.status) !== 'completed' || isOpenCoordinatorReviewRecord(job)) return false;
+  const signals = [
+    job.lane,
+    job.title,
+    job.workKind,
+    job.disposition,
+    job.mergeReadiness,
+    ...stringArray(job.reasons),
+    ...stringArray(job.collectReasonClasses)
+  ].map(normalized);
+  return signals.some((signal) => signal === 'discovery-only' ||
+    signal.includes('research') ||
+    signal.includes('synthesized') ||
+    signal.includes('collector-workspace-only-recovery') ||
+    signal.includes('generated-by-collector'));
+}
+
+function numberRecordValue(value: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const count = numberValue(entry);
+    if (count > 0) out[key] = count;
+  }
+  return out;
+}
+
+function admissionStatusCount(record: Record<string, number>, wanted: string): number {
+  return Object.entries(record).reduce((sum, [key, value]) => normalizedStatusKey(key) === wanted ? sum + value : sum, 0);
+}
+
+function normalizedStatusKey(value: unknown): string {
+  return textValue(value, '').trim().replace(/_/g, '-').toLowerCase();
+}
+
+function semanticGateStatus(input: { failedCount: number; warningCount: number; passedCount: number }): string {
+  if (input.failedCount > 0) return 'blocked';
+  if (input.warningCount > 0) return 'review';
+  if (input.passedCount > 0) return 'pass';
+  return 'unknown';
+}
+
+function firstNumber(...values: unknown[]): number {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return 0;
 }
 
 async function lifetimeRoutingSummary(

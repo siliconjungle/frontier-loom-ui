@@ -87,6 +87,37 @@ type ChartSeries = {
   yLabel?: string;
 };
 
+type SemanticHealthSummary = {
+  parserLosses: number;
+  parserWarnings: number;
+  ledgerFailed: number;
+  ledgerSkipped: number;
+  ledgerLanded: number;
+  autoMergeCandidates: number;
+  reviewRequired: number;
+  conflicts: number;
+  gateStatus: string;
+  gatePassed: number;
+  gateWarnings: number;
+  gateFailed: number;
+  synthesizedResearchComplete: number;
+  openCoordinatorReview: number;
+  reasonCodes: string[];
+};
+
+type SemanticMetricsSummary = {
+  expected: number;
+  satisfied: number;
+  candidates: number;
+  autoMerge: number;
+  acceptedClean: number;
+  conflicts: number;
+  total: number;
+  admissionRows: Array<{ label: string; value: number; detail?: string; tone?: ChartTone }>;
+  admissionTotal: number;
+  health: SemanticHealthSummary;
+};
+
 type OptimizationBehaviorCard = {
   label: string;
   value: string;
@@ -742,6 +773,7 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
 }): Node {
   const health = dashboardHealthSummary(dashboard, jobs, attention);
   const contribution = contributionGrid(dashboard, jobs, dashboard.events);
+  const semantic = semanticMetrics(dashboard.semantic);
   const resolvedWorkCount = resolvedWorkJobCount(jobs);
   const workerSuccessCount = successLikeJobCount(jobs);
   const progressRatio = health.jobCount ? resolvedWorkCount / health.jobCount : 0;
@@ -769,6 +801,14 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
         </div>
         <small className="goal-reliability">Worker reliability {formatPercent(workerReliabilityRatio)} · {text(workerSuccessCount)} clean completions</small>
       </div>
+    </section>
+
+    <section className="work-section" data-smoke-marker="semantic-merge-health">
+      <div className="metric-section-head">
+        <h3>Semantic merge health</h3>
+        <span>{semanticGateLabel(semantic.health.gateStatus)}</span>
+      </div>
+      <SimpleRows rows={semanticHealthRows(semantic)} />
     </section>
 
     <section className="work-section work-contribution-section">
@@ -5718,41 +5758,91 @@ function formatBucketSize(value: unknown): string {
   return `${Math.round(ms / 60000)} min`;
 }
 
-function semanticMetrics(value: unknown): {
-  expected: number;
-  satisfied: number;
-  candidates: number;
-  autoMerge: number;
-  acceptedClean: number;
-  conflicts: number;
-  total: number;
-  admissionRows: Array<{ label: string; value: number; detail?: string; tone?: ChartTone }>;
-  admissionTotal: number;
-} {
+function semanticMetrics(value: unknown): SemanticMetricsSummary {
   const input = recordValue(value);
   const imports = recordValue(input.import);
   const edit = recordValue(input.edit);
   const script = recordValue(edit.script);
   const replay = recordValue(input.replay);
   const admission = recordValue(input.admission);
+  const health = recordValue(input.health);
+  const parser = recordValue(health.parser);
+  const ledger = recordValue(health.ledger);
+  const merge = recordValue(health.merge);
+  const gates = recordValue(health.gates);
+  const outcomes = recordValue(health.outcomes);
   const admissionRows = [
     ...semanticAdmissionRows(admission.jobs, 'Jobs'),
     ...semanticAdmissionRows(admission.scripts, 'Scripts')
   ];
   const metrics = {
-    expected: numberValue(imports.expectedCount),
-    satisfied: numberValue(imports.expectedSatisfiedCount),
-    candidates: numberValue(imports.candidateCount),
-    autoMerge: numberValue(script.autoMergeCandidateCount),
-    acceptedClean: numberValue(replay.acceptedCleanCount),
-    conflicts: numberValue(replay.conflictCount)
+    expected: firstNumber(imports.expectedCount, input.expected),
+    satisfied: firstNumber(imports.expectedSatisfiedCount, input.satisfied),
+    candidates: firstNumber(imports.candidateCount, input.candidates),
+    autoMerge: firstNumber(script.autoMergeCandidateCount, input.autoMerge),
+    acceptedClean: firstNumber(replay.acceptedCleanCount, input.acceptedClean),
+    conflicts: firstNumber(merge.conflictCount, replay.conflictCount, input.conflicts)
+  };
+  const semanticHealth: SemanticHealthSummary = {
+    parserLosses: firstNumber(parser.lossCount, imports.lossCount),
+    parserWarnings: firstNumber(parser.warningCount, imports.warningCount),
+    ledgerFailed: numberValue(ledger.failedCount),
+    ledgerSkipped: numberValue(ledger.skippedCount),
+    ledgerLanded: numberValue(ledger.landedCount),
+    autoMergeCandidates: firstNumber(merge.autoMergeCandidateCount, metrics.autoMerge),
+    reviewRequired: numberValue(merge.reviewRequiredCount),
+    conflicts: metrics.conflicts,
+    gateStatus: textValue(gates.status, 'unknown'),
+    gatePassed: numberValue(gates.passedCount),
+    gateWarnings: numberValue(gates.warningCount),
+    gateFailed: numberValue(gates.failedCount),
+    synthesizedResearchComplete: numberValue(outcomes.synthesizedResearchCompleteCount),
+    openCoordinatorReview: numberValue(outcomes.openCoordinatorReviewCount),
+    reasonCodes: uniqueStrings([
+      ...stringArray(parser.expectedMissingReasonCodes),
+      ...stringArray(merge.reasonCodes),
+      ...stringArray(gates.reasonCodes)
+    ]).slice(0, 6)
   };
   return {
     ...metrics,
-    total: metrics.expected + metrics.satisfied + metrics.candidates + metrics.autoMerge + metrics.acceptedClean + metrics.conflicts,
+    total: metrics.expected + metrics.satisfied + metrics.candidates + metrics.autoMerge + metrics.acceptedClean + metrics.conflicts +
+      semanticHealth.parserLosses + semanticHealth.reviewRequired,
     admissionRows,
-    admissionTotal: admissionRows.reduce((sum, row) => sum + row.value, 0)
+    admissionTotal: admissionRows.reduce((sum, row) => sum + row.value, 0),
+    health: semanticHealth
   };
+}
+
+function semanticHealthRows(semantic: SemanticMetricsSummary): Array<{ label: string; value: string; detail: string }> {
+  const health = semantic.health;
+  const ledgerLosses = health.ledgerFailed + health.ledgerSkipped;
+  const reasonDetail = health.reasonCodes.length ? health.reasonCodes.join(', ') : 'no reason codes';
+  return [
+    { label: 'Parser losses', value: formatNumber(health.parserLosses), detail: `${formatNumber(health.parserWarnings)} warnings · ${reasonDetail}` },
+    { label: 'Ledger losses', value: formatNumber(ledgerLosses), detail: `${formatNumber(health.ledgerFailed)} failed · ${formatNumber(health.ledgerSkipped)} skipped · ${formatNumber(health.ledgerLanded)} landed` },
+    { label: 'Auto-merge candidates', value: formatNumber(health.autoMergeCandidates), detail: `${formatNumber(semantic.acceptedClean)} replay clean` },
+    { label: 'Review-required reasons', value: formatNumber(health.reviewRequired), detail: reasonDetail },
+    { label: 'Conflicts', value: formatNumber(health.conflicts), detail: 'semantic script, replay, or admission conflicts' },
+    { label: 'Gate status', value: semanticGateLabel(health.gateStatus), detail: `${formatNumber(health.gateFailed)} failed · ${formatNumber(health.gateWarnings)} review · ${formatNumber(health.gatePassed)} pass` },
+    { label: 'Synthesized/research complete', value: formatNumber(health.synthesizedResearchComplete), detail: 'completed discovery or synthesized outputs' },
+    { label: 'Open coordinator review', value: formatNumber(health.openCoordinatorReview), detail: 'outputs still waiting on coordinator decision' }
+  ];
+}
+
+function semanticGateLabel(value: string): string {
+  const status = normalized(value);
+  if (status === 'pass') return 'Pass';
+  if (status === 'review') return 'Review';
+  if (status === 'blocked') return 'Blocked';
+  return 'Unknown';
+}
+
+function firstNumber(...values: unknown[]): number {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return 0;
 }
 
 function semanticSuccessRows(value: unknown): Array<{ label: string; value: number; detail?: string; tone?: ChartTone }> {

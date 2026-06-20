@@ -69,9 +69,19 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     semanticImportExpectedCount: 2,
     semanticImportExpectedSatisfiedCount: 1,
     semanticImportCandidateCount: 3,
+    semanticImportLossCount: 2,
+    semanticImportLossesBySeverity: { error: 1, warning: 1 },
     semanticEditScriptAutoMergeCandidates: 1,
+    semanticEditScriptConflicts: 1,
+    semanticEditScriptReviewRequired: 1,
+    semanticEditScriptReasonCodes: ['ambiguous-edit'],
+    semanticEditProjectionBlocked: 1,
     semanticEditReplayAcceptedClean: 1,
     semanticEditReplayConflicts: 1,
+    semanticEditReplayReasonCodes: ['current-symbol-anchor-content-mismatch'],
+    semanticLineageNeedsReview: 1,
+    semanticLineageReasonCodes: ['ambiguous-lineage-candidates'],
+    semanticProofSpecFailedObligations: 1,
     semanticEditAdmission: {
       statusCounts: { accepted: 2, blocked: 1 },
       autoMergeCandidateCount: 1,
@@ -92,8 +102,8 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
       total: 1,
       applied: 1,
       committed: 0,
-      skipped: 0,
-      failed: 0,
+      skipped: 1,
+      failed: 1,
       landed: 1
     }
   },
@@ -143,7 +153,7 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     }]
   },
   buckets: {
-    'ready-to-apply': [{ bucket: 'ready-to-apply', jobId: 'ui-job', mergePath: 'merge-ui.json', outputDir: collectionDir, bundle: { jobId: 'ui-job', taskId: 'ui-task', lane: 'ui', status: 'completed', mergeReadiness: 'ready-to-apply', disposition: 'ready', patchPath, evidencePaths: ['ui-evidence.json'], reasons: [], commandsPassed: [{ command: 'npm test', summary: 'all smoke checks passed' }], commandsFailed: [], durationMs: 125000 } }],
+    'ready-to-apply': [{ bucket: 'ready-to-apply', jobId: 'ui-job', mergePath: 'merge-ui.json', outputDir: collectionDir, bundle: { jobId: 'ui-job', taskId: 'ui-task', lane: 'ui', status: 'completed', mergeReadiness: 'ready-to-apply', disposition: 'ready', patchPath, evidencePaths: ['ui-evidence.json'], reasons: ['synthesized-research-complete'], commandsPassed: [{ command: 'npm test', summary: 'all smoke checks passed' }], commandsFailed: [], durationMs: 125000 } }],
     'needs-human-port': [{ bucket: 'needs-human-port', jobId: 'runtime-job', mergePath: 'merge-runtime.json', outputDir: collectionDir, bundle: { jobId: 'runtime-job', taskId: 'runtime-task', lane: 'runtime', status: 'completed', mergeReadiness: 'needs-port', disposition: 'needs-port', evidencePaths: ['runtime-evidence.json'], reasons: ['manual port required'], contextBudget: { status: 'warning', action: 'continue', measured: { promptBytes: 64000, estimatedInputTokens: 16000 }, usage: { inputTokens: 28000 }, warnings: ['actual input tokens 28000 exceeded warning budget 20000'], errors: [] } } }],
     'failed-evidence': [{ bucket: 'failed-evidence', jobId: 'review-job', mergePath: 'merge-review.json', outputDir: collectionDir, bundle: { jobId: 'review-job', taskId: 'review-task', lane: 'review', status: 'failed', mergeReadiness: 'blocked', disposition: 'blocked', evidencePaths: [], reasons: ['missing proof'] } }],
     'stale-against-head': []
@@ -677,8 +687,18 @@ try {
   assert.equal(dashboard.timeSeries.bucketMs, 60000);
   assert.equal(dashboard.timeSeries.summary.missingTimestampJobCount, 3);
   assert.equal(dashboard.semantic.import.expectedCount, 2);
+  assert.equal(dashboard.semantic.import.lossCount, 2);
+  assert.deepEqual(dashboard.semantic.import.lossSeverityCounts, { error: 1, warning: 1 });
   assert.equal(dashboard.semantic.replay.acceptedCleanCount, 1);
   assert.equal(dashboard.semantic.admission.jobs.statusCounts.accepted, 2);
+  assert.equal(dashboard.semantic.health.parser.lossCount, 2);
+  assert.equal(dashboard.semantic.health.ledger.failedCount, 1);
+  assert.equal(dashboard.semantic.health.merge.reviewRequiredCount, 2);
+  assert.equal(dashboard.semantic.health.merge.conflictCount, 3);
+  assert.equal(dashboard.semantic.health.gates.status, 'blocked');
+  assert.ok(dashboard.semantic.health.gates.reasonCodes.includes('ambiguous-edit'));
+  assert.equal(dashboard.semantic.health.outcomes.synthesizedResearchCompleteCount, 1);
+  assert.equal(dashboard.semantic.health.outcomes.openCoordinatorReviewCount, 1);
   assert.ok(Array.isArray(dashboard.humanActions));
   assert.equal(dashboard.humanActions.length, 2);
   assert.deepEqual(dashboard.humanActions.map((action) => action.code).sort(), ['C-ROUTING', 'Q-SCOPE']);
@@ -1096,7 +1116,14 @@ try {
     'Quality status',
     'No testing metadata was reported',
     'Evidence mix',
-    'Recent check output'
+    'Recent check output',
+    'Semantic merge health',
+    'Parser losses',
+    'Ledger losses',
+    'Review-required reasons',
+    'Gate status',
+    'Synthesized/research complete',
+    'Open coordinator review'
   ]);
   assert.doesNotMatch(client, /Read-only operator shell|Frontier swarm operations|selectedLane|selected lane|data-lane-filter|Lane efficiency|Lane load|Epics \/ task groups|Merge readiness|Quality gates|Agent questions only|Artifact viewer|action-options|action-scope/);
   assertNoOperatorSteeringSurface(`${html}\n${client}`);
