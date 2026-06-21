@@ -1238,25 +1238,7 @@ try {
     'No testing metadata was reported',
     'Evidence mix',
     'Recent check output',
-    'Semantic merge health',
-    'Parser losses',
-    'Ledger losses',
-    'Safe merged',
-    'Safe with losses',
-    'Conflict',
-    'No-op',
-    'Stale',
-    'Missing sidecar',
-    'Coordinator review',
-    'Tests missing',
-    'Review-required reasons',
-    'Gate status',
-    'Synthesized/research complete',
-    'Open coordinator review',
-    'Decision graph source',
-    'Graph missing warning',
-    'Terminal decisions',
-    'Stale/rerun cleanup'
+    'Coordinator review'
   ]);
   assert.doesNotMatch(client, /Read-only operator shell|Frontier swarm operations|selectedLane|selected lane|data-lane-filter|Lane efficiency|Lane load|Epics \/ task groups|Merge readiness|Quality gates|Agent questions only|Artifact viewer|action-options|action-scope/);
   assertNoOperatorSteeringSurface(`${html}\n${client}`);

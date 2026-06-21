@@ -821,8 +821,6 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
 }): Node {
   const health = dashboardHealthSummary(dashboard, jobs, attention);
   const contribution = contributionGrid(dashboard, jobs, dashboard.events);
-  const semantic = semanticMetrics(dashboard.semantic);
-  const graph = decisionGraphSummary(dashboard);
   const resolvedWorkCount = resolvedWorkJobCount(jobs);
   const workerSuccessCount = successLikeJobCount(jobs);
   const progressRatio = health.jobCount ? resolvedWorkCount / health.jobCount : 0;
@@ -851,22 +849,6 @@ function WorkOverview({ dashboard, lanes, jobs, attention, audit, success }: {
         <small className="goal-reliability">Worker reliability {formatPercent(workerReliabilityRatio)} · {text(workerSuccessCount)} clean completions</small>
       </div>
     </section>
-
-    <section className="work-section" data-smoke-marker="semantic-merge-health">
-      <div className="metric-section-head">
-        <h3>Semantic merge health</h3>
-        <span>{semanticGateLabel(semantic.health.gateStatus)}</span>
-      </div>
-      <SimpleRows rows={semanticHealthRows(semantic)} />
-    </section>
-
-    {graph ? <section className="work-section" data-smoke-marker="decision-graph-health">
-      <div className="metric-section-head">
-        <h3>Decision graph health</h3>
-        <span>{decisionGraphStatusLabel(graph.status)}</span>
-      </div>
-      <SimpleRows rows={decisionGraphRows(graph)} />
-    </section> : null}
 
     <section className="work-section work-contribution-section">
       <div className="metric-section-head">
