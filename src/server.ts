@@ -484,6 +484,7 @@ async function readScopedDashboardSnapshot(
       ...activeRunSnapshot,
       collectionJobs: jobs,
       activeAgents: activeAgentRows,
+      health: lifetimeHealthSummary(activeJobs),
       humanActions: recordArray(record.humanActions),
       humanActionAnswers: answers,
       ...(graph ? { graph } : {}),
@@ -526,6 +527,7 @@ async function readScopedDashboardSnapshot(
       ...adjustedSummary,
       ...(graph ? { graph } : {})
     },
+    health: lifetimeHealthSummary(mergedJobs),
     semantic: semanticWithHealth(recordValue(normalizedSnapshot.semantic), semanticSummary, mergedJobs),
     jobs: mergedJobs,
     activeAgents: activeAgentsFromJobs(mergedJobs),
@@ -1914,6 +1916,7 @@ function readDrainPidManifestJob(
   const lane = textValue(planJob?.lane ?? task.lane, drainCoordinatorLane(jobId, runKind));
   return withRecomputedCostFields({
     id: jobId,
+    jobId,
     originalJobId: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
     title: textValue(planJob?.title ?? task.title, runKind === 'coordinator' ? `Coordinate lane review for ${lane}` : `Continue ${lane} work`),
@@ -2545,9 +2548,50 @@ function normalizeCoordinatorFacingJob(record: Record<string, unknown>): Record<
     disposition: coordinatorFacingMachineLabel(record.disposition),
     mergeReadiness: coordinatorFacingMachineLabel(record.mergeReadiness)
   };
+  normalizedRecord = normalizeUnreasonedBlockedJob(normalizedRecord);
   normalizedRecord = normalizeHistoricalEvidenceFailureJob(normalizedRecord);
   if (!isResolvedCoordinatorReviewRecord(normalizedRecord)) return normalizedRecord;
   return markCoordinatorReviewResolved(normalizedRecord, textValue(normalizedRecord.coordinatorDecisionStatus ?? normalizedRecord.disposition, 'review-resolved'));
+}
+
+function normalizeUnreasonedBlockedJob(record: Record<string, unknown>): Record<string, unknown> {
+  const status = normalized(record.status);
+  const bucket = normalized(record.bucket);
+  if (status !== 'blocked' && bucket !== 'blocked') return record;
+  if (hasExplicitBlockedEvidence(record)) return record;
+  return {
+    ...record,
+    originalBucket: record.originalBucket ?? record.bucket,
+    originalStatus: record.originalStatus ?? record.status,
+    originalDisposition: record.originalDisposition ?? record.disposition,
+    bucket: 'needs-coordinator-review',
+    status: 'completed',
+    disposition: 'needs-coordinator-review',
+    mergeReadiness: 'needs-coordinator-review',
+    reasons: uniquePaths([...stringArray(record.reasons), 'blocked-status-without-blocker-evidence']),
+    collectReasonClasses: uniquePaths([...stringArray(record.collectReasonClasses), 'run status needs coordinator classification'])
+  };
+}
+
+function hasExplicitBlockedEvidence(record: Record<string, unknown>): boolean {
+  const fields = [
+    record.disposition,
+    record.mergeReadiness,
+    record.semanticReadiness,
+    record.outcome,
+    record.health
+  ].map(normalized);
+  if (fields.some((field) => ['blocked', 'conflict', 'conflict-blocked', 'human-blocked', 'human-needed'].includes(field))) return true;
+  if (numberValue(record.blockerCount) > 0 || numberValue(record.openBlockerCount) > 0) return true;
+  if (numberValue(record.humanActionCount) > 0 || numberValue(record.openHumanQuestionCount) > 0) return true;
+  if (numberValue(record.commandsFailed) > 0 || numberValue(record.failedCheckCount) > 0) return true;
+  const classes = [
+    ...stringArray(record.reasons),
+    ...stringArray(record.collectReasonClasses),
+    ...stringArray(record.blockers),
+    ...stringArray(record.humanQuestions)
+  ].map(normalized);
+  return classes.some((value) => /\b(?:blocked|blocker|conflict|human-needed|human-blocked|human-question|failed-evidence|quota-deferred|timeout|denied)\b/u.test(value));
 }
 
 function normalizeHistoricalEvidenceFailureJob(record: Record<string, unknown>): Record<string, unknown> {
@@ -3705,6 +3749,7 @@ async function readActiveRunSnapshot(
       },
       ...(graph ? { graph } : {})
     },
+    health: lifetimeHealthSummary(jobs),
     lanes: activeRunLanes(jobs),
     jobs,
     activeAgents: activeAgentsFromJobs(jobs),
@@ -3916,6 +3961,8 @@ async function activeRunJob(
   const commandEvidence = commandEvidenceFromRecords(merge, evidenceRecord);
   return withRecomputedCostFields({
     id: jobId,
+    jobId,
+    originalJobId: jobId,
     taskId: textValue(planJob?.taskId ?? task.id, jobId),
     title: textValue(planJob?.title ?? task.title, jobId),
     lane: textValue(planJob?.lane ?? task.lane, 'active-run'),
@@ -4032,7 +4079,7 @@ function mergeActiveRunJobTelemetry(jobs: unknown[], activeJobs: Array<Record<st
   if (!activeJobs.length) return jobs;
   const byKey = new Map<string, Record<string, unknown>>();
   for (const activeJob of activeJobs) {
-    if (!hasTokenTelemetry(activeJob)) continue;
+    if (!hasActiveRunJobState(activeJob)) continue;
     for (const key of jobTelemetryKeys(activeJob)) byKey.set(key, activeJob);
   }
   if (!byKey.size) return jobs;
@@ -4043,6 +4090,7 @@ function mergeActiveRunJobTelemetry(jobs: unknown[], activeJobs: Array<Record<st
     if (!activeJob) return record;
     return {
       ...record,
+      ...activeRunJobStateFields(activeJob),
       ...(numberValue(activeJob.actualInputTokens) ? { actualInputTokens: numberValue(activeJob.actualInputTokens) } : {}),
       ...(numberValue(activeJob.inputTokens) ? { inputTokens: numberValue(activeJob.inputTokens) } : {}),
       ...(numberValue(activeJob.estimatedInputTokens) ? { estimatedInputTokens: numberValue(activeJob.estimatedInputTokens) } : {}),
@@ -4057,6 +4105,33 @@ function mergeActiveRunJobTelemetry(jobs: unknown[], activeJobs: Array<Record<st
       }
     };
   });
+}
+
+function hasActiveRunJobState(job: Record<string, unknown>): boolean {
+  return hasTokenTelemetry(job)
+    || Boolean(textValue(job.status, ''))
+    || stringArray(job.evidencePaths).length > 0
+    || stringArray(job.changedPaths).length > 0
+    || Boolean(textValue(job.patchPath, ''));
+}
+
+function activeRunJobStateFields(job: Record<string, unknown>): Record<string, unknown> {
+  const evidencePaths = stringArray(job.evidencePaths);
+  const changedPaths = stringArray(job.changedPaths);
+  const artifactPaths = stringArray(job.artifactPaths);
+  return {
+    ...(textValue(job.status, '') ? { status: textValue(job.status, '') } : {}),
+    ...(textValue(job.bucket, '') ? { bucket: textValue(job.bucket, '') } : {}),
+    ...(textValue(job.disposition, '') ? { disposition: textValue(job.disposition, '') } : {}),
+    ...(textValue(job.mergeReadiness, '') ? { mergeReadiness: textValue(job.mergeReadiness, '') } : {}),
+    ...(textValue(job.patchPath, '') ? { patchPath: textValue(job.patchPath, '') } : {}),
+    ...(artifactPaths.length ? { artifactPaths: uniquePaths([...artifactPaths, ...stringArray(job.artifactPaths)]) } : {}),
+    ...(changedPaths.length ? { changedPaths, changedPathCount: changedPaths.length } : {}),
+    ...(evidencePaths.length ? { evidencePaths, evidencePathCount: evidencePaths.length } : {}),
+    ...(numberValue(job.commandsPassed) ? { commandsPassed: numberValue(job.commandsPassed) } : {}),
+    ...(numberValue(job.commandsFailed) ? { commandsFailed: numberValue(job.commandsFailed) } : {}),
+    ...(stringArray(job.collectReasonClasses).length ? { collectReasonClasses: stringArray(job.collectReasonClasses) } : {})
+  };
 }
 
 function jobTelemetryKeys(job: Record<string, unknown>): string[] {
