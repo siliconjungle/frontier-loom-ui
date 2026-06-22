@@ -21,6 +21,7 @@ const lifetimeOwnershipRescopeJobDir = path.join(lifetimeOwnershipRescopeRunDir,
 const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
 const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
 const substrateRunDir = path.join(tmp, 'agent-runs', 'substrate-run');
+const durableQueueRunDir = path.join(tmp, 'agent-runs', 'durable-queue-run', 'run-1');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
@@ -35,6 +36,7 @@ await fs.mkdir(path.join(lifetimeOwnershipRescopeJobDir, 'evidence'), { recursiv
 await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
 await fs.mkdir(substrateRunDir, { recursive: true });
+await fs.mkdir(durableQueueRunDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
@@ -693,6 +695,39 @@ await fs.writeFile(path.join(queueDir, 'tasks.remaining-proof.json'), JSON.strin
   { id: 'queued-task', title: 'Queued task', lane: 'queued', status: 'todo' },
   { id: 'dedupe-task', title: 'Dedupe follow-up', lane: 'dedupe', status: 'todo' }
 ], null, 2) + '\n');
+await fs.writeFile(path.join(durableQueueRunDir, 'queue-state.json'), JSON.stringify({
+  id: 'frontier-swarm-codex:durable-queue-run',
+  jobs: [
+    {
+      id: 'swarm-job:durable-queued',
+      status: 'queued',
+      priority: 4,
+      payload: { id: 'durable-queued', title: 'Durable queued task', lane: 'durable', targetRefs: ['src/durable.ts'] },
+      metadata: { swarmJobId: 'durable-queued', taskId: 'durable-queued', lane: 'durable', runId: 'durable-queue-run' }
+    },
+    {
+      id: 'swarm-job:durable-leased',
+      status: 'leased',
+      payload: { id: 'durable-leased', title: 'Durable leased task', lane: 'durable' },
+      metadata: { swarmJobId: 'durable-leased', taskId: 'durable-leased', lane: 'durable', runId: 'durable-queue-run' },
+      lease: { owner: 'frontier-swarm-codex', token: 'redacted-by-ui-test' }
+    },
+    {
+      id: 'swarm-job:durable-completed',
+      status: 'completed',
+      payload: { id: 'durable-completed', title: 'Durable completed task', lane: 'durable' },
+      metadata: { swarmJobId: 'durable-completed', taskId: 'durable-completed', lane: 'durable', runId: 'durable-queue-run' }
+    },
+    {
+      id: 'swarm-job:durable-dead',
+      status: 'dead',
+      payload: { id: 'durable-dead', title: 'Durable dead task', lane: 'durable' },
+      metadata: { swarmJobId: 'durable-dead', taskId: 'durable-dead', lane: 'durable', runId: 'durable-queue-run' }
+    }
+  ],
+  terminalOutcomes: [{ jobId: 'swarm-job:durable-completed' }, { jobId: 'swarm-job:durable-dead' }],
+  events: [{ type: 'frontier.queue.job.leased' }, { type: 'frontier.queue.job.completed' }]
+}, null, 2) + '\n');
 const activeWorker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codex', 'active-live'], { stdio: 'ignore' });
 assert.ok(activeWorker.pid);
 await fs.writeFile(path.join(activeRunDir, 'pids.json'), JSON.stringify({
@@ -894,7 +929,8 @@ try {
     assert.equal(lifetimeDashboard.kind, 'frontier.loom-ui.lifetime-dashboard');
     assert.ok(lifetimeDashboard.sources.sourceCount >= 2);
     assert.ok(lifetimeDashboard.sources.loadedSourceCount >= 1);
-    assert.equal(lifetimeDashboard.sources.queueSourceCount, 1);
+    assert.equal(lifetimeDashboard.sources.queueSourceCount, 2);
+    assert.equal(lifetimeDashboard.sources.queueStateSourceCount, 1);
     assert.equal(lifetimeDashboard.graph.nodeCount >= 2, true);
     assert.equal(lifetimeDashboard.graph.safeMergeCandidateCount >= 1, true);
     assert.equal(lifetimeDashboard.graph.sourceKind, 'lifetime-rollup');
@@ -930,6 +966,14 @@ try {
     assert.equal((lifetimeDashboard.summary.bucketCounts?.['worker-failed'] ?? 0) >= 1, true);
     assert.equal(lifetimeDashboard.summary.bucketCounts?.['rerun-work'] ?? 0, 1);
     assert.equal((lifetimeDashboard.summary.bucketCounts?.['review-resolved'] ?? 0) >= 5, true);
+    assert.equal(lifetimeDashboard.summary.durableQueueStateCount, 1);
+    assert.equal(lifetimeDashboard.summary.durableQueueJobCount, 4);
+    assert.equal(lifetimeDashboard.summary.durableQueueQueuedCount, 1);
+    assert.equal(lifetimeDashboard.summary.durableQueueLeasedCount, 1);
+    assert.equal(lifetimeDashboard.summary.durableQueueCompletedCount, 1);
+    assert.equal(lifetimeDashboard.summary.durableQueueFailedCount, 1);
+    assert.equal(lifetimeDashboard.summary.durableQueueTerminalOutcomeCount, 2);
+    assert.equal(lifetimeDashboard.summary.durableQueueEventCount, 2);
     assert.equal(lifetimeDashboard.humanActionAnswers.length, 1);
     assert.equal(lifetimeDashboard.humanActionAnswers[0].code, 'Q-SCOPE');
     assert.match(lifetimeDashboard.humanActionAnswers[0].answer, /lifetime answer/);
@@ -994,12 +1038,20 @@ try {
     assert.equal(ownershipRescopeJob.evidenceFailureNormalized, true);
     assert.deepEqual(ownershipRescopeJob.ownershipViolations, ['src/internal.ts']);
     assert.equal(lifetimeDashboard.raw.lifetime.autoDrainDelays.length, 1);
+    assert.equal(lifetimeDashboard.raw.lifetime.queueStates[0].path.replace(/\\/g, '/').endsWith('agent-runs/durable-queue-run/run-1/queue-state.json'), true);
+    const backlogIds = new Set(lifetimeDashboard.backlog.entries.map((entry) => entry.id));
+    assert.equal(backlogIds.has('durable-queued'), true);
+    assert.equal(backlogIds.has('durable-leased'), true);
+    assert.equal(backlogIds.has('durable-completed'), false);
+    assert.equal(backlogIds.has('durable-dead'), false);
     assert.equal(lifetimeDashboard.capacity.manifestId, 'capacity-proof-manifest');
     assert.equal(lifetimeDashboard.capacity.maxConcurrency, 6);
-    assert.equal(lifetimeDashboard.capacity.openLaneCount, 1);
-    assert.equal(lifetimeDashboard.capacity.queuedTaskCount, 1);
+    assert.equal(lifetimeDashboard.capacity.durableQueueJobCount, 4);
+    assert.equal(lifetimeDashboard.capacity.openLaneCount, 2);
+    assert.equal(lifetimeDashboard.capacity.queuedTaskCount, 2);
     assert.equal(lifetimeDashboard.capacity.lanes.find((lane) => lane.id === 'dedupe').completedCount, 4);
     assert.equal(lifetimeDashboard.capacity.lanes.find((lane) => lane.id === 'queued').queuedTaskCount, 1);
+    assert.equal(lifetimeDashboard.capacity.lanes.find((lane) => lane.id === 'durable').queuedTaskCount, 1);
   } finally {
     await lifetimeServer.close();
   }

@@ -36,6 +36,7 @@ const LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES = 400;
 const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
 const LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS = 32;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
+const LIFETIME_DASHBOARD_MAX_QUEUE_STATE_FILES = 200;
 const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 8000;
 const LIFETIME_DASHBOARD_MAX_SUBSTRATE_FILES = 800;
 const LIFETIME_DASHBOARD_SUBSTRATE_MAX_BYTES = 4 * 1024 * 1024;
@@ -1219,8 +1220,23 @@ function isResolvedCoordinatorReviewRecord(job: Record<string, unknown>): boolea
 interface LifetimeQueueBacklog {
   entries: Array<Record<string, unknown>>;
   manifests: LifetimeQueueCapacityManifest[];
+  queueStates: LifetimeQueueRuntimeState[];
   sourceCount: number;
   paths: string[];
+  generatedAt: number;
+}
+
+interface LifetimeQueueRuntimeState {
+  path: string;
+  queueId: string;
+  jobCount: number;
+  queuedCount: number;
+  leasedCount: number;
+  completedCount: number;
+  failedCount: number;
+  deadCount: number;
+  terminalOutcomeCount: number;
+  eventCount: number;
   generatedAt: number;
 }
 
@@ -1246,33 +1262,53 @@ interface LifetimeQueueCapacityManifestLane {
 async function readLifetimeQueueBacklog(cwd: string): Promise<LifetimeQueueBacklog> {
   const root = path.join(cwd, '.loom', 'queues');
   const stat = await fs.stat(root).catch(() => undefined);
-  if (!stat?.isDirectory()) return { entries: [], manifests: [], sourceCount: 0, paths: [], generatedAt: 0 };
+  const agentRunsRoot = path.join(cwd, 'agent-runs');
   const queueDirs = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
   const entriesById = new Map<string, Record<string, unknown>>();
   const manifests: LifetimeQueueCapacityManifest[] = [];
+  const queueStates: LifetimeQueueRuntimeState[] = [];
   const paths: string[] = [];
   let generatedAt = 0;
-  for (const queueDir of queueDirs) {
-    if (!queueDir.isDirectory()) continue;
-    const dir = path.join(root, queueDir.name);
-    const manifestFile = await preferredQueueManifestFile(dir);
-    if (manifestFile) {
-      const manifestStat = await fs.stat(manifestFile).catch(() => undefined);
-      generatedAt = Math.max(generatedAt, manifestStat?.mtimeMs ?? 0);
-      const manifest = await readQueueCapacityManifest(cwd, manifestFile);
-      if (manifest) manifests.push(manifest);
-    }
-    for (const taskFile of await queueTaskFiles(dir)) {
-      const fileStat = await fs.stat(taskFile).catch(() => undefined);
-      generatedAt = Math.max(generatedAt, fileStat?.mtimeMs ?? 0);
-      paths.push(path.relative(cwd, taskFile));
-      const tasks = await readQueueTaskFile(taskFile);
-      for (const task of tasks) {
-        const id = textValue(task.id ?? task.taskId ?? task.title, '');
-        if (!id) continue;
-        entriesById.set(id, normalizeQueueBacklogEntry(cwd, queueDir.name, taskFile, task));
+  if (stat?.isDirectory()) {
+    for (const queueDir of queueDirs) {
+      if (!queueDir.isDirectory()) continue;
+      const dir = path.join(root, queueDir.name);
+      const manifestFile = await preferredQueueManifestFile(dir);
+      if (manifestFile) {
+        const manifestStat = await fs.stat(manifestFile).catch(() => undefined);
+        generatedAt = Math.max(generatedAt, manifestStat?.mtimeMs ?? 0);
+        const manifest = await readQueueCapacityManifest(cwd, manifestFile);
+        if (manifest) manifests.push(manifest);
+      }
+      for (const taskFile of await queueTaskFiles(dir)) {
+        const fileStat = await fs.stat(taskFile).catch(() => undefined);
+        generatedAt = Math.max(generatedAt, fileStat?.mtimeMs ?? 0);
+        paths.push(path.relative(cwd, taskFile));
+        const tasks = await readQueueTaskFile(taskFile);
+        for (const task of tasks) {
+          const id = textValue(task.id ?? task.taskId ?? task.title, '');
+          if (!id) continue;
+          entriesById.set(id, normalizeQueueBacklogEntry(cwd, queueDir.name, taskFile, task));
+          if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
+        }
         if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
       }
+      if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
+    }
+  }
+  const queueStateFiles = await findLifetimeQueueStateFiles(agentRunsRoot);
+  for (const file of queueStateFiles) {
+    const fileStat = await fs.stat(file).catch(() => undefined);
+    generatedAt = Math.max(generatedAt, fileStat?.mtimeMs ?? 0);
+    const relative = path.relative(cwd, file);
+    paths.push(relative);
+    const state = recordValue(await readJsonFile(file));
+    const summary = queueRuntimeStateSummary(relative, state, fileStat?.mtimeMs ?? 0);
+    if (summary) queueStates.push(summary);
+    for (const entry of normalizeQueueStateBacklogEntries(cwd, file, state)) {
+      const id = textValue(entry.id ?? entry.taskId, '');
+      if (!id) continue;
+      entriesById.set(id, entry);
       if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
     }
     if (entriesById.size >= LIFETIME_DASHBOARD_MAX_QUEUE_TASKS) break;
@@ -1280,6 +1316,7 @@ async function readLifetimeQueueBacklog(cwd: string): Promise<LifetimeQueueBackl
   return {
     entries: Array.from(entriesById.values()),
     manifests,
+    queueStates,
     sourceCount: paths.length,
     paths,
     generatedAt
@@ -1302,6 +1339,30 @@ async function queueTaskFiles(dir: string): Promise<string[]> {
   return candidates
     .sort((left, right) => left.mtimeMs - right.mtimeMs || left.preferred - right.preferred || left.file.localeCompare(right.file))
     .map((candidate) => candidate.file);
+}
+
+async function findLifetimeQueueStateFiles(root: string): Promise<string[]> {
+  const stat = await fs.stat(root).catch(() => undefined);
+  if (!stat?.isDirectory()) return [];
+  const out: Array<{ file: string; mtimeMs: number }> = [];
+  const skipDirs = new Set(['.git', 'node_modules', 'dist', 'coverage', 'evidence', 'streams', 'artifact-store']);
+  async function walk(current: string, depth: number): Promise<void> {
+    if (out.length >= LIFETIME_DASHBOARD_MAX_QUEUE_STATE_FILES || depth > LIFETIME_DASHBOARD_SCAN_MAX_DEPTH) return;
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (out.length >= LIFETIME_DASHBOARD_MAX_QUEUE_STATE_FILES) return;
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipDirs.has(entry.name)) await walk(absolute, depth + 1);
+        continue;
+      }
+      if (!entry.isFile() || entry.name !== 'queue-state.json') continue;
+      const fileStat = await fs.stat(absolute).catch(() => undefined);
+      out.push({ file: absolute, mtimeMs: fileStat?.mtimeMs ?? 0 });
+    }
+  }
+  await walk(root, 0);
+  return out.sort((left, right) => right.mtimeMs - left.mtimeMs || left.file.localeCompare(right.file)).map((entry) => entry.file);
 }
 
 async function preferredQueueManifestFile(dir: string): Promise<string | undefined> {
@@ -1391,6 +1452,90 @@ function normalizeQueueBacklogEntry(cwd: string, queueId: string, file: string, 
     sourceLabel: path.relative(cwd, file),
     sourceQueue: queueId
   };
+}
+
+function queueRuntimeStateSummary(pathLabel: string, state: Record<string, unknown>, generatedAt: number): LifetimeQueueRuntimeState | undefined {
+  const jobs = recordArray(state.jobs);
+  if (!jobs.length && !textValue(state.id, '')) return undefined;
+  return {
+    path: pathLabel,
+    queueId: textValue(state.id, pathLabel),
+    jobCount: jobs.length,
+    queuedCount: queueJobStatusCount(jobs, ['queued', 'pending', 'ready', 'scheduled', 'delayed']),
+    leasedCount: queueJobStatusCount(jobs, ['leased', 'running', 'active']),
+    completedCount: queueJobStatusCount(jobs, ['completed', 'deduped']),
+    failedCount: queueJobStatusCount(jobs, ['failed']),
+    deadCount: queueJobStatusCount(jobs, ['dead', 'cancelled']),
+    terminalOutcomeCount: recordArray(state.terminalOutcomes).length,
+    eventCount: recordArray(state.events).length,
+    generatedAt
+  };
+}
+
+function normalizeQueueStateBacklogEntries(cwd: string, file: string, state: Record<string, unknown>): Array<Record<string, unknown>> {
+  const queueId = textValue(state.id, path.basename(path.dirname(file)));
+  return recordArray(state.jobs)
+    .filter((job) => !isTerminalQueueStatus(job.status))
+    .map((job) => normalizeQueueStateBacklogEntry(cwd, queueId, file, job))
+    .filter((entry) => Boolean(textValue(entry.id ?? entry.taskId, '')));
+}
+
+function normalizeQueueStateBacklogEntry(cwd: string, queueId: string, file: string, job: Record<string, unknown>): Record<string, unknown> {
+  const metadata = recordValue(job.metadata);
+  const payload = recordValue(job.payload);
+  const lease = recordValue(job.lease);
+  const rawId = textValue(metadata.swarmJobId ?? metadata.taskId ?? payload.id ?? payload.taskId ?? job.id, '');
+  const id = rawId.startsWith('swarm-job:') ? rawId.slice('swarm-job:'.length) : rawId;
+  const queueStatus = textValue(job.status, 'queued');
+  const sourceRefs = stringArray(payload.sourceRefs);
+  const targetRefs = stringArray(payload.targetRefs);
+  const allowedWrites = stringArray(payload.allowedWrites);
+  const files = uniquePaths([...targetRefs, ...allowedWrites, ...sourceRefs]).slice(0, 40);
+  const status = queueBacklogStatus(queueStatus);
+  return {
+    id,
+    taskId: id,
+    title: textValue(payload.title ?? payload.objective ?? metadata.taskId ?? id, id),
+    objective: textValue(payload.objective ?? payload.summary, ''),
+    status,
+    queueStatus,
+    ready: status === 'todo',
+    lane: textValue(metadata.lane ?? payload.lane, queueId),
+    group: textValue(metadata.lane ?? payload.groupId ?? payload.epicId, queueId),
+    epicId: textValue(payload.epicId, ''),
+    priority: numberValue(job.priority ?? payload.priority),
+    changedPaths: files,
+    changedPathCount: files.length,
+    sourceRefs,
+    targetRefs,
+    allowedWrites,
+    acceptance: stringArray(payload.acceptance),
+    verification: recordArray(payload.verification),
+    tags: uniquePaths([...stringArray(job.tags), ...stringArray(payload.tags)]),
+    sourceLabel: path.relative(cwd, file),
+    sourceQueue: queueId,
+    queueJobId: textValue(job.id, ''),
+    queueRunId: textValue(metadata.runId, ''),
+    queuePlanId: textValue(metadata.planId, ''),
+    leaseOwner: textValue(lease.owner, '')
+  };
+}
+
+function queueBacklogStatus(value: unknown): string {
+  const status = normalized(value);
+  if (['leased', 'running', 'active'].includes(status)) return 'running';
+  if (['failed', 'dead'].includes(status)) return 'failed';
+  if (['completed', 'deduped', 'cancelled'].includes(status)) return 'completed';
+  return 'todo';
+}
+
+function isTerminalQueueStatus(value: unknown): boolean {
+  return ['completed', 'deduped', 'dead', 'cancelled'].includes(normalized(value));
+}
+
+function queueJobStatusCount(jobs: Array<Record<string, unknown>>, statuses: string[]): number {
+  const allowed = new Set(statuses);
+  return jobs.filter((job) => allowed.has(normalized(job.status))).length;
 }
 
 async function readLifetimeDashboardResetCutoff(root: string): Promise<number> {
@@ -1841,6 +1986,7 @@ async function combineLifetimeDashboardSnapshots(
     dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length,
     substrateRecordCount: numberValue(substrateGraph.nodeCount),
     substrateSourceCount: substrate.sourceCount,
+    ...queueRuntimeStateRollup(queueBacklog),
     ...(graph ? { graph } : {})
   };
   const queueOverlay = lifetimeQueueBacklogOverlay(queueBacklog, jobs);
@@ -1865,6 +2011,7 @@ async function combineLifetimeDashboardSnapshots(
       loadedSourceCount: visibleSnapshots.length,
       suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
       queueSourceCount: queueBacklog.sourceCount,
+      queueStateSourceCount: queueBacklog.queueStates.length,
       coordinationDelayCount: autoDrainDelays.length,
       substrateSourceCount: substrate.sourceCount,
       ...(substrate.sourceCount ? { substrateFiles: substrate.sourceFiles } : {}),
@@ -1906,6 +2053,7 @@ async function combineLifetimeDashboardSnapshots(
         ...(substrate.sourceCount ? { substrate } : {}),
         sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
         manifests: queueBacklog.manifests,
+        queueStates: queueBacklog.queueStates,
         queueSources: queueBacklog.paths
       }
     }
@@ -2625,6 +2773,7 @@ function mergeLifetimeActiveRunSnapshot(
       {
         entries: recordArray(recordValue(lifetime.backlog).entries),
         manifests: recordArray(recordValue(recordValue(lifetime.raw).lifetime).manifests) as unknown as LifetimeQueueCapacityManifest[],
+        queueStates: recordArray(recordValue(recordValue(lifetime.raw).lifetime).queueStates) as unknown as LifetimeQueueRuntimeState[],
         sourceCount: numberValue(recordValue(lifetime.backlog).entryCount),
         paths: stringArray(recordValue(recordValue(lifetime.raw).lifetime).queueSources),
         generatedAt: numberValue(lifetime.generatedAt)
@@ -3465,7 +3614,21 @@ function lifetimeCapacitySummary(queueBacklog: LifetimeQueueBacklog, jobs: Array
     totalTaskCount: queueBacklog.entries.length,
     completedTaskCount: jobs.filter((job) => textValue(job.status, '') === 'completed').length,
     lanes,
-    queueSources: queueBacklog.paths
+    queueSources: queueBacklog.paths,
+    ...queueRuntimeStateRollup(queueBacklog)
+  };
+}
+
+function queueRuntimeStateRollup(queueBacklog: LifetimeQueueBacklog): Record<string, number> {
+  return {
+    durableQueueStateCount: queueBacklog.queueStates.length,
+    durableQueueJobCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.jobCount, 0),
+    durableQueueQueuedCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.queuedCount, 0),
+    durableQueueLeasedCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.leasedCount, 0),
+    durableQueueCompletedCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.completedCount, 0),
+    durableQueueFailedCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.failedCount + state.deadCount, 0),
+    durableQueueTerminalOutcomeCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.terminalOutcomeCount, 0),
+    durableQueueEventCount: queueBacklog.queueStates.reduce((sum, state) => sum + state.eventCount, 0)
   };
 }
 
