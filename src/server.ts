@@ -23,7 +23,7 @@ const LIFETIME_DASHBOARD_MAX_AUTONOMOUS_DECISION_FILES = 400;
 const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
 const LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS = 32;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
-const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 2500;
+const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 8000;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
@@ -471,6 +471,7 @@ async function readDashboardSnapshot(options: NormalizedLoomUiServerOptions): Pr
 async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOptions): Promise<unknown> {
   const key = JSON.stringify(dashboardInput(options));
   const now = Date.now();
+  const previousValue = dashboardSnapshotCache?.key === key ? dashboardSnapshotCache.value : undefined;
   if (dashboardSnapshotCache?.key === key) {
     if (dashboardSnapshotCache.value !== undefined && now - dashboardSnapshotCache.at < DASHBOARD_SNAPSHOT_CACHE_MS) {
       return dashboardSnapshotCache.value;
@@ -479,10 +480,11 @@ async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOption
   }
   const generation = dashboardSnapshotCacheGeneration;
   const pending = readDashboardSnapshot(options).then((value) => {
+    const stableValue = stableDashboardSnapshotValue(previousValue, value);
     if (generation === dashboardSnapshotCacheGeneration) {
-      dashboardSnapshotCache = { key, at: Date.now(), value };
+      dashboardSnapshotCache = { key, at: Date.now(), value: stableValue };
     }
-    return value;
+    return stableValue;
   }, (error) => {
     if (generation === dashboardSnapshotCacheGeneration && dashboardSnapshotCache?.key === key) {
       dashboardSnapshotCache = dashboardSnapshotCache.value === undefined
@@ -491,8 +493,33 @@ async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOption
     }
     throw error;
   });
-  dashboardSnapshotCache = { key, at: now, value: dashboardSnapshotCache?.key === key ? dashboardSnapshotCache.value : undefined, pending };
+  dashboardSnapshotCache = { key, at: now, value: previousValue, pending };
   return pending;
+}
+
+function stableDashboardSnapshotValue(previous: unknown, next: unknown): unknown {
+  if (!shouldKeepPreviousDashboardSnapshot(previous, next)) return next;
+  return previous;
+}
+
+function shouldKeepPreviousDashboardSnapshot(previous: unknown, next: unknown): boolean {
+  const previousRecord = recordValue(previous);
+  const nextRecord = recordValue(next);
+  if (!Object.keys(previousRecord).length || !Object.keys(nextRecord).length) return false;
+  const nextSources = recordValue(nextRecord.sources);
+  const timedOutSources = numberValue(nextSources.timedOutSourceCount);
+  if (!timedOutSources) return false;
+  const previousJobCount = dashboardSnapshotJobCount(previousRecord);
+  const nextJobCount = dashboardSnapshotJobCount(nextRecord);
+  if (!previousJobCount || previousJobCount <= nextJobCount) return false;
+  const previousSources = recordValue(previousRecord.sources);
+  const previousLoaded = numberValue(previousSources.loadedSourceCount);
+  const nextLoaded = numberValue(nextSources.loadedSourceCount);
+  return nextJobCount === 0 || !nextLoaded || nextLoaded < previousLoaded;
+}
+
+function dashboardSnapshotJobCount(snapshot: Record<string, unknown>): number {
+  return recordArray(snapshot.jobs).length || numberValue(recordValue(snapshot.summary).jobCount);
 }
 
 function invalidateDashboardSnapshotCache(): void {
