@@ -45,6 +45,7 @@ const LIFETIME_DASHBOARD_SUBSTRATE_MAX_BYTES = 4 * 1024 * 1024;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
+const FRONTIER_SWARM_CODEX_DISTRIBUTED_RUN_KIND = 'frontier.swarm-codex.distributed-run';
 
 let dashboardSnapshotCache: {
   key: string;
@@ -1586,18 +1587,28 @@ interface DashboardSubstrateSummary {
     runIds: string[];
     eventTypeCounts: Record<string, number>;
   };
-  sync: {
-    evidenceCount: number;
-    exchangeCount: number;
+	  sync: {
+	    evidenceCount: number;
+	    exchangeCount: number;
     peerCount: number;
     pulledEventCount: number;
     pushedEventCount: number;
     acceptedEventCount: number;
-    skippedDuplicateEventCount: number;
-    conflictCount: number;
-  };
-  leases: {
-    stateCount: number;
+	    skippedDuplicateEventCount: number;
+	    conflictCount: number;
+	  };
+	  distributedRun: {
+	    proofCount: number;
+	    okCount: number;
+	    failedCount: number;
+	    workerCount: number;
+	    syncedWorkerCount: number;
+	    peerCount: number;
+	    coverageCounts: Record<string, number>;
+	    transportKinds: Record<string, number>;
+	  };
+	  leases: {
+	    stateCount: number;
     recordCount: number;
     eventCount: number;
     activeCount: number;
@@ -1678,9 +1689,10 @@ async function findDashboardSubstrateFiles(root: string, input: { maxDepth: numb
 function dashboardSubstrateFileNameMatches(name: string): boolean {
   return name === 'run-events.jsonl'
     || name === LIVE_RUN_GRAPH_EVENTS_FILE
-    || name === 'run-sync-evidence.json'
-    || name === 'run-sync-history.jsonl'
-    || name === 'apply-ledger.json'
+	    || name === 'run-sync-evidence.json'
+	    || name === 'run-sync-history.jsonl'
+	    || name === 'distributed-run-proof.json'
+	    || name === 'apply-ledger.json'
     || name === 'workspace-proof.json'
     || name === 'workspace-manifest.json'
     || name === 'link-repair.json'
@@ -1733,8 +1745,9 @@ function dashboardSubstrateRecordKind(record: Record<string, unknown>): string {
   const kind = textValue(record.kind, '');
   if (kind === 'frontier.run.event' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
   if (kind === 'frontier.run.dashboard' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
-  if (kind === FRONTIER_SWARM_CODEX_RUN_SYNC_KIND) return kind;
-  if (kind === FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND) return kind;
+	  if (kind === FRONTIER_SWARM_CODEX_RUN_SYNC_KIND) return kind;
+	  if (kind === FRONTIER_SWARM_CODEX_DISTRIBUTED_RUN_KIND) return kind;
+	  if (kind === FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_STATE_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_RECORD_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_EVENT_KIND) return kind;
@@ -1760,9 +1773,10 @@ function summarizeDashboardSubstrateRecords(
     generatedAt: Date.now(),
     sourceFiles,
     sourceCount: sourceFiles.length,
-    run: { eventCount: 0, dashboardCount: 0, runIds: [], eventTypeCounts },
-    sync: { evidenceCount: 0, exchangeCount: 0, peerCount: 0, pulledEventCount: 0, pushedEventCount: 0, acceptedEventCount: 0, skippedDuplicateEventCount: 0, conflictCount: 0 },
-    leases: { stateCount: 0, recordCount: 0, eventCount: 0, activeCount: 0, grantedCount: 0, deniedCount: 0, releasedCount: 0, expiredCount: 0, scopeCount: 0 },
+	    run: { eventCount: 0, dashboardCount: 0, runIds: [], eventTypeCounts },
+	    sync: { evidenceCount: 0, exchangeCount: 0, peerCount: 0, pulledEventCount: 0, pushedEventCount: 0, acceptedEventCount: 0, skippedDuplicateEventCount: 0, conflictCount: 0 },
+	    distributedRun: { proofCount: 0, okCount: 0, failedCount: 0, workerCount: 0, syncedWorkerCount: 0, peerCount: 0, coverageCounts: {}, transportKinds: {} },
+	    leases: { stateCount: 0, recordCount: 0, eventCount: 0, activeCount: 0, grantedCount: 0, deniedCount: 0, releasedCount: 0, expiredCount: 0, scopeCount: 0 },
     gates: { executionCount: 0, passedCount: 0, failedCount: 0, warningCount: 0, requiredFailedCount: 0, durationMs: 0, kindCounts: gateKindCounts },
     git: { workspaceManifestCount: 0, workspaceProofCount: 0, applyLedgerCount: 0, linkRepairCount: 0, appliedCount: 0, committedCount: 0, failedCount: 0, skippedCount: 0, changedPathCount: 0 }
   };
@@ -1777,10 +1791,13 @@ function summarizeDashboardSubstrateRecords(
         summary.run.dashboardCount += 1;
         if (textValue(record.runId, '')) runIds.add(textValue(record.runId, ''));
         break;
-      case FRONTIER_SWARM_CODEX_RUN_SYNC_KIND:
-      case FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND:
-        summarizeRunSync(summary, record);
-        break;
+	      case FRONTIER_SWARM_CODEX_RUN_SYNC_KIND:
+	      case FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND:
+	        summarizeRunSync(summary, record);
+	        break;
+	      case FRONTIER_SWARM_CODEX_DISTRIBUTED_RUN_KIND:
+	        summarizeDistributedRunProof(summary, record, runIds);
+	        break;
       case FRONTIER_SEMANTIC_LEASE_STATE_KIND:
         summary.leases.stateCount += 1;
         summarizeLeaseRecords(summary, recordArray(record.leases));
@@ -1881,6 +1898,23 @@ function summarizeRunSync(summary: DashboardSubstrateSummary, record: Record<str
   summary.sync.conflictCount += numberValue(syncSummary.conflictCount);
 }
 
+function summarizeDistributedRunProof(summary: DashboardSubstrateSummary, record: Record<string, unknown>, runIds: Set<string>): void {
+  summary.distributedRun.proofCount += 1;
+  if (record.ok === true) summary.distributedRun.okCount += 1;
+  else summary.distributedRun.failedCount += 1;
+  if (textValue(record.runId, '')) runIds.add(textValue(record.runId, ''));
+  const workers = recordArray(record.workers);
+  summary.distributedRun.workerCount += workers.length;
+  summary.distributedRun.syncedWorkerCount += workers.filter((worker) => worker.syncedToCoordinator === true).length;
+  summary.distributedRun.peerCount += stringArray(record.peers).length;
+  const transport = recordValue(record.transport);
+  incrementRecordCount(summary.distributedRun.transportKinds, textValue(transport.kind, 'unknown'));
+  const coverage = recordValue(record.coverage);
+  for (const [key, value] of Object.entries(coverage)) {
+    if (value === true) incrementRecordCount(summary.distributedRun.coverageCounts, key);
+  }
+}
+
 function summarizeGitApplyLedger(summary: DashboardSubstrateSummary, ledger: Record<string, unknown>): void {
   summary.git.applyLedgerCount += 1;
   const ledgerSummary = recordValue(ledger.summary);
@@ -1895,9 +1929,11 @@ function summarizeGitApplyLedger(summary: DashboardSubstrateSummary, ledger: Rec
 
 function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): Record<string, unknown> | undefined {
   const nodeCount = substrate.run.eventCount
-    + substrate.run.dashboardCount
-    + substrate.sync.exchangeCount
-    + substrate.leases.recordCount
+	    + substrate.run.dashboardCount
+	    + substrate.sync.exchangeCount
+	    + substrate.distributedRun.proofCount
+	    + substrate.distributedRun.workerCount
+	    + substrate.leases.recordCount
     + substrate.leases.eventCount
     + substrate.gates.executionCount
     + substrate.git.workspaceManifestCount
@@ -1906,7 +1942,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     + substrate.git.linkRepairCount;
   if (!nodeCount) return undefined;
   const gateFailedCount = substrate.gates.failedCount;
-  const blockerCount = substrate.gates.requiredFailedCount + substrate.git.failedCount + substrate.leases.deniedCount + substrate.sync.conflictCount;
+	  const blockerCount = substrate.gates.requiredFailedCount + substrate.git.failedCount + substrate.leases.deniedCount + substrate.sync.conflictCount + substrate.distributedRun.failedCount;
   return {
     sourceFile: substrate.sourceFiles[0],
     sourceFiles: substrate.sourceFiles,
@@ -1921,7 +1957,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     humanQuestionCount: 0,
     openHumanQuestionCount: 0,
     safeMergeCandidateCount: substrate.git.appliedCount + substrate.git.committedCount,
-    decisionCount: substrate.leases.eventCount + substrate.sync.exchangeCount,
+	    decisionCount: substrate.leases.eventCount + substrate.sync.exchangeCount + substrate.distributedRun.proofCount,
     terminalDecisionCount: 0,
     terminalAcceptedCount: substrate.git.appliedCount + substrate.git.committedCount,
     terminalRejectedCount: substrate.git.failedCount,
@@ -1935,16 +1971,17 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     openRerunCount: 0,
     staleRerunCleanupCount: 0,
     status: blockerCount ? 'blocked' : gateFailedCount ? 'review' : substrate.git.appliedCount || substrate.git.committedCount ? 'ready' : 'clear',
-    summaryLine: `${nodeCount} substrate records, ${substrate.gates.executionCount} gate executions, ${substrate.leases.activeCount} active leases, ${substrate.sync.exchangeCount} run sync exchanges.`,
+	    summaryLine: `${nodeCount} substrate records, ${substrate.gates.executionCount} gate executions, ${substrate.leases.activeCount} active leases, ${substrate.sync.exchangeCount} run sync exchanges, ${substrate.distributedRun.proofCount} distributed proofs.`,
     recentEvents: []
   };
 }
 
 function dashboardSubstrateSourceKinds(substrate: DashboardSubstrateSummary): string[] {
   const kinds: string[] = [];
-  if (substrate.run.eventCount || substrate.run.dashboardCount) kinds.push('frontier-run');
-  if (substrate.sync.exchangeCount || substrate.sync.evidenceCount) kinds.push('frontier-run-sync');
-  if (substrate.leases.recordCount || substrate.leases.eventCount || substrate.leases.stateCount) kinds.push('frontier-lease');
+	  if (substrate.run.eventCount || substrate.run.dashboardCount) kinds.push('frontier-run');
+	  if (substrate.sync.exchangeCount || substrate.sync.evidenceCount) kinds.push('frontier-run-sync');
+	  if (substrate.distributedRun.proofCount) kinds.push('frontier-distributed-run');
+	  if (substrate.leases.recordCount || substrate.leases.eventCount || substrate.leases.stateCount) kinds.push('frontier-lease');
   if (substrate.gates.executionCount) kinds.push('frontier-test');
   if (substrate.git.workspaceManifestCount || substrate.git.workspaceProofCount || substrate.git.applyLedgerCount || substrate.git.linkRepairCount) kinds.push('frontier-swarm-git');
   return kinds;
@@ -2033,9 +2070,15 @@ async function combineLifetimeDashboardSnapshots(
     ...lifetimeDashboardSummary(jobs),
     coordinationDelayCount: autoDrainDelays.length,
     dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length,
-    substrateRecordCount: numberValue(substrateGraph.nodeCount),
-    substrateSourceCount: substrate.sourceCount,
-    ...queueRuntimeStateRollup(queueBacklog),
+	    substrateRecordCount: numberValue(substrateGraph.nodeCount),
+	    substrateSourceCount: substrate.sourceCount,
+	    distributedRunProofCount: substrate.distributedRun.proofCount,
+	    distributedRunOkCount: substrate.distributedRun.okCount,
+	    distributedRunFailedCount: substrate.distributedRun.failedCount,
+	    distributedRunWorkerCount: substrate.distributedRun.workerCount,
+	    distributedRunSyncedWorkerCount: substrate.distributedRun.syncedWorkerCount,
+	    distributedRunPeerCount: substrate.distributedRun.peerCount,
+	    ...queueRuntimeStateRollup(queueBacklog),
     ...(graph ? { graph } : {})
   };
   const queueOverlay = lifetimeQueueBacklogOverlay(queueBacklog, jobs);

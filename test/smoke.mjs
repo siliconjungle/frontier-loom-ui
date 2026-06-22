@@ -811,6 +811,69 @@ await fs.writeFile(path.join(substrateRunDir, 'run-sync-evidence.json'), JSON.st
   },
   exchanges: []
 }, null, 2) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'distributed-run-proof.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.distributed-run',
+  version: 1,
+  ok: true,
+  generatedAt: new Date().toISOString(),
+  runId: 'substrate-run',
+  planId: 'substrate-plan',
+  transport: { kind: 'local-fs', supported: true },
+  coordinator: {
+    runDir: substrateRunDir,
+    runEventsPath: path.join(substrateRunDir, 'run-events.jsonl'),
+    runDashboardPath: path.join(substrateRunDir, 'run-dashboard.json'),
+    eventCount: 3,
+    actorIds: ['coordinator']
+  },
+  workers: [
+    {
+      enabled: true,
+      runId: 'substrate-run',
+      jobId: 'distributed-worker-a',
+      taskId: 'distributed-task-a',
+      workspacePath: path.join(substrateRunDir, 'worker-a'),
+      runRoot: '.frontier-run',
+      runDir: path.join(substrateRunDir, 'worker-a', '.frontier-run', 'substrate-run'),
+      runEventsPath: path.join(substrateRunDir, 'worker-a', '.frontier-run', 'substrate-run', 'run-events.jsonl'),
+      runDashboardPath: path.join(substrateRunDir, 'worker-a', '.frontier-run', 'substrate-run', 'run-dashboard.json'),
+      transport: { kind: 'local-fs', supported: true },
+      eventCount: 2,
+      actorIds: ['worker-a'],
+      syncedToCoordinator: true
+    },
+    {
+      enabled: true,
+      runId: 'substrate-run',
+      jobId: 'distributed-worker-b',
+      taskId: 'distributed-task-b',
+      workspacePath: path.join(substrateRunDir, 'worker-b'),
+      runRoot: '.frontier-run',
+      runDir: path.join(substrateRunDir, 'worker-b', '.frontier-run', 'substrate-run'),
+      runEventsPath: path.join(substrateRunDir, 'worker-b', '.frontier-run', 'substrate-run', 'run-events.jsonl'),
+      runDashboardPath: path.join(substrateRunDir, 'worker-b', '.frontier-run', 'substrate-run', 'run-dashboard.json'),
+      transport: { kind: 'local-fs', supported: true },
+      eventCount: 2,
+      actorIds: ['worker-b'],
+      syncedToCoordinator: true
+    }
+  ],
+  peers: [path.join(substrateRunDir, 'peer')],
+  coverage: {
+    realWorkerRunEvents: true,
+    distributedSync: true,
+    queueBacked: true,
+    dashboardProjection: true,
+    modelTelemetryProjection: true,
+    humanQuestionProjection: true,
+    transportResolved: true
+  },
+  paths: {
+    runDir: substrateRunDir,
+    runEventsPath: path.join(substrateRunDir, 'run-events.jsonl'),
+    runDashboardPath: path.join(substrateRunDir, 'run-dashboard.json')
+  }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(substrateRunDir, 'semantic-lease-state.json'), JSON.stringify({
   kind: 'frontier.semantic-lease.state',
   version: 1,
@@ -963,6 +1026,7 @@ try {
     assert.equal(lifetimeDashboard.graph.sourceStatuses.includes('collected'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-run'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-run-sync'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-distributed-run'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-lease'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-test'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-swarm-git'), true);
@@ -980,6 +1044,14 @@ try {
     assert.equal(lifetimeDashboard.substrate.sync.pushedEventCount, 3);
     assert.equal(lifetimeDashboard.substrate.sync.acceptedEventCount, 5);
     assert.equal(lifetimeDashboard.substrate.sync.conflictCount, 0);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.proofCount, 1);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.okCount, 1);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.failedCount, 0);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.workerCount, 2);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.syncedWorkerCount, 2);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.peerCount, 1);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.coverageCounts.realWorkerRunEvents, 1);
+    assert.equal(lifetimeDashboard.substrate.distributedRun.transportKinds['local-fs'], 1);
     assert.equal(lifetimeDashboard.substrate.leases.activeCount, 1);
     assert.equal(lifetimeDashboard.substrate.gates.executionCount, 1);
     assert.equal(lifetimeDashboard.substrate.gates.passedCount, 1);
@@ -988,7 +1060,11 @@ try {
     assert.equal(lifetimeDashboard.sources.substrateSourceCount >= 4, true);
     assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/run-events\.jsonl$/.test(file)), true);
     assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/run-sync-evidence\.json$/.test(file)), true);
+    assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/distributed-run-proof\.json$/.test(file)), true);
     assert.equal(lifetimeDashboard.summary.substrateRecordCount >= 4, true);
+    assert.equal(lifetimeDashboard.summary.distributedRunProofCount, 1);
+    assert.equal(lifetimeDashboard.summary.distributedRunWorkerCount, 2);
+    assert.equal(lifetimeDashboard.summary.distributedRunSyncedWorkerCount, 2);
     assert.equal(lifetimeDashboard.summary.graph.nodeCount, lifetimeDashboard.graph.nodeCount);
     assert.equal(lifetimeDashboard.summary.jobCount >= 9, true);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);
