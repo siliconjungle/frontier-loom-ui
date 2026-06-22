@@ -785,6 +785,32 @@ await fs.writeFile(path.join(substrateRunDir, 'run-events.jsonl'), JSON.stringif
   payload: { node: { id: 'task:substrate', kind: 'task', status: 'done' } },
   payloadHash: 'sha256:fixture'
 }) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'run-sync-evidence.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.run-sync',
+  version: 1,
+  ok: true,
+  generatedAt: new Date().toISOString(),
+  direction: 'bidirectional',
+  localRunEventsPath: path.join(substrateRunDir, 'run-events.jsonl'),
+  peerRunEventsPaths: [path.join(substrateRunDir, 'peer-run-events.jsonl')],
+  summary: {
+    peerCount: 1,
+    exchangeCount: 1,
+    hasWork: true,
+    pulledEventCount: 2,
+    pushedEventCount: 3,
+    acceptedEventCount: 5,
+    skippedDuplicateEventCount: 1,
+    conflictCount: 0,
+    localEventCountBefore: 1,
+    localEventCountAfter: 3,
+    remoteEventCountBefore: 2,
+    remoteEventCountAfter: 5,
+    runIds: ['substrate-run'],
+    heads: ['evt-substrate-node']
+  },
+  exchanges: []
+}, null, 2) + '\n');
 await fs.writeFile(path.join(substrateRunDir, 'semantic-lease-state.json'), JSON.stringify({
   kind: 'frontier.semantic-lease.state',
   version: 1,
@@ -936,6 +962,7 @@ try {
     assert.equal(lifetimeDashboard.graph.sourceKind, 'lifetime-rollup');
     assert.equal(lifetimeDashboard.graph.sourceStatuses.includes('collected'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-run'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-run-sync'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-lease'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-test'), true);
     assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-swarm-git'), true);
@@ -947,6 +974,12 @@ try {
     assert.equal(lifetimeDashboard.substrate.kind, 'frontier.loom-ui.dashboard-substrate');
     assert.equal(lifetimeDashboard.substrate.run.eventCount >= 1, true);
     assert.equal(lifetimeDashboard.substrate.run.runIds.includes('substrate-run'), true);
+    assert.equal(lifetimeDashboard.substrate.sync.exchangeCount, 1);
+    assert.equal(lifetimeDashboard.substrate.sync.peerCount, 1);
+    assert.equal(lifetimeDashboard.substrate.sync.pulledEventCount, 2);
+    assert.equal(lifetimeDashboard.substrate.sync.pushedEventCount, 3);
+    assert.equal(lifetimeDashboard.substrate.sync.acceptedEventCount, 5);
+    assert.equal(lifetimeDashboard.substrate.sync.conflictCount, 0);
     assert.equal(lifetimeDashboard.substrate.leases.activeCount, 1);
     assert.equal(lifetimeDashboard.substrate.gates.executionCount, 1);
     assert.equal(lifetimeDashboard.substrate.gates.passedCount, 1);
@@ -954,6 +987,7 @@ try {
     assert.equal(lifetimeDashboard.substrate.git.workspaceProofCount, 1);
     assert.equal(lifetimeDashboard.sources.substrateSourceCount >= 4, true);
     assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/run-events\.jsonl$/.test(file)), true);
+    assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/run-sync-evidence\.json$/.test(file)), true);
     assert.equal(lifetimeDashboard.summary.substrateRecordCount >= 4, true);
     assert.equal(lifetimeDashboard.summary.graph.nodeCount, lifetimeDashboard.graph.nodeCount);
     assert.equal(lifetimeDashboard.summary.jobCount >= 9, true);

@@ -19,6 +19,8 @@ import {
 import { estimateCodexModelCost, readCodexDashboardSnapshot } from '@shapeshift-labs/frontier-swarm-codex';
 import { FRONTIER_TEST_GATE_EXECUTION_KIND } from '@shapeshift-labs/frontier-test';
 
+const FRONTIER_SWARM_CODEX_RUN_SYNC_KIND = 'frontier.swarm-codex.run-sync';
+const FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND = 'frontier.run.jsonl-store-sync-evidence';
 const packageDir = path.dirname(fileURLToPath(import.meta.url));
 const HEALTH_JSON_PARSE_MAX_BYTES = 16 * 1024 * 1024;
 const TASK_DETAIL_PATCH_MAX_BYTES = 512 * 1024;
@@ -1584,6 +1586,16 @@ interface DashboardSubstrateSummary {
     runIds: string[];
     eventTypeCounts: Record<string, number>;
   };
+  sync: {
+    evidenceCount: number;
+    exchangeCount: number;
+    peerCount: number;
+    pulledEventCount: number;
+    pushedEventCount: number;
+    acceptedEventCount: number;
+    skippedDuplicateEventCount: number;
+    conflictCount: number;
+  };
   leases: {
     stateCount: number;
     recordCount: number;
@@ -1666,6 +1678,8 @@ async function findDashboardSubstrateFiles(root: string, input: { maxDepth: numb
 function dashboardSubstrateFileNameMatches(name: string): boolean {
   return name === 'run-events.jsonl'
     || name === LIVE_RUN_GRAPH_EVENTS_FILE
+    || name === 'run-sync-evidence.json'
+    || name === 'run-sync-history.jsonl'
     || name === 'apply-ledger.json'
     || name === 'workspace-proof.json'
     || name === 'workspace-manifest.json'
@@ -1719,6 +1733,8 @@ function dashboardSubstrateRecordKind(record: Record<string, unknown>): string {
   const kind = textValue(record.kind, '');
   if (kind === 'frontier.run.event' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
   if (kind === 'frontier.run.dashboard' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
+  if (kind === FRONTIER_SWARM_CODEX_RUN_SYNC_KIND) return kind;
+  if (kind === FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_STATE_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_RECORD_KIND) return kind;
   if (kind === FRONTIER_SEMANTIC_LEASE_EVENT_KIND) return kind;
@@ -1745,6 +1761,7 @@ function summarizeDashboardSubstrateRecords(
     sourceFiles,
     sourceCount: sourceFiles.length,
     run: { eventCount: 0, dashboardCount: 0, runIds: [], eventTypeCounts },
+    sync: { evidenceCount: 0, exchangeCount: 0, peerCount: 0, pulledEventCount: 0, pushedEventCount: 0, acceptedEventCount: 0, skippedDuplicateEventCount: 0, conflictCount: 0 },
     leases: { stateCount: 0, recordCount: 0, eventCount: 0, activeCount: 0, grantedCount: 0, deniedCount: 0, releasedCount: 0, expiredCount: 0, scopeCount: 0 },
     gates: { executionCount: 0, passedCount: 0, failedCount: 0, warningCount: 0, requiredFailedCount: 0, durationMs: 0, kindCounts: gateKindCounts },
     git: { workspaceManifestCount: 0, workspaceProofCount: 0, applyLedgerCount: 0, linkRepairCount: 0, appliedCount: 0, committedCount: 0, failedCount: 0, skippedCount: 0, changedPathCount: 0 }
@@ -1759,6 +1776,10 @@ function summarizeDashboardSubstrateRecords(
       case 'frontier.run.dashboard':
         summary.run.dashboardCount += 1;
         if (textValue(record.runId, '')) runIds.add(textValue(record.runId, ''));
+        break;
+      case FRONTIER_SWARM_CODEX_RUN_SYNC_KIND:
+      case FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND:
+        summarizeRunSync(summary, record);
         break;
       case FRONTIER_SEMANTIC_LEASE_STATE_KIND:
         summary.leases.stateCount += 1;
@@ -1834,6 +1855,32 @@ function summarizeGateExecution(summary: DashboardSubstrateSummary, execution: R
   }
 }
 
+function summarizeRunSync(summary: DashboardSubstrateSummary, record: Record<string, unknown>): void {
+  summary.sync.evidenceCount += 1;
+  if (dashboardSubstrateRecordKind(record) === FRONTIER_RUN_JSONL_STORE_SYNC_EVIDENCE_KIND) {
+    const local = recordValue(record.local);
+    const remote = recordValue(record.remote);
+    const pulled = numberValue(local.acceptedEventCount);
+    const pushed = numberValue(remote.acceptedEventCount);
+    summary.sync.exchangeCount += 1;
+    summary.sync.peerCount += 1;
+    summary.sync.pulledEventCount += pulled;
+    summary.sync.pushedEventCount += pushed;
+    summary.sync.acceptedEventCount += pulled + pushed;
+    summary.sync.skippedDuplicateEventCount += numberValue(local.skippedDuplicateEventCount) + numberValue(remote.skippedDuplicateEventCount);
+    summary.sync.conflictCount += recordArray(record.conflicts).length;
+    return;
+  }
+  const syncSummary = recordValue(record.summary);
+  summary.sync.exchangeCount += numberValue(syncSummary.exchangeCount);
+  summary.sync.peerCount += numberValue(syncSummary.peerCount);
+  summary.sync.pulledEventCount += numberValue(syncSummary.pulledEventCount);
+  summary.sync.pushedEventCount += numberValue(syncSummary.pushedEventCount);
+  summary.sync.acceptedEventCount += numberValue(syncSummary.acceptedEventCount);
+  summary.sync.skippedDuplicateEventCount += numberValue(syncSummary.skippedDuplicateEventCount);
+  summary.sync.conflictCount += numberValue(syncSummary.conflictCount);
+}
+
 function summarizeGitApplyLedger(summary: DashboardSubstrateSummary, ledger: Record<string, unknown>): void {
   summary.git.applyLedgerCount += 1;
   const ledgerSummary = recordValue(ledger.summary);
@@ -1849,6 +1896,7 @@ function summarizeGitApplyLedger(summary: DashboardSubstrateSummary, ledger: Rec
 function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): Record<string, unknown> | undefined {
   const nodeCount = substrate.run.eventCount
     + substrate.run.dashboardCount
+    + substrate.sync.exchangeCount
     + substrate.leases.recordCount
     + substrate.leases.eventCount
     + substrate.gates.executionCount
@@ -1858,7 +1906,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     + substrate.git.linkRepairCount;
   if (!nodeCount) return undefined;
   const gateFailedCount = substrate.gates.failedCount;
-  const blockerCount = substrate.gates.requiredFailedCount + substrate.git.failedCount + substrate.leases.deniedCount;
+  const blockerCount = substrate.gates.requiredFailedCount + substrate.git.failedCount + substrate.leases.deniedCount + substrate.sync.conflictCount;
   return {
     sourceFile: substrate.sourceFiles[0],
     sourceFiles: substrate.sourceFiles,
@@ -1873,7 +1921,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     humanQuestionCount: 0,
     openHumanQuestionCount: 0,
     safeMergeCandidateCount: substrate.git.appliedCount + substrate.git.committedCount,
-    decisionCount: substrate.leases.eventCount,
+    decisionCount: substrate.leases.eventCount + substrate.sync.exchangeCount,
     terminalDecisionCount: 0,
     terminalAcceptedCount: substrate.git.appliedCount + substrate.git.committedCount,
     terminalRejectedCount: substrate.git.failedCount,
@@ -1887,7 +1935,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
     openRerunCount: 0,
     staleRerunCleanupCount: 0,
     status: blockerCount ? 'blocked' : gateFailedCount ? 'review' : substrate.git.appliedCount || substrate.git.committedCount ? 'ready' : 'clear',
-    summaryLine: `${nodeCount} substrate records, ${substrate.gates.executionCount} gate executions, ${substrate.leases.activeCount} active leases.`,
+    summaryLine: `${nodeCount} substrate records, ${substrate.gates.executionCount} gate executions, ${substrate.leases.activeCount} active leases, ${substrate.sync.exchangeCount} run sync exchanges.`,
     recentEvents: []
   };
 }
@@ -1895,6 +1943,7 @@ function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): R
 function dashboardSubstrateSourceKinds(substrate: DashboardSubstrateSummary): string[] {
   const kinds: string[] = [];
   if (substrate.run.eventCount || substrate.run.dashboardCount) kinds.push('frontier-run');
+  if (substrate.sync.exchangeCount || substrate.sync.evidenceCount) kinds.push('frontier-run-sync');
   if (substrate.leases.recordCount || substrate.leases.eventCount || substrate.leases.stateCount) kinds.push('frontier-lease');
   if (substrate.gates.executionCount) kinds.push('frontier-test');
   if (substrate.git.workspaceManifestCount || substrate.git.workspaceProofCount || substrate.git.applyLedgerCount || substrate.git.linkRepairCount) kinds.push('frontier-swarm-git');
