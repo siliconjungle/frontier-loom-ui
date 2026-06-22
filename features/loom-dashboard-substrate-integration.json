@@ -1,0 +1,58 @@
+{
+  "id": "loom.dashboard.substrate-integration",
+  "title": "Dashboard reads Frontier run, lease, gate, and git substrate records",
+  "packages": [
+    {
+      "name": "@shapeshift-labs/frontier-loom-ui",
+      "surface": "server-dashboard",
+      "purpose": "Project run, lease, gate, queue, and git substrate records into the dashboard snapshot"
+    },
+    {
+      "name": "@shapeshift-labs/loom",
+      "surface": "delegate-dependencies",
+      "purpose": "Pin Loom delegates to the published swarm/run package split"
+    }
+  ],
+  "state": [
+    {
+      "id": "dashboard-substrate-summary",
+      "path": ["substrate"],
+      "package": "@shapeshift-labs/frontier-loom-ui",
+      "description": "Dashboard snapshot reports frontier-run, frontier-lease, frontier-test gate execution, and frontier-swarm-git substrate records"
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "dashboard-substrate-present",
+      "source": "test",
+      "query": "frontier-loom-ui smoke asserts substrate counts and graph rollups",
+      "required": true
+    },
+    {
+      "id": "loom-delegates-current",
+      "source": "test",
+      "query": "loom smoke passes with updated package versions",
+      "required": true
+    }
+  ],
+  "gates": [
+    {
+      "id": "frontier-loom-ui-test",
+      "command": "npm test",
+      "required": true,
+      "category": "test"
+    },
+    {
+      "id": "loom-test",
+      "command": "npm test",
+      "required": true,
+      "category": "test"
+    },
+    {
+      "id": "pack-dry",
+      "command": "npm run pack:dry -- --json",
+      "required": true,
+      "category": "build"
+    }
+  ]
+}

@@ -2,9 +2,9 @@
 
 Full-height dark operator UI for Loom and Frontier swarm workspaces.
 
-The UI reads the dashboard snapshot API from `@shapeshift-labs/frontier-swarm-codex`. It does not parse swarm internals directly, and the browser surface is read-only: it focuses on workspace-lifetime progress, active agents, tasks, evidence/admission status, recent events, and loaded sources.
+The UI reads the dashboard snapshot API from `@shapeshift-labs/frontier-swarm-codex` and projects the shared Frontier substrate from `@shapeshift-labs/frontier-run`, `@shapeshift-labs/frontier-lease`, `@shapeshift-labs/frontier-test`, and `@shapeshift-labs/frontier-swarm-git`. The browser surface is read-only: it focuses on workspace-lifetime progress, active agents, tasks, evidence/admission status, recent events, gate health, lease state, git apply/workspace evidence, and loaded sources.
 
-The dashboard is global by design. It rolls up `agent-runs/`, `.loom/queues/`, coordinator decision overlays, and currently running workers from the selected workspace. It is not possible to pin the UI to a single run from the CLI or server options; individual run artifacts are loaded only as inputs into the lifetime workspace view.
+The dashboard is global by design. It rolls up `agent-runs/`, `.loom/queues/`, coordinator decision overlays, `frontier-run` JSONL, semantic lease records, gate execution records, swarm-git apply ledgers/workspace proofs, and currently running workers from the selected workspace. It is not possible to pin the UI to a single run from the CLI or server options; individual run artifacts are loaded only as inputs into the lifetime workspace view.
 
 The overview and success views surface landed/applied ledger counts, health, token load, and timing summaries with compact dark cards. The metrics view includes small, dependency-free dark chart primitives for API-provided health, bucketed time-series progress, context/token load, failure and ownership pressure, and semantic admission counts when those fields are present in the snapshot. Older snapshots still render from jobs and events as a fallback. The page remains full-height with scroll-contained panels so dense workspaces do not push the document body.
 

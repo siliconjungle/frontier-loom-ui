@@ -20,6 +20,7 @@ const lifetimeOwnershipRescopeRunDir = path.join(tmp, 'agent-runs', 'ownership-r
 const lifetimeOwnershipRescopeJobDir = path.join(lifetimeOwnershipRescopeRunDir, 'ownership-rescope-job');
 const lifetimeRedrainCollectionDir = path.join(tmp, 'agent-runs', 'redrain-regression-run', 'collection-01');
 const lifetimeRedrainLedgerDir = path.join(tmp, 'agent-runs', 'redrain-regression-run-redrain-01');
+const substrateRunDir = path.join(tmp, 'agent-runs', 'substrate-run');
 const queueDir = path.join(tmp, '.loom', 'queues', 'capacity-proof');
 await fs.mkdir(collectionDir, { recursive: true });
 await fs.mkdir(continuationDir, { recursive: true });
@@ -33,6 +34,7 @@ await fs.mkdir(path.join(lifetimeFailedWithEvidenceJobDir, 'evidence'), { recurs
 await fs.mkdir(path.join(lifetimeOwnershipRescopeJobDir, 'evidence'), { recursive: true });
 await fs.mkdir(lifetimeRedrainCollectionDir, { recursive: true });
 await fs.mkdir(lifetimeRedrainLedgerDir, { recursive: true });
+await fs.mkdir(substrateRunDir, { recursive: true });
 await fs.mkdir(queueDir, { recursive: true });
 await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
 await fs.writeFile(path.join(tmp, 'src', 'board.ts'), [
@@ -735,6 +737,105 @@ await fs.writeFile(path.join(activeRunDir, 'live-run-graph-events.jsonl'), [
   ''
 ].join('\n'));
 
+await fs.writeFile(path.join(substrateRunDir, 'run-events.jsonl'), JSON.stringify({
+  kind: 'frontier.run.event',
+  version: 1,
+  id: 'evt-substrate-node',
+  runId: 'substrate-run',
+  actorId: 'coordinator',
+  actorSeq: 1,
+  parents: [],
+  time: new Date().toISOString(),
+  type: 'node.created',
+  payload: { node: { id: 'task:substrate', kind: 'task', status: 'done' } },
+  payloadHash: 'sha256:fixture'
+}) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'semantic-lease-state.json'), JSON.stringify({
+  kind: 'frontier.semantic-lease.state',
+  version: 1,
+  id: 'lease-state-substrate',
+  defaultTtlMs: 60000,
+  nextFencingToken: 2,
+  sequence: 1,
+  leases: [{
+    kind: 'frontier.semantic-lease.record',
+    version: 1,
+    id: 'lease-substrate',
+    token: 'lease-token',
+    ownerId: 'coordinator',
+    status: 'granted',
+    scopes: [],
+    scopeKeys: ['package:@shapeshift-labs/frontier-loom-ui'],
+    fencingToken: 1,
+    requestedAt: Date.now() - 1000,
+    grantedAt: Date.now() - 900,
+    expiresAt: Date.now() + 60000,
+    ttlMs: 60000
+  }],
+  events: [{
+    kind: 'frontier.semantic-lease.event',
+    version: 1,
+    id: 'lease-event-substrate',
+    type: 'lease.granted',
+    sequence: 1,
+    at: Date.now() - 900,
+    stateId: 'lease-state-substrate',
+    leaseId: 'lease-substrate',
+    ownerId: 'coordinator',
+    fencingToken: 1,
+    scopeKeys: ['package:@shapeshift-labs/frontier-loom-ui']
+  }]
+}, null, 2) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'gate-executions.jsonl'), JSON.stringify({
+  kind: 'frontier.test.gate-execution',
+  version: 1,
+  id: 'gate-substrate-build',
+  gateKind: 'build',
+  required: true,
+  status: 'passed',
+  startedAt: Date.now() - 600,
+  finishedAt: Date.now() - 100,
+  durationMs: 500,
+  attempt: 1,
+  maxAttempts: 1,
+  command: ['npm', 'run', 'build'],
+  envKeys: [],
+  stdoutTail: [],
+  stderrTail: [],
+  failureTail: [],
+  artifacts: [],
+  artifactPaths: [],
+  packageScope: ['@shapeshift-labs/frontier-loom-ui']
+}) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'workspace-proof.json'), JSON.stringify({
+  kind: 'frontier.swarm-git.workspace-proof',
+  version: 1,
+  id: 'workspace-proof-substrate',
+  generatedAt: Date.now(),
+  manifest: { kind: 'frontier.swarm-git.workspace-manifest', version: 1, id: 'workspace-substrate', mode: 'current', root: tmp, path: tmp },
+  copiedPaths: [],
+  linkedPaths: [],
+  missingRequired: [],
+  missingOptional: [],
+  ignoredChangedPaths: [],
+  ignoredChangedPathReasons: [],
+  observedChangedPaths: ['src/board.ts'],
+  reportedChangedPaths: ['src/board.ts'],
+  summary: { copiedCount: 0, linkedCount: 0, missingRequiredCount: 0, missingOptionalCount: 0, ignoredChangedPathCount: 0, ignoredChangedPathReasonCounts: {}, observedChangedPathCount: 1, reportedChangedPathCount: 1 }
+}, null, 2) + '\n');
+await fs.writeFile(path.join(substrateRunDir, 'apply-ledger.json'), JSON.stringify({
+  kind: 'frontier.swarm-git.apply-ledger',
+  version: 1,
+  ok: true,
+  cwd: tmp,
+  collectionDir: substrateRunDir,
+  outDir: substrateRunDir,
+  generatedAt: Date.now(),
+  dryRun: false,
+  entries: [{ jobId: 'substrate-job', changedPaths: ['src/board.ts'], status: 'applied', commands: [] }],
+  summary: { total: 1, checked: 0, applied: 1, committed: 0, skipped: 0, failed: 0 }
+}, null, 2) + '\n');
+
 const manifest = createLoomUiViewManifest();
 assert.equal(manifest.id, 'frontier-loom-ui.dashboard');
 assert.equal(manifest.metadata.theme, 'dark');
@@ -798,11 +899,26 @@ try {
     assert.equal(lifetimeDashboard.graph.safeMergeCandidateCount >= 1, true);
     assert.equal(lifetimeDashboard.graph.sourceKind, 'lifetime-rollup');
     assert.equal(lifetimeDashboard.graph.sourceStatuses.includes('collected'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-run'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-lease'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-test'), true);
+    assert.equal(lifetimeDashboard.graph.sourceKinds.includes('frontier-swarm-git'), true);
     assert.equal(lifetimeDashboard.graph.graphMissingWarningCount >= 1, true);
     assert.equal(lifetimeDashboard.graph.graphMissingWarnings.some((warning) => /run-graph\.json/.test(warning)), true);
     assert.equal(lifetimeDashboard.graph.staleCount >= 1, true);
     assert.equal(lifetimeDashboard.graph.rerunCount >= 1, true);
     assert.equal(lifetimeDashboard.graph.staleRerunCleanupCount >= 1, true);
+    assert.equal(lifetimeDashboard.substrate.kind, 'frontier.loom-ui.dashboard-substrate');
+    assert.equal(lifetimeDashboard.substrate.run.eventCount >= 1, true);
+    assert.equal(lifetimeDashboard.substrate.run.runIds.includes('substrate-run'), true);
+    assert.equal(lifetimeDashboard.substrate.leases.activeCount, 1);
+    assert.equal(lifetimeDashboard.substrate.gates.executionCount, 1);
+    assert.equal(lifetimeDashboard.substrate.gates.passedCount, 1);
+    assert.equal(lifetimeDashboard.substrate.git.applyLedgerCount, 1);
+    assert.equal(lifetimeDashboard.substrate.git.workspaceProofCount, 1);
+    assert.equal(lifetimeDashboard.sources.substrateSourceCount >= 4, true);
+    assert.equal(lifetimeDashboard.sources.substrateFiles.some((file) => /substrate-run\/run-events\.jsonl$/.test(file)), true);
+    assert.equal(lifetimeDashboard.summary.substrateRecordCount >= 4, true);
     assert.equal(lifetimeDashboard.summary.graph.nodeCount, lifetimeDashboard.graph.nodeCount);
     assert.equal(lifetimeDashboard.summary.jobCount >= 9, true);
     assert.equal(lifetimeDashboard.summary.coordinationDelayCount, 1);

@@ -4,7 +4,20 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { FRONTIER_RUN_VERSION } from '@shapeshift-labs/frontier-run';
+import {
+  FRONTIER_SEMANTIC_LEASE_EVENT_KIND,
+  FRONTIER_SEMANTIC_LEASE_RECORD_KIND,
+  FRONTIER_SEMANTIC_LEASE_STATE_KIND
+} from '@shapeshift-labs/frontier-lease';
+import {
+  FRONTIER_SWARM_GIT_APPLY_LEDGER_KIND,
+  FRONTIER_SWARM_GIT_LINK_REPAIR_KIND,
+  FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_KIND,
+  FRONTIER_SWARM_GIT_WORKSPACE_PROOF_KIND
+} from '@shapeshift-labs/frontier-swarm-git';
 import { estimateCodexModelCost, readCodexDashboardSnapshot } from '@shapeshift-labs/frontier-swarm-codex';
+import { FRONTIER_TEST_GATE_EXECUTION_KIND } from '@shapeshift-labs/frontier-test';
 
 const packageDir = path.dirname(fileURLToPath(import.meta.url));
 const HEALTH_JSON_PARSE_MAX_BYTES = 16 * 1024 * 1024;
@@ -24,6 +37,8 @@ const LIFETIME_DASHBOARD_MAX_DRAIN_RUNS = 6;
 const LIFETIME_DASHBOARD_MAX_ACTIVE_PID_RUNS = 32;
 const LIFETIME_DASHBOARD_MAX_QUEUE_TASKS = 500;
 const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 8000;
+const LIFETIME_DASHBOARD_MAX_SUBSTRATE_FILES = 800;
+const LIFETIME_DASHBOARD_SUBSTRATE_MAX_BYTES = 4 * 1024 * 1024;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
@@ -427,6 +442,8 @@ async function dashboardWatchRoots(options: NormalizedLoomUiServerOptions): Prom
   const roots: string[] = [];
   const agentRuns = path.join(options.cwd, 'agent-runs');
   if (await fileExists(agentRuns)) roots.push(agentRuns);
+  const loomRoot = path.join(options.cwd, '.loom');
+  if (await fileExists(loomRoot)) roots.push(loomRoot);
   const loomQueues = path.join(options.cwd, '.loom', 'queues');
   if (await fileExists(loomQueues)) roots.push(loomQueues);
   return uniquePaths(roots);
@@ -1410,6 +1427,367 @@ async function findLifetimeDashboardArtifactFiles(
   return out;
 }
 
+interface DashboardSubstrateSummary {
+  kind: 'frontier.loom-ui.dashboard-substrate';
+  version: 1;
+  generatedAt: number;
+  sourceFiles: string[];
+  sourceCount: number;
+  run: {
+    eventCount: number;
+    dashboardCount: number;
+    runIds: string[];
+    eventTypeCounts: Record<string, number>;
+  };
+  leases: {
+    stateCount: number;
+    recordCount: number;
+    eventCount: number;
+    activeCount: number;
+    grantedCount: number;
+    deniedCount: number;
+    releasedCount: number;
+    expiredCount: number;
+    scopeCount: number;
+  };
+  gates: {
+    executionCount: number;
+    passedCount: number;
+    failedCount: number;
+    warningCount: number;
+    requiredFailedCount: number;
+    durationMs: number;
+    kindCounts: Record<string, number>;
+  };
+  git: {
+    workspaceManifestCount: number;
+    workspaceProofCount: number;
+    applyLedgerCount: number;
+    linkRepairCount: number;
+    appliedCount: number;
+    committedCount: number;
+    failedCount: number;
+    skippedCount: number;
+    changedPathCount: number;
+  };
+  graph?: Record<string, unknown>;
+}
+
+async function readDashboardSubstrateSummary(cwd: string): Promise<DashboardSubstrateSummary> {
+  const roots = uniquePaths([
+    path.join(cwd, 'agent-runs'),
+    path.join(cwd, '.loom')
+  ]);
+  const files: string[] = [];
+  for (const root of roots) {
+    const stat = await fs.stat(root).catch(() => undefined);
+    if (!stat?.isDirectory()) continue;
+    files.push(...await findDashboardSubstrateFiles(root, {
+      maxDepth: LIFETIME_DASHBOARD_SCAN_MAX_DEPTH + 1,
+      maxFiles: Math.max(1, LIFETIME_DASHBOARD_MAX_SUBSTRATE_FILES - files.length)
+    }));
+    if (files.length >= LIFETIME_DASHBOARD_MAX_SUBSTRATE_FILES) break;
+  }
+  const records: Array<{ file: string; record: Record<string, unknown> }> = [];
+  for (const file of uniquePaths(files)) {
+    for (const record of await readDashboardSubstrateRecords(file)) {
+      records.push({ file, record });
+    }
+  }
+  return summarizeDashboardSubstrateRecords(cwd, records);
+}
+
+async function findDashboardSubstrateFiles(root: string, input: { maxDepth: number; maxFiles: number }): Promise<string[]> {
+  const out: string[] = [];
+  const skipDirs = new Set(['.git', 'node_modules', 'dist', 'coverage', '.cache', 'patch-scores', 'artifact-index']);
+  async function walk(current: string, depth: number): Promise<void> {
+    if (out.length >= input.maxFiles || depth > input.maxDepth) return;
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (out.length >= input.maxFiles) return;
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (skipDirs.has(entry.name)) continue;
+        await walk(absolute, depth + 1);
+      } else if (entry.isFile() && dashboardSubstrateFileNameMatches(entry.name)) {
+        out.push(absolute);
+      }
+    }
+  }
+  await walk(root, 0);
+  return out;
+}
+
+function dashboardSubstrateFileNameMatches(name: string): boolean {
+  return name === 'run-events.jsonl'
+    || name === LIVE_RUN_GRAPH_EVENTS_FILE
+    || name === 'apply-ledger.json'
+    || name === 'workspace-proof.json'
+    || name === 'workspace-manifest.json'
+    || name === 'link-repair.json'
+    || /(?:semantic-)?lease(?:s|-state|-events|-records)?\.(?:json|jsonl)$/u.test(name)
+    || /gate-executions?\.(?:json|jsonl)$/u.test(name);
+}
+
+async function readDashboardSubstrateRecords(file: string): Promise<Record<string, unknown>[]> {
+  const stat = await fs.stat(file).catch(() => undefined);
+  if (!stat?.isFile() || stat.size > LIFETIME_DASHBOARD_SUBSTRATE_MAX_BYTES) return [];
+  const text = await fs.readFile(file, 'utf8').catch(() => '');
+  if (!text.trim()) return [];
+  if (file.endsWith('.jsonl')) {
+    return text.split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map(parseJsonRecord)
+      .filter((record): record is Record<string, unknown> => Boolean(record && dashboardSubstrateRecordKind(record)));
+  }
+  const parsed = parseJsonValue(text);
+  return flattenDashboardSubstrateRecords(parsed).filter((record) => Boolean(dashboardSubstrateRecordKind(record)));
+}
+
+function parseJsonRecord(text: string): Record<string, unknown> | undefined {
+  return recordValue(parseJsonValue(text));
+}
+
+function parseJsonValue(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function flattenDashboardSubstrateRecords(value: unknown): Record<string, unknown>[] {
+  const record = recordValue(value);
+  if (!Object.keys(record).length) {
+    return Array.isArray(value) ? value.flatMap(flattenDashboardSubstrateRecords) : [];
+  }
+  if (dashboardSubstrateRecordKind(record)) return [record];
+  const out: Record<string, unknown>[] = [];
+  for (const key of ['events', 'leases', 'records', 'executions', 'entries']) {
+    out.push(...recordArray(record[key]).flatMap(flattenDashboardSubstrateRecords));
+  }
+  return out;
+}
+
+function dashboardSubstrateRecordKind(record: Record<string, unknown>): string {
+  const kind = textValue(record.kind, '');
+  if (kind === 'frontier.run.event' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
+  if (kind === 'frontier.run.dashboard' && numberValue(record.version) === FRONTIER_RUN_VERSION) return kind;
+  if (kind === FRONTIER_SEMANTIC_LEASE_STATE_KIND) return kind;
+  if (kind === FRONTIER_SEMANTIC_LEASE_RECORD_KIND) return kind;
+  if (kind === FRONTIER_SEMANTIC_LEASE_EVENT_KIND) return kind;
+  if (kind === FRONTIER_TEST_GATE_EXECUTION_KIND) return kind;
+  if (kind === FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_KIND) return kind;
+  if (kind === FRONTIER_SWARM_GIT_WORKSPACE_PROOF_KIND) return kind;
+  if (kind === FRONTIER_SWARM_GIT_APPLY_LEDGER_KIND) return kind;
+  if (kind === FRONTIER_SWARM_GIT_LINK_REPAIR_KIND) return kind;
+  return '';
+}
+
+function summarizeDashboardSubstrateRecords(
+  cwd: string,
+  records: Array<{ file: string; record: Record<string, unknown> }>
+): DashboardSubstrateSummary {
+  const runIds = new Set<string>();
+  const eventTypeCounts: Record<string, number> = {};
+  const gateKindCounts: Record<string, number> = {};
+  const sourceFiles = uniquePaths(records.map(({ file }) => path.relative(cwd, file).replaceAll(path.sep, '/')));
+  const summary: DashboardSubstrateSummary = {
+    kind: 'frontier.loom-ui.dashboard-substrate',
+    version: 1,
+    generatedAt: Date.now(),
+    sourceFiles,
+    sourceCount: sourceFiles.length,
+    run: { eventCount: 0, dashboardCount: 0, runIds: [], eventTypeCounts },
+    leases: { stateCount: 0, recordCount: 0, eventCount: 0, activeCount: 0, grantedCount: 0, deniedCount: 0, releasedCount: 0, expiredCount: 0, scopeCount: 0 },
+    gates: { executionCount: 0, passedCount: 0, failedCount: 0, warningCount: 0, requiredFailedCount: 0, durationMs: 0, kindCounts: gateKindCounts },
+    git: { workspaceManifestCount: 0, workspaceProofCount: 0, applyLedgerCount: 0, linkRepairCount: 0, appliedCount: 0, committedCount: 0, failedCount: 0, skippedCount: 0, changedPathCount: 0 }
+  };
+  for (const { record } of records) {
+    switch (dashboardSubstrateRecordKind(record)) {
+      case 'frontier.run.event':
+        summary.run.eventCount += 1;
+        if (textValue(record.runId, '')) runIds.add(textValue(record.runId, ''));
+        incrementRecordCount(eventTypeCounts, textValue(record.type, 'unknown'));
+        break;
+      case 'frontier.run.dashboard':
+        summary.run.dashboardCount += 1;
+        if (textValue(record.runId, '')) runIds.add(textValue(record.runId, ''));
+        break;
+      case FRONTIER_SEMANTIC_LEASE_STATE_KIND:
+        summary.leases.stateCount += 1;
+        summarizeLeaseRecords(summary, recordArray(record.leases));
+        for (const event of recordArray(record.events)) {
+          summary.leases.eventCount += 1;
+          summarizeLeaseEvent(summary, event);
+        }
+        break;
+      case FRONTIER_SEMANTIC_LEASE_RECORD_KIND:
+        summarizeLeaseRecords(summary, [record]);
+        break;
+      case FRONTIER_SEMANTIC_LEASE_EVENT_KIND:
+        summary.leases.eventCount += 1;
+        summarizeLeaseEvent(summary, record);
+        break;
+      case FRONTIER_TEST_GATE_EXECUTION_KIND:
+        summarizeGateExecution(summary, record);
+        break;
+      case FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_KIND:
+        summary.git.workspaceManifestCount += 1;
+        break;
+      case FRONTIER_SWARM_GIT_WORKSPACE_PROOF_KIND:
+        summary.git.workspaceProofCount += 1;
+        summary.git.changedPathCount += stringArray(record.reportedChangedPaths).length;
+        break;
+      case FRONTIER_SWARM_GIT_APPLY_LEDGER_KIND:
+        summarizeGitApplyLedger(summary, record);
+        break;
+      case FRONTIER_SWARM_GIT_LINK_REPAIR_KIND:
+        summary.git.linkRepairCount += 1;
+        break;
+    }
+  }
+  summary.run.runIds = Array.from(runIds).sort();
+  summary.graph = substrateDashboardGraphSummary(summary);
+  return summary;
+}
+
+function summarizeLeaseRecords(summary: DashboardSubstrateSummary, leases: Record<string, unknown>[]): void {
+  for (const lease of leases) {
+    summary.leases.recordCount += 1;
+    summary.leases.scopeCount += Math.max(stringArray(lease.scopeKeys).length, recordArray(lease.scopes).length);
+    const status = normalized(lease.status);
+    if (status === 'granted') {
+      summary.leases.grantedCount += 1;
+      summary.leases.activeCount += 1;
+    } else if (status === 'denied') summary.leases.deniedCount += 1;
+    else if (status === 'released') summary.leases.releasedCount += 1;
+    else if (status === 'expired') summary.leases.expiredCount += 1;
+  }
+}
+
+function summarizeLeaseEvent(summary: DashboardSubstrateSummary, event: Record<string, unknown>): void {
+  const type = normalized(event.type);
+  if (type.endsWith('granted')) summary.leases.grantedCount += 1;
+  else if (type.endsWith('denied')) summary.leases.deniedCount += 1;
+  else if (type.endsWith('released')) summary.leases.releasedCount += 1;
+  else if (type.endsWith('expired')) summary.leases.expiredCount += 1;
+}
+
+function summarizeGateExecution(summary: DashboardSubstrateSummary, execution: Record<string, unknown>): void {
+  summary.gates.executionCount += 1;
+  summary.gates.durationMs += numberValue(execution.durationMs);
+  incrementRecordCount(summary.gates.kindCounts, textValue(execution.gateKind, 'unknown'));
+  const status = normalized(execution.status);
+  if (status === 'passed') summary.gates.passedCount += 1;
+  else if (status === 'failed') {
+    summary.gates.failedCount += 1;
+    if (execution.required !== false) summary.gates.requiredFailedCount += 1;
+  } else if (status === 'warning' || status === 'blocked' || status === 'unknown') {
+    summary.gates.warningCount += 1;
+  }
+}
+
+function summarizeGitApplyLedger(summary: DashboardSubstrateSummary, ledger: Record<string, unknown>): void {
+  summary.git.applyLedgerCount += 1;
+  const ledgerSummary = recordValue(ledger.summary);
+  summary.git.appliedCount += numberValue(ledgerSummary.applied);
+  summary.git.committedCount += numberValue(ledgerSummary.committed);
+  summary.git.failedCount += numberValue(ledgerSummary.failed);
+  summary.git.skippedCount += numberValue(ledgerSummary.skipped);
+  for (const entry of recordArray(ledger.entries)) {
+    summary.git.changedPathCount += stringArray(entry.changedPaths).length;
+  }
+}
+
+function substrateDashboardGraphSummary(substrate: DashboardSubstrateSummary): Record<string, unknown> | undefined {
+  const nodeCount = substrate.run.eventCount
+    + substrate.run.dashboardCount
+    + substrate.leases.recordCount
+    + substrate.leases.eventCount
+    + substrate.gates.executionCount
+    + substrate.git.workspaceManifestCount
+    + substrate.git.workspaceProofCount
+    + substrate.git.applyLedgerCount
+    + substrate.git.linkRepairCount;
+  if (!nodeCount) return undefined;
+  const gateFailedCount = substrate.gates.failedCount;
+  const blockerCount = substrate.gates.requiredFailedCount + substrate.git.failedCount + substrate.leases.deniedCount;
+  return {
+    sourceFile: substrate.sourceFiles[0],
+    sourceFiles: substrate.sourceFiles,
+    sourceKind: 'frontier-substrate-rollup',
+    sourceKinds: dashboardSubstrateSourceKinds(substrate),
+    sourceStatus: 'collected',
+    sourceStatuses: ['collected'],
+    nodeCount,
+    edgeCount: 0,
+    blockerCount,
+    openBlockerCount: blockerCount,
+    humanQuestionCount: 0,
+    openHumanQuestionCount: 0,
+    safeMergeCandidateCount: substrate.git.appliedCount + substrate.git.committedCount,
+    decisionCount: substrate.leases.eventCount,
+    terminalDecisionCount: 0,
+    terminalAcceptedCount: substrate.git.appliedCount + substrate.git.committedCount,
+    terminalRejectedCount: substrate.git.failedCount,
+    terminalRerunCount: 0,
+    gateCount: substrate.gates.executionCount,
+    gatePassedCount: substrate.gates.passedCount,
+    gateFailedCount,
+    staleCount: 0,
+    openStaleCount: 0,
+    rerunCount: 0,
+    openRerunCount: 0,
+    staleRerunCleanupCount: 0,
+    status: blockerCount ? 'blocked' : gateFailedCount ? 'review' : substrate.git.appliedCount || substrate.git.committedCount ? 'ready' : 'clear',
+    summaryLine: `${nodeCount} substrate records, ${substrate.gates.executionCount} gate executions, ${substrate.leases.activeCount} active leases.`,
+    recentEvents: []
+  };
+}
+
+function dashboardSubstrateSourceKinds(substrate: DashboardSubstrateSummary): string[] {
+  const kinds: string[] = [];
+  if (substrate.run.eventCount || substrate.run.dashboardCount) kinds.push('frontier-run');
+  if (substrate.leases.recordCount || substrate.leases.eventCount || substrate.leases.stateCount) kinds.push('frontier-lease');
+  if (substrate.gates.executionCount) kinds.push('frontier-test');
+  if (substrate.git.workspaceManifestCount || substrate.git.workspaceProofCount || substrate.git.applyLedgerCount || substrate.git.linkRepairCount) kinds.push('frontier-swarm-git');
+  return kinds;
+}
+
+function mergeDashboardGraphSummaries(
+  left: Record<string, unknown> | undefined,
+  right: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  const sourceFiles = uniquePaths([...stringArray(left.sourceFiles), ...stringArray(right.sourceFiles), textValue(left.sourceFile, ''), textValue(right.sourceFile, '')].filter(Boolean));
+  const sourceKinds = uniquePaths([...stringArray(left.sourceKinds), ...stringArray(right.sourceKinds), textValue(left.sourceKind, ''), textValue(right.sourceKind, '')].filter(Boolean));
+  const sourceStatuses = uniquePaths([...stringArray(left.sourceStatuses), ...stringArray(right.sourceStatuses), textValue(left.sourceStatus, ''), textValue(right.sourceStatus, '')].filter(Boolean));
+  const sumKeys = ['nodeCount', 'edgeCount', 'blockerCount', 'openBlockerCount', 'humanQuestionCount', 'openHumanQuestionCount', 'safeMergeCandidateCount', 'decisionCount', 'terminalDecisionCount', 'terminalAcceptedCount', 'terminalRejectedCount', 'terminalRerunCount', 'gateCount', 'gatePassedCount', 'gateFailedCount', 'staleCount', 'openStaleCount', 'rerunCount', 'openRerunCount', 'staleRerunCleanupCount'];
+  const out: Record<string, unknown> = {
+    ...left,
+    sourceFile: sourceFiles[0],
+    sourceFiles,
+    sourceKind: 'lifetime-rollup',
+    sourceKinds,
+    sourceStatus: sourceStatuses.length === 1 ? sourceStatuses[0] : 'mixed',
+    sourceStatuses,
+    recentEvents: [...recordArray(left.recentEvents), ...recordArray(right.recentEvents)].slice(-12)
+  };
+  for (const key of sumKeys) out[key] = numberValue(left[key]) + numberValue(right[key]);
+  const blockerCount = numberValue(out.openBlockerCount);
+  const gateFailedCount = numberValue(out.gateFailedCount);
+  out.status = blockerCount ? 'blocked' : gateFailedCount ? 'review' : numberValue(out.safeMergeCandidateCount) ? 'ready' : 'clear';
+  out.summaryLine = `${numberValue(out.nodeCount)} nodes, ${numberValue(out.edgeCount)} edges, ${numberValue(out.decisionCount)} decisions, and ${numberValue(out.gateCount)} gates across loaded runs and substrate records.`;
+  return out;
+}
+
+function incrementRecordCount(record: Record<string, number>, key: string): void {
+  record[key || 'unknown'] = (record[key || 'unknown'] ?? 0) + 1;
+}
+
 async function combineLifetimeDashboardSnapshots(
   options: NormalizedLoomUiServerOptions,
   discoveredSources: LifetimeDashboardSource[],
@@ -1448,15 +1826,25 @@ async function combineLifetimeDashboardSnapshots(
     });
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = await readHumanActionAnswers(options);
-  const graph = withDashboardRunGraphJobHealth(lifetimeDecisionGraphSummary(visibleSnapshots), jobs);
+  const substrate = await readDashboardSubstrateSummary(options.cwd);
+  const substrateGraph = recordValue(substrate.graph);
+  const graph = withDashboardRunGraphJobHealth(
+    mergeDashboardGraphSummaries(
+      lifetimeDecisionGraphSummary(visibleSnapshots),
+      Object.keys(substrateGraph).length ? substrateGraph : undefined
+    ),
+    jobs
+  );
   const summary = {
     ...lifetimeDashboardSummary(jobs),
     coordinationDelayCount: autoDrainDelays.length,
     dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length,
+    substrateRecordCount: numberValue(substrateGraph.nodeCount),
+    substrateSourceCount: substrate.sourceCount,
     ...(graph ? { graph } : {})
   };
   const queueOverlay = lifetimeQueueBacklogOverlay(queueBacklog, jobs);
-  const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), ...visibleSnapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
+  const latestGeneratedAt = Math.max(Date.now(), numberValue(queueBacklog.generatedAt), substrate.generatedAt, ...visibleSnapshots.map((entry) => numberValue(entry.snapshot.generatedAt)), ...discoveredSources.map((source) => source.mtimeMs));
   const events = visibleSnapshots.flatMap(({ source, snapshot }) => recordArray(snapshot.events).map((event) => ({
     ...event,
     sourceLabel: source.label,
@@ -1478,6 +1866,8 @@ async function combineLifetimeDashboardSnapshots(
       suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
       queueSourceCount: queueBacklog.sourceCount,
       coordinationDelayCount: autoDrainDelays.length,
+      substrateSourceCount: substrate.sourceCount,
+      ...(substrate.sourceCount ? { substrateFiles: substrate.sourceFiles } : {}),
       ...(humanActionAnswers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {}),
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
     },
@@ -1487,6 +1877,7 @@ async function combineLifetimeDashboardSnapshots(
     quality: {},
     timeSeries: lifetimeTimeSeries(jobs, events),
     ...(graph ? { graph } : {}),
+    substrate,
     lanes: lifetimeLaneRows(jobs),
     capacity: lifetimeCapacitySummary(queueBacklog, jobs, queueOverlay.entries),
     jobs,
@@ -1512,6 +1903,7 @@ async function combineLifetimeDashboardSnapshots(
         suppressedCollectionSourceCount: snapshots.length - visibleSnapshots.length,
         autoDrainDelays,
         ...(graph ? { graphSourceFiles: graph.sourceFiles } : {}),
+        ...(substrate.sourceCount ? { substrate } : {}),
         sources: discoveredSources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES),
         manifests: queueBacklog.manifests,
         queueSources: queueBacklog.paths
