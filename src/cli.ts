@@ -19,9 +19,6 @@ export async function runFrontierLoomUiCli(argv = process.argv.slice(2)): Promis
     const port = optionalNumberArg(args.port, 'port');
     const result = await startLoomUiServer({
       cwd: stringArg(args.cwd),
-      run: stringArg(args.run),
-      collection: stringArg(args.collection),
-      continuation: stringArg(args.continuation),
       host: stringArg(args.host),
       port
     });
@@ -79,9 +76,7 @@ function printHelp(): void {
     'frontier-loom-ui [options]',
     '',
     'Options:',
-    '  --run <dir|swarm-results.json>',
-    '  --collection <dir|collection.json>',
-    '  --continuation <dir|continuation.json>',
+    '  --cwd <workspace>',
     '  --host <host> --port <port>',
     '  --open',
     '  --json',

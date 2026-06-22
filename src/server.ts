@@ -27,7 +27,6 @@ const LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS = 2500;
 const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
-const dashboardStreamListeners = new Set<() => void>();
 
 let dashboardSnapshotCache: {
   key: string;
@@ -35,6 +34,14 @@ let dashboardSnapshotCache: {
   value?: unknown;
   pending?: Promise<unknown>;
 } | undefined;
+let dashboardSnapshotCacheGeneration = 0;
+
+type DashboardStreamHint = {
+  humanActionAnswer?: FrontierLoomUiHumanActionAnswerRecord;
+  answerPath?: string;
+};
+
+const dashboardStreamListeners = new Set<(hint?: DashboardStreamHint) => void>();
 
 export interface FrontierLoomUiServerOptions {
   cwd?: string;
@@ -280,27 +287,45 @@ async function streamDashboard(
 
   let closed = false;
   let pending = false;
+  let queued = false;
   let lastSignature = '';
+  let lastSnapshot: unknown;
+  const writeSnapshot = (snapshot: unknown) => {
+    const signature = dashboardStreamSignature(snapshot);
+    const body = JSON.stringify(snapshot);
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      lastSnapshot = snapshot;
+      response.write(`data: ${body}\n\n`);
+    }
+  };
   const send = async () => {
-    if (closed || pending) return;
+    if (closed) return;
+    if (pending) {
+      queued = true;
+      return;
+    }
     pending = true;
+    queued = false;
     try {
       const snapshot = await readDashboardSnapshotCached(options);
-      const signature = dashboardStreamSignature(snapshot);
-      const body = JSON.stringify(snapshot);
-      if (signature !== lastSignature) {
-        lastSignature = signature;
-        response.write(`data: ${body}\n\n`);
-      }
+      writeSnapshot(snapshot);
     } catch (error) {
       response.write(`event: error\ndata: ${JSON.stringify({ ok: false, error: errorMessage(error) })}\n\n`);
     } finally {
       pending = false;
+      if (queued && !closed) {
+        queued = false;
+        setTimeout(() => {
+          void send();
+        }, 0);
+      }
     }
   };
 
   const trigger = debounce(send, 120);
-  const directTrigger = () => {
+  const directTrigger = (hint?: DashboardStreamHint) => {
+    if (hint && lastSnapshot) writeSnapshot(applyDashboardStreamHint(lastSnapshot, hint));
     void send();
   };
   const watchers = await createDashboardWatchers(options, trigger);
@@ -328,6 +353,27 @@ function dashboardStreamSignature(snapshot: unknown): string {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return JSON.stringify(snapshot);
   const { generatedAt: _generatedAt, ...stableSnapshot } = snapshot as Record<string, unknown>;
   return JSON.stringify(stableSnapshot);
+}
+
+function applyDashboardStreamHint(snapshot: unknown, hint: DashboardStreamHint): unknown {
+  if (!hint.humanActionAnswer || !snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return snapshot;
+  const record = snapshot as Record<string, unknown>;
+  const existing = recordArray(record.humanActionAnswers);
+  const alreadyPresent = existing.some((row) => {
+    return textValue(row.code, '') === hint.humanActionAnswer?.code
+      && textValue(row.answer, '') === hint.humanActionAnswer?.answer
+      && numberValue(row.at) === hint.humanActionAnswer?.at;
+  });
+  const humanActionAnswers = alreadyPresent ? existing : [...existing, hint.humanActionAnswer];
+  return {
+    ...record,
+    generatedAt: Date.now(),
+    humanActionAnswers,
+    sources: {
+      ...recordValue(record.sources),
+      ...(hint.answerPath ? { humanActionAnswers: hint.answerPath } : {})
+    }
+  };
 }
 
 function debounce(fn: () => void | Promise<void>, delayMs: number): () => void {
@@ -378,20 +424,11 @@ function watchDirectory(root: string, recursive: boolean, onChange: () => void):
 }
 
 async function dashboardWatchRoots(options: NormalizedLoomUiServerOptions): Promise<string[]> {
-  const inputs = [options.run, options.collection, options.continuation].filter((value): value is string => Boolean(value));
   const roots: string[] = [];
-  for (const input of inputs) {
-    const absolute = path.resolve(options.cwd, input);
-    const stat = await fs.lstat(absolute).catch(() => undefined);
-    if (!stat) continue;
-    roots.push(stat.isDirectory() ? absolute : path.dirname(absolute));
-  }
-  if (!inputs.length) {
-    const agentRuns = path.join(options.cwd, 'agent-runs');
-    if (await fileExists(agentRuns)) roots.push(agentRuns);
-    const loomQueues = path.join(options.cwd, '.loom', 'queues');
-    if (await fileExists(loomQueues)) roots.push(loomQueues);
-  }
+  const agentRuns = path.join(options.cwd, 'agent-runs');
+  if (await fileExists(agentRuns)) roots.push(agentRuns);
+  const loomQueues = path.join(options.cwd, '.loom', 'queues');
+  if (await fileExists(loomQueues)) roots.push(loomQueues);
   return uniquePaths(roots);
 }
 
@@ -401,7 +438,6 @@ function uniquePaths(values: string[]): string[] {
 
 function normalizeServerOptions(options: FrontierLoomUiServerOptions): NormalizedLoomUiServerOptions {
   return {
-    ...options,
     cwd: path.resolve(options.cwd ?? process.cwd()),
     host: options.host ?? '127.0.0.1',
     port: normalizePort(options.port),
@@ -429,8 +465,7 @@ function dashboardInput(options: FrontierLoomUiServerOptions & { cwd: string }) 
 }
 
 async function readDashboardSnapshot(options: NormalizedLoomUiServerOptions): Promise<unknown> {
-  if (!options.run && !options.collection && !options.continuation) return readLifetimeDashboardSnapshot(options);
-  return readScopedDashboardSnapshot(options);
+  return readLifetimeDashboardSnapshot(options);
 }
 
 async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOptions): Promise<unknown> {
@@ -442,11 +477,14 @@ async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOption
     }
     if (dashboardSnapshotCache.pending) return dashboardSnapshotCache.pending;
   }
+  const generation = dashboardSnapshotCacheGeneration;
   const pending = readDashboardSnapshot(options).then((value) => {
-    dashboardSnapshotCache = { key, at: Date.now(), value };
+    if (generation === dashboardSnapshotCacheGeneration) {
+      dashboardSnapshotCache = { key, at: Date.now(), value };
+    }
     return value;
   }, (error) => {
-    if (dashboardSnapshotCache?.key === key) {
+    if (generation === dashboardSnapshotCacheGeneration && dashboardSnapshotCache?.key === key) {
       dashboardSnapshotCache = dashboardSnapshotCache.value === undefined
         ? undefined
         : { key, at: dashboardSnapshotCache.at, value: dashboardSnapshotCache.value };
@@ -458,6 +496,7 @@ async function readDashboardSnapshotCached(options: NormalizedLoomUiServerOption
 }
 
 function invalidateDashboardSnapshotCache(): void {
+  dashboardSnapshotCacheGeneration += 1;
   dashboardSnapshotCache = undefined;
 }
 
@@ -846,9 +885,11 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
   const snapshots: Array<{ source: LifetimeDashboardSource; snapshot: Record<string, unknown> }> = [];
   let skippedSourceCount = 0;
   let timedOutSourceCount = 0;
-  for (const source of sources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES)) {
+  const sourceResults = await Promise.all(sources.slice(0, LIFETIME_DASHBOARD_MAX_SOURCES).map(async (source) => {
     try {
-      const snapshot = await withTimeout(
+      return {
+        source,
+        snapshot: await withTimeout(
         (async () => {
           const scopedSnapshot = await readScopedDashboardSnapshot({
             ...options,
@@ -860,13 +901,19 @@ async function readLifetimeDashboardSnapshot(options: NormalizedLoomUiServerOpti
         })(),
         LIFETIME_DASHBOARD_SOURCE_TIMEOUT_MS,
         `lifetime source timed out: ${source.path}`
-      );
-      if (Object.keys(snapshot).length) snapshots.push({ source, snapshot });
+        )
+      };
     } catch (error) {
+      return { source, error };
+    }
+  }));
+  for (const result of sourceResults) {
+    if ('error' in result) {
       skippedSourceCount++;
-      if (error instanceof Error && error.message.startsWith('lifetime source timed out:')) timedOutSourceCount++;
+      if (result.error instanceof Error && result.error.message.startsWith('lifetime source timed out:')) timedOutSourceCount++;
       continue;
     }
+    if (Object.keys(result.snapshot).length) snapshots.push({ source: result.source, snapshot: result.snapshot });
   }
   const lifetime = await combineLifetimeDashboardSnapshots(
     options,
@@ -2733,8 +2780,8 @@ function coordinatorReviewDecisionMatches(job: Record<string, unknown>, decision
   const idMatches = decisionIds.some((id) => jobIds.includes(id) || jobIds.includes(sanitizeDecisionId(id)));
   if (!idMatches) return false;
   const decisionSource = textValue(decision.source ?? decision.sourceCollection ?? decision.sourceRun ?? decision.sourceLabel, '');
+  if (isHistoricalReviewDrainDecision(decision) && historicalReviewDrainDecisionMatches(job, decision)) return true;
   if (!decisionSource) return true;
-  if (isHistoricalReviewDrainDecision(decision)) return historicalReviewDrainDecisionMatches(job, decision);
   const jobSources = [
     textValue(job.sourceLabel, ''),
     textValue(job.sourceCollection, ''),
@@ -4755,26 +4802,53 @@ async function findCollectionBundle(
   options: NormalizedLoomUiServerOptions,
   jobId: string
 ): Promise<{ bundle: Record<string, unknown>; outputDir?: string } | undefined> {
-  const collectionFile = await resolveArtifactFile(options.cwd, options.collection, ['collection.json', 'coordinator-query.json']);
-  if (!collectionFile) return undefined;
-  const collection = JSON.parse(await fs.readFile(collectionFile, 'utf8')) as Record<string, unknown>;
-  const buckets = recordValue(collection.buckets);
-  for (const entries of Object.values(buckets)) {
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      const row = recordValue(entry);
-      const bundle = recordValue(row.bundle);
-      if (textValue(row.jobId, '') === jobId || textValue(bundle.jobId, '') === jobId) {
-        return { bundle, outputDir: textValue(row.outputDir, '') };
+  const requestedIds = new Set([jobId, unscopedLifetimeTaskKey(jobId)]);
+  for (const collectionFile of await collectionBundleLookupFiles(options)) {
+    const collection = JSON.parse(await fs.readFile(collectionFile, 'utf8')) as Record<string, unknown>;
+    const defaultOutputDir = textValue(collection.outDir, '') || path.dirname(collectionFile);
+    const buckets = recordValue(collection.buckets);
+    for (const entries of Object.values(buckets)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        const row = recordValue(entry);
+        const bundle = recordValue(row.bundle);
+        const ids = [textValue(row.jobId, ''), textValue(bundle.jobId, ''), textValue(bundle.taskId, '')].filter(Boolean);
+        if (ids.some((id) => requestedIds.has(id) || requestedIds.has(unscopedLifetimeTaskKey(id)))) {
+          return { bundle, outputDir: textValue(row.outputDir, '') || defaultOutputDir };
+        }
+      }
+    }
+    const jobs = Array.isArray(collection.jobs) ? collection.jobs : [];
+    for (const job of jobs) {
+      const row = recordValue(job);
+      const ids = [textValue(row.id ?? row.jobId, ''), textValue(row.originalJobId, ''), textValue(row.taskId, '')].filter(Boolean);
+      if (ids.some((id) => requestedIds.has(id) || requestedIds.has(unscopedLifetimeTaskKey(id)))) {
+        return { bundle: row, outputDir: textValue(row.outputDir, '') || defaultOutputDir };
       }
     }
   }
-  const jobs = Array.isArray(collection.jobs) ? collection.jobs : [];
-  for (const job of jobs) {
-    const row = recordValue(job);
-    if (textValue(row.id ?? row.jobId, '') === jobId) return { bundle: row, outputDir: textValue(row.outputDir, '') };
-  }
   return undefined;
+}
+
+async function collectionBundleLookupFiles(options: NormalizedLoomUiServerOptions): Promise<string[]> {
+  const direct = await resolveArtifactFile(options.cwd, options.collection, ['collection.json', 'coordinator-query.json']);
+  if (direct) return [direct];
+  const out: string[] = [];
+  for (const source of await discoverLifetimeDashboardSources(options.cwd)) {
+    if (source.kind !== 'collection' || !source.collection) continue;
+    const root = path.resolve(options.cwd, source.collection);
+    if (!isPathInside(options.cwd, root)) continue;
+    const stat = await fs.lstat(root).catch(() => undefined);
+    if (!stat) continue;
+    const candidates = stat.isDirectory()
+      ? [path.join(root, 'collection.json'), path.join(root, 'coordinator-query.json')]
+      : [root];
+    for (const candidate of candidates) {
+      const candidateStat = await fs.stat(candidate).catch(() => undefined);
+      if (candidateStat?.isFile()) out.push(candidate);
+    }
+  }
+  return uniquePaths(out);
 }
 
 async function resolveArtifactFile(cwd: string, input: string | undefined, names: string[]): Promise<string | undefined> {
@@ -4812,13 +4886,13 @@ async function writeHumanActionAnswer(
     source: 'frontier-loom-ui'
   };
   await fs.appendFile(answerPath, JSON.stringify(record) + '\n', 'utf8');
-  notifyDashboardStreams();
+  notifyDashboardStreams({ humanActionAnswer: record, answerPath });
   return { ok: true, code, answerPath };
 }
 
-function notifyDashboardStreams(): void {
+function notifyDashboardStreams(hint?: DashboardStreamHint): void {
   invalidateDashboardSnapshotCache();
-  for (const listener of dashboardStreamListeners) listener();
+  for (const listener of dashboardStreamListeners) listener(hint);
 }
 
 async function readHumanActionAnswers(options: NormalizedLoomUiServerOptions): Promise<FrontierLoomUiHumanActionAnswerRecord[]> {

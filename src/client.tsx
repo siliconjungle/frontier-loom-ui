@@ -214,7 +214,7 @@ type RouteState = {
   ticket?: string;
 };
 
-type ContentTab = 'work' | 'board' | 'swarm' | 'lanes' | 'performance' | 'history' | 'testing' | 'actions';
+type ContentTab = 'work' | 'board' | 'running' | 'swarm' | 'lanes' | 'performance' | 'history' | 'testing' | 'actions';
 
 type TimelinePoint = {
   at: number;
@@ -332,6 +332,49 @@ type AgentWorker = {
   currentJobs: TaskBoardItem[];
 };
 
+type RunningGraphFilter = {
+  lane: string;
+  task: string;
+};
+
+type RunningGraphNodeKind = 'source' | 'lane' | 'agent' | 'task';
+
+type RunningGraphNode = {
+  id: string;
+  kind: RunningGraphNodeKind;
+  label: string;
+  detail: string;
+  meta: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  tone: ChartTone;
+  color?: string;
+  taskCardId?: string;
+};
+
+type RunningGraphEdge = {
+  id: string;
+  from: string;
+  to: string;
+  path: string;
+  tone: ChartTone;
+};
+
+type RunningGraph = {
+  nodes: RunningGraphNode[];
+  edges: RunningGraphEdge[];
+  laneOptions: Array<{ id: string; label: string; count: number }>;
+  taskOptions: Array<{ id: string; label: string; ticket: string; lane: string }>;
+  filter: RunningGraphFilter;
+  width: number;
+  height: number;
+  totalActiveJobCount: number;
+  activeJobCount: number;
+  activeAgentCount: number;
+};
+
 type TaskFileDiff = {
   path: string;
   additions: number;
@@ -407,6 +450,7 @@ type TaskDetails = {
 const contentTabs: Array<{ id: ContentTab; label: string }> = [
   { id: 'work', label: 'Overview' },
   { id: 'board', label: 'Board' },
+  { id: 'running', label: 'Running' },
   { id: 'swarm', label: 'Swarm' },
   { id: 'lanes', label: 'Lanes' },
   { id: 'performance', label: 'Performance' },
@@ -423,6 +467,7 @@ let renderedDashboardSignature: string | undefined;
 let pendingFocusTab: ContentTab | undefined;
 let selectedTaskCardId: string | undefined = initialRoute.taskId;
 let selectedTicketId: string | undefined = initialRoute.ticket;
+let runningGraphFilter: RunningGraphFilter = { lane: 'all', task: 'all' };
 let chartPopover: HTMLElement | undefined;
 let activeContributionTarget: HTMLElement | undefined;
 const taskDetailsCache = new Map<string, TaskDetails>();
@@ -460,6 +505,23 @@ root?.addEventListener('click', (event) => {
   const modalBackdrop = event.target instanceof HTMLElement && event.target.dataset.modalBackdrop === 'true';
   if (modalClose || modalBackdrop) {
     closeTaskDialog();
+    return;
+  }
+
+  const runningFilter = event.target instanceof Element
+    ? event.target.closest<HTMLElement>('[data-running-filter-kind]')
+    : null;
+  if (runningFilter) {
+    event.preventDefault();
+    event.stopPropagation();
+    const kind = runningFilter.dataset.runningFilterKind;
+    const value = runningFilter.dataset.runningFilterValue || 'all';
+    if (kind === 'lane') {
+      runningGraphFilter = { lane: value, task: 'all' };
+    } else if (kind === 'task') {
+      runningGraphFilter = { ...runningGraphFilter, task: value };
+    }
+    if (currentDashboard) renderDashboard(currentDashboard);
     return;
   }
 
@@ -684,6 +746,7 @@ function dashboardSignature(dashboard: Dashboard): string {
     events: dashboard.events,
     routing: dashboard.routing,
     backlog: dashboard.backlog,
+    capacity: dashboard.capacity,
     semantic: dashboard.semantic,
     sources: dashboard.sources
   });
@@ -752,6 +815,12 @@ function contentPanel(tab: ContentTab, input: {
   if (tab === 'board') return <Panel title="Task board" meta={boardPanelMeta(input.dashboard, boardItems, input.visibleJobs)}>
     <TaskBoard dashboard={input.dashboard} jobs={input.visibleJobs} />
   </Panel>;
+  if (tab === 'running') {
+    const activeCount = activeAgentTaskCount(input.dashboard, input.visibleJobs);
+    return <Panel title="Running graph" meta={activeCount ? `${text(activeCount)} active tasks` : 'none running'}>
+      <RunningGraphView dashboard={input.dashboard} jobs={input.visibleJobs} />
+    </Panel>;
+  }
   if (tab === 'swarm') {
     const sourceKind = dashboardSourceKind(input.dashboard);
     const activeCount = activeAgentTaskCount(input.dashboard, input.visibleJobs);
@@ -970,6 +1039,268 @@ function TaskBoard({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Reco
       </section>)}
     </div>
   </div>;
+}
+
+function RunningGraphView({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Record<string, unknown>> }): Node {
+  const graph = buildRunningGraph(dashboard, jobs, runningGraphFilter);
+  return <div className="running-layout" data-scroll-id="running" data-smoke-marker="running-tab">
+    <section className="running-filters" aria-label="Running graph filters">
+      <div className="running-filter-group">
+        <span>Scope</span>
+        <div>
+          <RunningFilterButton kind="lane" value="all" active={graph.filter.lane === 'all'} label={`Global · ${text(graph.totalActiveJobCount)}`} />
+          {graph.laneOptions.map((lane) => <RunningFilterButton kind="lane" value={lane.id} active={graph.filter.lane === lane.id} label={`${lane.label} · ${text(lane.count)}`} />)}
+        </div>
+      </div>
+      <div className="running-filter-group">
+        <span>Tasks</span>
+        <div>
+          <RunningFilterButton kind="task" value="all" active={graph.filter.task === 'all'} label="All active" />
+          {graph.taskOptions.map((task) => <RunningFilterButton kind="task" value={task.id} active={graph.filter.task === task.id} label={`${task.ticket} · ${task.label}`} />)}
+        </div>
+      </div>
+    </section>
+    <section className="work-section running-graph-section">
+      <div className="metric-section-head">
+        <h3>Live execution graph</h3>
+        <span>{text(graph.activeAgentCount)} agents · {text(graph.activeJobCount)} active tasks</span>
+      </div>
+      <RunningGraphCanvas graph={graph} />
+    </section>
+  </div>;
+}
+
+function RunningFilterButton({ kind, value, active, label }: { kind: 'lane' | 'task'; value: string; active: boolean; label: string }): Node {
+  return <button
+    type="button"
+    className={active ? 'running-filter active' : 'running-filter'}
+    data-running-filter-kind={kind}
+    data-running-filter-value={value}
+  >{label}</button>;
+}
+
+function RunningGraphCanvas({ graph }: { graph: RunningGraph }): Node {
+  if (!graph.activeJobCount) return <p className="empty tight">No active jobs are running right now.</p>;
+  return <div className="running-graph-viewport" data-scroll-id="running-graph-viewport" aria-label="Current running swarm graph">
+    <div
+      className="running-graph-canvas"
+      style={`width:${graph.width}px; height:${graph.height}px`}
+    >
+      <svg className="running-graph-svg" viewBox={`0 0 ${graph.width} ${graph.height}`} width={graph.width} height={graph.height} aria-hidden="true">
+        {graph.edges.map((edge) => <path className={`running-edge ${edge.tone}`} d={edge.path} />)}
+      </svg>
+      {graph.nodes.map((node) => <RunningGraphNodeView node={node} />)}
+    </div>
+  </div>;
+}
+
+function RunningGraphNodeView({ node }: { node: RunningGraphNode }): Node {
+  const style = `left:${node.x}px; top:${node.y}px; width:${node.width}px; height:${node.height}px; --node-color:${node.color ?? 'var(--line-strong)'}`;
+  if (node.taskCardId) return <button
+    type="button"
+    className={`running-node ${node.kind} ${node.tone}`}
+    style={style}
+    data-task-card={node.taskCardId}
+    aria-label={`${node.label}: ${node.detail}. ${node.meta}`}
+  ><RunningGraphNodeContent node={node} /></button>;
+  return <article
+    className={`running-node ${node.kind} ${node.tone}`}
+    style={style}
+    aria-label={`${node.label}: ${node.detail}. ${node.meta}`}
+  ><RunningGraphNodeContent node={node} /></article>;
+}
+
+function RunningGraphNodeContent({ node }: { node: RunningGraphNode }): Node {
+  return <div className="running-node-inner">
+    <span>{node.kind}</span>
+    <b>{node.label}</b>
+    <small>{node.detail}</small>
+    <em>{node.meta}</em>
+  </div>;
+}
+
+function buildRunningGraph(dashboard: Dashboard, jobs: Array<Record<string, unknown>>, filter: RunningGraphFilter): RunningGraph {
+  const now = timeValue(dashboard.generatedAt) ?? Date.now();
+  const activeItems = taskBoardItems(dashboard, jobs).filter(isActiveAgentJob);
+  const laneCounts = runningLaneCounts(activeItems);
+  const laneOptions = Array.from(laneCounts.entries())
+    .map(([id, count]) => ({ id, label: laneDisplayLabel(id), count }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+  const laneFilter = filter.lane !== 'all' && laneCounts.has(filter.lane) ? filter.lane : 'all';
+  const laneScopedItems = laneFilter === 'all'
+    ? activeItems
+    : activeItems.filter((job) => laneOf(job) === laneFilter);
+  const taskOptions = laneScopedItems
+    .map((job) => ({ id: taskCardId(job), label: taskTitle(job), ticket: ticketId(job), lane: laneOf(job) }))
+    .sort((left, right) => left.ticket.localeCompare(right.ticket));
+  const taskIds = new Set(taskOptions.map((task) => task.id));
+  const taskFilter = filter.task !== 'all' && taskIds.has(filter.task) ? filter.task : 'all';
+  const scopedItems = taskFilter === 'all'
+    ? laneScopedItems
+    : laneScopedItems.filter((job) => taskCardId(job) === taskFilter);
+
+  const dimensions = {
+    source: { x: 28, width: 196, height: 92 },
+    lane: { x: 276, width: 220, height: 92 },
+    agent: { x: 560, width: 286, height: 104 },
+    task: { x: 918, width: 430, height: 112 },
+    rowHeight: 148,
+    paddingY: 38,
+    groupGap: 40
+  };
+  const nodes: RunningGraphNode[] = [];
+  const laneNodes: RunningGraphNode[] = [];
+  const agentNodes: RunningGraphNode[] = [];
+  const taskNodes: RunningGraphNode[] = [];
+  const edges: RunningGraphEdge[] = [];
+  let yCursor = dimensions.paddingY;
+  const laneIds = uniqueStrings(scopedItems.map(laneOf)).sort((left, right) => laneDisplayLabel(left).localeCompare(laneDisplayLabel(right)));
+
+  for (const laneId of laneIds) {
+    const laneJobs = scopedItems.filter((job) => laneOf(job) === laneId);
+    const workers = agentWorkers(laneJobs);
+    const laneStartY = yCursor;
+    let laneRows = 0;
+    workers.forEach((worker, workerIndex) => {
+      const workerJobs = worker.currentJobs.length ? worker.currentJobs : worker.jobs;
+      const workerStartRow = laneRows;
+      workerJobs.forEach((job) => {
+        const y = laneStartY + laneRows * dimensions.rowHeight;
+        taskNodes.push({
+          id: `task:${taskCardId(job)}`,
+          kind: 'task',
+          label: taskTitle(job),
+          detail: `${ticketId(job)} · ${taskCardStatus(job)}`,
+          meta: `${agentModelLabel(job)} · ${jobRuntimeLabel(job, now)}`,
+          x: dimensions.task.x,
+          y,
+          width: dimensions.task.width,
+          height: dimensions.task.height,
+          tone: 'good',
+          taskCardId: taskCardId(job)
+        });
+        laneRows += 1;
+      });
+      const workerRowCount = Math.max(1, workerJobs.length);
+      const workerY = laneStartY
+        + workerStartRow * dimensions.rowHeight
+        + ((workerRowCount - 1) * dimensions.rowHeight) / 2;
+      agentNodes.push({
+        id: `agent:${laneId}:${worker.key}`,
+        kind: 'agent',
+        label: agentDisplayName(worker, workerIndex),
+        detail: `${agentModelSummary(worker)} · ${agentRuntimeValue(worker, now)}`,
+        meta: `${text(workerJobs.length)} ${workerJobs.length === 1 ? 'task' : 'tasks'} · ${agentTokenValue(worker)} input`,
+        x: dimensions.agent.x,
+        y: workerY,
+        width: dimensions.agent.width,
+        height: dimensions.agent.height,
+        tone: 'neutral',
+        color: worker.color
+      });
+    });
+    const safeLaneRows = Math.max(1, laneRows);
+    const laneY = laneStartY + ((safeLaneRows - 1) * dimensions.rowHeight) / 2;
+    laneNodes.push({
+      id: `lane:${laneId}`,
+      kind: 'lane',
+      label: laneDisplayLabel(laneId),
+      detail: `${text(laneJobs.length)} active ${laneJobs.length === 1 ? 'task' : 'tasks'}`,
+      meta: laneModelSummary(laneJobs),
+      x: dimensions.lane.x,
+      y: laneY,
+      width: dimensions.lane.width,
+      height: dimensions.lane.height,
+      tone: 'neutral'
+    });
+    yCursor += safeLaneRows * dimensions.rowHeight + dimensions.groupGap;
+  }
+
+  const height = Math.max(360, yCursor + dimensions.paddingY - dimensions.groupGap);
+  const width = dimensions.task.x + dimensions.task.width + 32;
+  const activeAgentCount = agentNodes.length;
+  const sourceKind = dashboardSourceKind(dashboard);
+  const sourceNode: RunningGraphNode = {
+    id: 'source:global',
+    kind: 'source',
+    label: sourceKind === 'lifetime' ? 'Global swarm' : 'Current swarm',
+    detail: sourceKind === 'lifetime' ? 'Workspace lifetime' : 'Active run',
+    meta: `${text(activeAgentCount)} agents · ${text(scopedItems.length)} active tasks`,
+    x: dimensions.source.x,
+    y: Math.max(dimensions.paddingY, height / 2 - dimensions.source.height / 2),
+    width: dimensions.source.width,
+    height: dimensions.source.height,
+    tone: 'neutral'
+  };
+
+  nodes.push(sourceNode, ...laneNodes, ...agentNodes, ...taskNodes);
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  for (const lane of laneNodes) {
+    edges.push(runningGraphEdge(sourceNode, lane, 'neutral'));
+    const laneId = lane.id.slice('lane:'.length);
+    for (const agent of agentNodes.filter((node) => node.id.startsWith(`agent:${laneId}:`))) {
+      edges.push(runningGraphEdge(lane, agent, 'neutral'));
+      const workerKey = agent.id.slice(`agent:${laneId}:`.length);
+      const workerJobs = scopedItems.filter((job) => laneOf(job) === laneId && agentIdentityKey(job) === workerKey);
+      for (const job of workerJobs) {
+        const taskNode = byId.get(`task:${taskCardId(job)}`);
+        if (taskNode) edges.push(runningGraphEdge(agent, taskNode, 'good'));
+      }
+    }
+  }
+
+  return {
+    nodes,
+    edges,
+    laneOptions,
+    taskOptions,
+    filter: { lane: laneFilter, task: taskFilter },
+    width,
+    height,
+    totalActiveJobCount: activeItems.length,
+    activeJobCount: scopedItems.length,
+    activeAgentCount
+  };
+}
+
+function runningLaneCounts(jobs: TaskBoardItem[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const job of jobs) {
+    const lane = laneOf(job);
+    counts.set(lane, (counts.get(lane) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function laneDisplayLabel(id: string): string {
+  if (!id || id === 'unassigned') return 'Unassigned';
+  return sentenceCaseIdentifier(id);
+}
+
+function laneModelSummary(jobs: TaskBoardItem[]): string {
+  const models = uniqueStrings(jobs.map(agentModelLabel).filter((model) => model !== 'model unknown'));
+  if (!models.length) return 'model unknown';
+  if (models.length === 1) return models[0];
+  return `${models.slice(0, 2).join(' + ')}${models.length > 2 ? ` +${models.length - 2}` : ''}`;
+}
+
+function runningGraphEdge(from: RunningGraphNode, to: RunningGraphNode, tone: ChartTone): RunningGraphEdge {
+  return {
+    id: `${from.id}->${to.id}`,
+    from: from.id,
+    to: to.id,
+    path: runningGraphEdgePath(from, to),
+    tone
+  };
+}
+
+function runningGraphEdgePath(from: RunningGraphNode, to: RunningGraphNode): string {
+  const x1 = from.x + from.width;
+  const y1 = from.y + from.height / 2;
+  const x2 = to.x;
+  const y2 = to.y + to.height / 2;
+  const curve = Math.max(38, Math.min(120, (x2 - x1) / 2));
+  return `M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`;
 }
 
 function AgentWork({ dashboard, jobs }: { dashboard: Dashboard; jobs: Array<Record<string, unknown>> }): Node {
@@ -4438,6 +4769,7 @@ function tabMeta(tab: ContentTab, input: { jobs: number; lanes: number; question
   void input.sources;
   if (tab === 'work') return `${text(input.jobs)} tasks`;
   if (tab === 'board') return 'AI tasks';
+  if (tab === 'running') return 'live graph';
   if (tab === 'swarm') return 'active agents';
   if (tab === 'lanes') return `${text(input.lanes)} lanes`;
   if (tab === 'performance') return 'cost trends';
