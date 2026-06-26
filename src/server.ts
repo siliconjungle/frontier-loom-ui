@@ -2068,6 +2068,7 @@ async function combineLifetimeDashboardSnapshots(
   );
   const summary = {
     ...lifetimeDashboardSummary(jobs),
+    ...lifetimeHtmlCssSummary(visibleSnapshots),
     coordinationDelayCount: autoDrainDelays.length,
     dirtyAutoDrainSkipCount: autoDrainDelays.filter((record) => record.skippedReason === 'dirty-worktree').length,
 	    substrateRecordCount: numberValue(substrateGraph.nodeCount),
@@ -3852,6 +3853,31 @@ function startOfLocalDay(value: number): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
 }
 
+function lifetimeHtmlCssSummary(snapshots: Array<{ snapshot: Record<string, unknown> }>): Record<string, number> {
+  const keys = [
+    'htmlFiles', 'cssFiles', 'htmlCssFiles',
+    'htmlMergedFiles', 'cssMergedFiles', 'htmlCssMergedFiles',
+    'htmlBlockedFiles', 'cssBlockedFiles', 'htmlCssBlockedFiles',
+    'htmlParserEvidenceFiles', 'cssParserEvidenceFiles', 'htmlCssParserEvidenceFiles',
+    'htmlParserEvidenceFailedFiles', 'cssParserEvidenceFailedFiles', 'htmlCssParserEvidenceFailedFiles',
+    'htmlIdentityEvidenceFiles', 'cssSelectorTargetEvidenceFiles', 'htmlCssStructuralTargetEvidenceFiles',
+    'htmlIdentityEvidenceFailedFiles', 'cssSelectorTargetConflictFiles', 'htmlCssStructuralTargetEvidenceFailedFiles',
+    'cssSelectorTargetRebasedFiles', 'htmlCssBrowserRuntimeProofs'
+  ];
+  const summary: Record<string, number> = {};
+  for (const key of keys) summary[key] = 0;
+  for (const { snapshot } of snapshots) {
+    const sources = [
+      recordValue(snapshot.summary),
+      recordValue(recordValue(recordValue(snapshot.raw).collection).summary)
+    ];
+    for (const source of sources) {
+      for (const key of keys) summary[key] += numberValue(source[key]);
+    }
+  }
+  return summary;
+}
+
 function lifetimeSemanticSummary(jobs: Array<Record<string, unknown>>): Record<string, unknown> {
   return {
     expected: jobs.length,
@@ -3942,6 +3968,20 @@ function semanticWithHealth(
     ...(blockedCount ? ['semantic-blocked'] : []),
     ...(openCoordinatorReviewCount ? ['open-coordinator-review'] : [])
   ]).slice(0, 12);
+  const htmlCssHealth = {
+    fileCount: firstNumber(sourceSummary.htmlCssFiles),
+    htmlFileCount: firstNumber(sourceSummary.htmlFiles),
+    cssFileCount: firstNumber(sourceSummary.cssFiles),
+    mergedFileCount: firstNumber(sourceSummary.htmlCssMergedFiles),
+    blockedFileCount: firstNumber(sourceSummary.htmlCssBlockedFiles),
+    parserEvidenceFileCount: firstNumber(sourceSummary.htmlCssParserEvidenceFiles),
+    parserEvidenceFailedFileCount: firstNumber(sourceSummary.htmlCssParserEvidenceFailedFiles),
+    structuralTargetEvidenceFileCount: firstNumber(sourceSummary.htmlCssStructuralTargetEvidenceFiles),
+    structuralTargetEvidenceFailedFileCount: firstNumber(sourceSummary.htmlCssStructuralTargetEvidenceFailedFiles),
+    cssSelectorTargetConflictFileCount: firstNumber(sourceSummary.cssSelectorTargetConflictFiles),
+    cssSelectorTargetRebasedFileCount: firstNumber(sourceSummary.cssSelectorTargetRebasedFiles),
+    browserRuntimeProofCount: firstNumber(sourceSummary.htmlCssBrowserRuntimeProofs)
+  };
   const parserHealth = {
     lossCount: parserLosses,
     lossSeverityCounts: parserLossSeverityCounts,
@@ -3988,6 +4028,7 @@ function semanticWithHealth(
       merge: { ...mergeHealth, ...recordValue(existingHealth.merge) },
       gates: { ...gatesHealth, ...recordValue(existingHealth.gates) },
       outcomes: { ...outcomesHealth, ...recordValue(existingHealth.outcomes) },
+      htmlCss: { ...recordValue(existingHealth.htmlCss), ...htmlCssHealth },
       admission: semanticAdmissionHealth({
         sourceSummary,
         semantic,

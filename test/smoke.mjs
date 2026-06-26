@@ -86,6 +86,29 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     semanticLineageNeedsReview: 1,
     semanticLineageReasonCodes: ['ambiguous-lineage-candidates'],
     semanticProofSpecFailedObligations: 1,
+    htmlFiles: 1,
+    cssFiles: 1,
+    htmlCssFiles: 2,
+    htmlMergedFiles: 1,
+    cssMergedFiles: 1,
+    htmlCssMergedFiles: 2,
+    htmlBlockedFiles: 0,
+    cssBlockedFiles: 1,
+    htmlCssBlockedFiles: 1,
+    htmlParserEvidenceFiles: 1,
+    cssParserEvidenceFiles: 1,
+    htmlCssParserEvidenceFiles: 2,
+    htmlParserEvidenceFailedFiles: 0,
+    cssParserEvidenceFailedFiles: 0,
+    htmlCssParserEvidenceFailedFiles: 0,
+    htmlIdentityEvidenceFiles: 1,
+    cssSelectorTargetEvidenceFiles: 1,
+    htmlCssStructuralTargetEvidenceFiles: 2,
+    htmlIdentityEvidenceFailedFiles: 0,
+    cssSelectorTargetConflictFiles: 1,
+    htmlCssStructuralTargetEvidenceFailedFiles: 1,
+    cssSelectorTargetRebasedFiles: 1,
+    htmlCssBrowserRuntimeProofs: 1,
     semanticCollectAdmissionReasonCodeCounts: {
       'lossy-import': 1,
       'symbol-conflict': 1,
@@ -990,6 +1013,14 @@ try {
   assert.equal(dashboard.sources.collectionDir, undefined);
   assert.ok(dashboard.summary.jobCount >= 3);
   assert.ok(dashboard.health.summary.jobCount >= 3);
+  assert.equal(dashboard.semantic.health.htmlCss.fileCount, 2);
+  assert.equal(dashboard.semantic.health.htmlCss.htmlFileCount, 1);
+  assert.equal(dashboard.semantic.health.htmlCss.cssFileCount, 1);
+  assert.equal(dashboard.semantic.health.htmlCss.parserEvidenceFileCount, 2);
+  assert.equal(dashboard.semantic.health.htmlCss.structuralTargetEvidenceFileCount, 2);
+  assert.equal(dashboard.semantic.health.htmlCss.cssSelectorTargetConflictFileCount, 1);
+  assert.equal(dashboard.semantic.health.htmlCss.cssSelectorTargetRebasedFileCount, 1);
+  assert.equal(dashboard.semantic.health.htmlCss.browserRuntimeProofCount, 1);
   assert.equal(dashboard.graph.sourceKind, 'lifetime-rollup');
   assert.ok(dashboard.graph.nodeCount >= 4);
   assert.ok(dashboard.graph.safeMergeCandidateCount >= 1);
@@ -1480,7 +1511,9 @@ try {
     'No testing metadata was reported',
     'Evidence mix',
     'Recent check output',
-    'Coordinator review'
+    'Coordinator review',
+    'HTML/CSS evidence',
+    'rebased selector'
   ]);
   assert.doesNotMatch(client, /Read-only operator shell|Frontier swarm operations|selectedLane|selected lane|data-lane-filter|Lane efficiency|Lane load|Epics \/ task groups|Merge readiness|Quality gates|Agent questions only|Artifact viewer|action-options|action-scope/);
   assertNoOperatorSteeringSurface(`${html}\n${client}`);

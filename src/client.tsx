@@ -133,6 +133,21 @@ type ChartSeries = {
   yLabel?: string;
 };
 
+type SemanticHtmlCssHealthSummary = {
+  fileCount: number;
+  htmlFileCount: number;
+  cssFileCount: number;
+  mergedFileCount: number;
+  blockedFileCount: number;
+  parserEvidenceFileCount: number;
+  parserEvidenceFailedFileCount: number;
+  structuralTargetEvidenceFileCount: number;
+  structuralTargetEvidenceFailedFileCount: number;
+  cssSelectorTargetConflictFileCount: number;
+  cssSelectorTargetRebasedFileCount: number;
+  browserRuntimeProofCount: number;
+};
+
 type SemanticHealthSummary = {
   parserLosses: number;
   parserWarnings: number;
@@ -151,6 +166,7 @@ type SemanticHealthSummary = {
   admissionStatusCounts: Record<string, number>;
   admissionReasonCodeCounts: Record<string, number>;
   reasonCodes: string[];
+  htmlCss: SemanticHtmlCssHealthSummary;
 };
 
 type SemanticMetricsSummary = {
@@ -6253,6 +6269,7 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
   const merge = recordValue(health.merge);
   const gates = recordValue(health.gates);
   const outcomes = recordValue(health.outcomes);
+  const htmlCss = recordValue(health.htmlCss);
   const admissionHealth = recordValue(health.admission);
   const admissionRows = [
     ...semanticAdmissionRows(admission.jobs, 'Jobs'),
@@ -6301,7 +6318,21 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
       ...stringArray(parser.expectedMissingReasonCodes),
       ...stringArray(merge.reasonCodes),
       ...stringArray(gates.reasonCodes)
-    ]).slice(0, 6)
+    ]).slice(0, 6),
+    htmlCss: {
+      fileCount: numberValue(htmlCss.fileCount),
+      htmlFileCount: numberValue(htmlCss.htmlFileCount),
+      cssFileCount: numberValue(htmlCss.cssFileCount),
+      mergedFileCount: numberValue(htmlCss.mergedFileCount),
+      blockedFileCount: numberValue(htmlCss.blockedFileCount),
+      parserEvidenceFileCount: numberValue(htmlCss.parserEvidenceFileCount),
+      parserEvidenceFailedFileCount: numberValue(htmlCss.parserEvidenceFailedFileCount),
+      structuralTargetEvidenceFileCount: numberValue(htmlCss.structuralTargetEvidenceFileCount),
+      structuralTargetEvidenceFailedFileCount: numberValue(htmlCss.structuralTargetEvidenceFailedFileCount),
+      cssSelectorTargetConflictFileCount: numberValue(htmlCss.cssSelectorTargetConflictFileCount),
+      cssSelectorTargetRebasedFileCount: numberValue(htmlCss.cssSelectorTargetRebasedFileCount),
+      browserRuntimeProofCount: numberValue(htmlCss.browserRuntimeProofCount)
+    }
   };
   return {
     ...metrics,
@@ -6454,12 +6485,30 @@ function semanticHealthRows(semantic: SemanticMetricsSummary): Array<{ label: st
     { label: 'Parser losses', value: formatNumber(health.parserLosses), detail: `${formatNumber(health.parserWarnings)} warnings · ${reasonDetail}` },
     { label: 'Ledger losses', value: formatNumber(ledgerLosses), detail: `${formatNumber(health.ledgerFailed)} failed · ${formatNumber(health.ledgerSkipped)} skipped · ${formatNumber(health.ledgerLanded)} landed` },
     { label: 'Auto-merge candidates', value: formatNumber(health.autoMergeCandidates), detail: `${formatNumber(semantic.acceptedClean)} replay clean` },
+    ...semanticHtmlCssHealthRows(health.htmlCss),
     ...semanticAdmissionHealthRows(semantic),
     { label: 'Review-required reasons', value: formatNumber(health.reviewRequired), detail: reasonDetail },
     { label: 'Conflicts', value: formatNumber(health.conflicts), detail: 'semantic script, replay, or admission conflicts' },
     { label: 'Gate status', value: semanticGateLabel(health.gateStatus), detail: `${formatNumber(health.gateFailed)} failed · ${formatNumber(health.gateWarnings)} review · ${formatNumber(health.gatePassed)} pass` },
     { label: 'Synthesized/research complete', value: formatNumber(health.synthesizedResearchComplete), detail: 'completed discovery or synthesized outputs' },
     { label: 'Open coordinator review', value: formatNumber(health.openCoordinatorReview), detail: 'outputs still waiting on coordinator decision' }
+  ];
+}
+
+function semanticHtmlCssHealthRows(htmlCss: SemanticHtmlCssHealthSummary): Array<{ label: string; value: string; detail: string }> {
+  if (!htmlCss.fileCount && !htmlCss.parserEvidenceFileCount && !htmlCss.structuralTargetEvidenceFileCount) return [];
+  const failedEvidence = htmlCss.parserEvidenceFailedFileCount + htmlCss.structuralTargetEvidenceFailedFileCount;
+  return [
+    {
+      label: 'HTML/CSS evidence',
+      value: `${formatNumber(htmlCss.mergedFileCount)}/${formatNumber(htmlCss.fileCount)}`,
+      detail: `${formatNumber(htmlCss.parserEvidenceFileCount)} parser · ${formatNumber(htmlCss.structuralTargetEvidenceFileCount)} identity/selector · ${formatNumber(htmlCss.browserRuntimeProofCount)} browser`
+    },
+    {
+      label: 'HTML/CSS review signals',
+      value: formatNumber(htmlCss.blockedFileCount + failedEvidence + htmlCss.cssSelectorTargetConflictFileCount),
+      detail: `${formatNumber(htmlCss.blockedFileCount)} blocked · ${formatNumber(failedEvidence)} failed evidence · ${formatNumber(htmlCss.cssSelectorTargetRebasedFileCount)} rebased selector`
+    }
   ];
 }
 
