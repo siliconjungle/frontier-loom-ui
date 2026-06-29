@@ -46,6 +46,9 @@ const LIFETIME_DASHBOARD_RESET_FILE = '.loom-ui-reset.json';
 const REVIEW_DECISIONS_FILE = '.loom-ui-review-decisions.json';
 const LIVE_RUN_GRAPH_EVENTS_FILE = 'live-run-graph-events.jsonl';
 const FRONTIER_SWARM_CODEX_DISTRIBUTED_RUN_KIND = 'frontier.swarm-codex.distributed-run';
+const MERGE_METRICS_FEEDBACK_FILE = 'merge-metrics-feedback.json';
+const MERGE_METRICS_TOP_REGION_LIMIT = 12;
+const MERGE_METRICS_HINT_LIMIT = 12;
 
 let dashboardSnapshotCache: {
   key: string;
@@ -561,6 +564,7 @@ async function readScopedDashboardSnapshot(
   const answers = await readHumanActionAnswers(options);
   const record = snapshot as unknown as Record<string, unknown>;
   const collectionGraph = await readDashboardRunGraphSummary(options, record);
+  const mergeMetrics = await readDashboardMergeMetricsSummary(options, record);
   const jobs = Array.isArray(record.jobs) ? record.jobs : [];
   const activeJobs = recordArray(activeRunSnapshot?.jobs);
   if (shouldPreferActiveRunSnapshot(jobs, activeJobs)) {
@@ -575,16 +579,19 @@ async function readScopedDashboardSnapshot(
       humanActions: recordArray(record.humanActions),
       humanActionAnswers: answers,
       ...(graph ? { graph } : {}),
+      ...(mergeMetrics ? { mergeMetrics } : {}),
       summary: {
         ...recordValue(activeRunSnapshot?.summary),
-        ...(graph ? { graph } : {})
+        ...(graph ? { graph } : {}),
+        ...mergeMetricsSummaryFields(mergeMetrics)
       },
       sources: {
         ...recordValue(record.sources),
         ...recordValue(activeRunSnapshot?.sources),
         ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {}),
         ...(autonomousDecisions.length ? { autonomousMergeDecisions: autonomousDecisionSourceSummary(autonomousDecisions) } : {}),
-        ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {})
+        ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {}),
+        ...mergeMetricsSourceFields(mergeMetrics)
       },
       raw: {
         ...recordValue(activeRunSnapshot?.raw),
@@ -612,18 +619,21 @@ async function readScopedDashboardSnapshot(
     ...(graph ? { graph } : {}),
     summary: {
       ...adjustedSummary,
-      ...(graph ? { graph } : {})
+      ...(graph ? { graph } : {}),
+      ...mergeMetricsSummaryFields(mergeMetrics)
     },
     health: lifetimeHealthSummary(mergedJobs),
     semantic: semanticWithHealth(recordValue(normalizedSnapshot.semantic), semanticSummary, mergedJobs),
     jobs: mergedJobs,
     activeAgents: activeAgentsFromJobs(mergedJobs),
     humanActionAnswers: answers,
+    ...(mergeMetrics ? { mergeMetrics } : {}),
     sources: {
       ...recordValue(record.sources),
       ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {}),
       ...(autonomousDecisions.length ? { autonomousMergeDecisions: autonomousDecisionSourceSummary(autonomousDecisions) } : {}),
-      ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {})
+      ...(answers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {}),
+      ...mergeMetricsSourceFields(mergeMetrics)
     }
   };
 }
@@ -2058,6 +2068,7 @@ async function combineLifetimeDashboardSnapshots(
   }), reviewDecisions))).slice(0, LIFETIME_DASHBOARD_MAX_JOBS);
   const humanActionAnswers = await readHumanActionAnswers(options);
   const substrate = await readDashboardSubstrateSummary(options.cwd);
+  const mergeMetrics = await readLifetimeMergeMetricsSummary(options.cwd, visibleSnapshots.map(({ source }) => source));
   const substrateGraph = recordValue(substrate.graph);
   const graph = withDashboardRunGraphJobHealth(
     mergeDashboardGraphSummaries(
@@ -2079,6 +2090,7 @@ async function combineLifetimeDashboardSnapshots(
 	    distributedRunWorkerCount: substrate.distributedRun.workerCount,
 	    distributedRunSyncedWorkerCount: substrate.distributedRun.syncedWorkerCount,
 	    distributedRunPeerCount: substrate.distributedRun.peerCount,
+      ...mergeMetricsSummaryFields(mergeMetrics),
 	    ...queueRuntimeStateRollup(queueBacklog),
     ...(graph ? { graph } : {})
   };
@@ -2109,7 +2121,8 @@ async function combineLifetimeDashboardSnapshots(
       substrateSourceCount: substrate.sourceCount,
       ...(substrate.sourceCount ? { substrateFiles: substrate.sourceFiles } : {}),
       ...(humanActionAnswers.length ? { humanActionAnswers: await humanActionAnswerLogPath(options) } : {}),
-      ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {})
+      ...(reviewDecisions.length ? { coordinatorReviewDecisions: coordinatorReviewDecisionPath(options.cwd) } : {}),
+      ...mergeMetricsSourceFields(mergeMetrics)
     },
     summary,
     semantic: semanticWithHealth(lifetimeSemanticSummary(jobs), summary, jobs),
@@ -2125,6 +2138,7 @@ async function combineLifetimeDashboardSnapshots(
     humanActionAnswers,
     events,
     routing: await lifetimeRoutingSummary(options.cwd, visibleSnapshots),
+    ...(mergeMetrics ? { mergeMetrics } : {}),
     backlog: {
       id: 'workspace-lifetime',
       entryCount: queueOverlay.totalCount,
@@ -4355,6 +4369,356 @@ function firstNumber(...values: unknown[]): number {
   for (const value of values) {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
   }
+  return 0;
+}
+
+interface MergeMetricsFeedbackEntry {
+  sourceLabel: string;
+  sourceFile: string;
+  generatedAt: number;
+  feedback: Record<string, unknown>;
+}
+
+async function readDashboardMergeMetricsSummary(
+  options: NormalizedLoomUiServerOptions,
+  snapshot: Record<string, unknown>
+): Promise<Record<string, unknown> | undefined> {
+  const source = await resolveDashboardMergeMetricsSource(options, snapshot);
+  if (!source?.file) return undefined;
+  const feedback = recordValue(await readJsonFile(source.file));
+  if (!Object.keys(feedback).length) return undefined;
+  return summarizeMergeMetricsFeedbackEntries([{
+    sourceLabel: 'Collection feedback',
+    sourceFile: path.relative(options.cwd, source.file).replaceAll(path.sep, '/'),
+    generatedAt: mergeMetricsGeneratedAt(feedback),
+    feedback
+  }]);
+}
+
+async function resolveDashboardMergeMetricsSource(
+  options: NormalizedLoomUiServerOptions,
+  snapshot: Record<string, unknown>
+): Promise<{ file?: string; expectedFile?: string } | undefined> {
+  const sources = recordValue(snapshot.sources);
+  const candidates = uniquePaths([
+    textValue(options.collection, ''),
+    textValue(sources.collectionDir, ''),
+    path.dirname(textValue(sources.collectionFile, ''))
+  ].filter(Boolean));
+  let expectedFile: string | undefined;
+  for (const candidate of candidates) {
+    const absolute = path.resolve(options.cwd, candidate);
+    if (!isPathInside(options.cwd, absolute)) continue;
+    const stat = await fs.lstat(absolute).catch(() => undefined);
+    if (!stat) continue;
+    const file = stat.isDirectory()
+      ? path.join(absolute, MERGE_METRICS_FEEDBACK_FILE)
+      : path.basename(absolute) === MERGE_METRICS_FEEDBACK_FILE
+        ? absolute
+        : path.join(path.dirname(absolute), MERGE_METRICS_FEEDBACK_FILE);
+    expectedFile ??= file;
+    const fileStat = await fs.stat(file).catch(() => undefined);
+    if (fileStat?.isFile() && isPathInside(options.cwd, file)) return { file, expectedFile: file };
+  }
+  return expectedFile ? { expectedFile } : undefined;
+}
+
+async function readLifetimeMergeMetricsSummary(
+  cwd: string,
+  sources: LifetimeDashboardSource[]
+): Promise<Record<string, unknown> | undefined> {
+  const entries: MergeMetricsFeedbackEntry[] = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    const dir = lifetimeRoutingSidecarDir(cwd, source);
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    const file = path.join(dir, MERGE_METRICS_FEEDBACK_FILE);
+    const stat = await fs.stat(file).catch(() => undefined);
+    if (!stat?.isFile() || !isPathInside(cwd, file)) continue;
+    const feedback = recordValue(await readJsonFile(file));
+    if (!Object.keys(feedback).length) continue;
+    entries.push({
+      sourceLabel: source.label,
+      sourceFile: path.relative(cwd, file).replaceAll(path.sep, '/'),
+      generatedAt: mergeMetricsGeneratedAt(feedback),
+      feedback
+    });
+  }
+  return summarizeMergeMetricsFeedbackEntries(entries);
+}
+
+function summarizeMergeMetricsFeedbackEntries(entries: MergeMetricsFeedbackEntry[]): Record<string, unknown> | undefined {
+  if (!entries.length) return undefined;
+  const topRegions = aggregateMergeMetricsRegions(entries.flatMap((entry) => mergeMetricsRegionRows(entry))).slice(0, MERGE_METRICS_TOP_REGION_LIMIT);
+  const suggestions = mergeMetricsSuggestionRows(entries).slice(0, MERGE_METRICS_HINT_LIMIT);
+  const semanticLeaseHints = mergeMetricsHintRows(entries, 'semanticLeaseHints').slice(0, MERGE_METRICS_HINT_LIMIT);
+  const taskSplitHints = mergeMetricsHintRows(entries, 'taskSplitHints').slice(0, MERGE_METRICS_HINT_LIMIT);
+  const routingHints = mergeMetricsHintRows(entries, 'routingHints').slice(0, MERGE_METRICS_HINT_LIMIT);
+  const feedback = {
+    preferredLeaseKeys: mergeMetricsFeedbackKeys(entries, 'preferredLeaseKeys'),
+    avoidConcurrentRegionKeys: mergeMetricsFeedbackKeys(entries, 'avoidConcurrentRegionKeys'),
+    splitTaskRegionKeys: mergeMetricsFeedbackKeys(entries, 'splitTaskRegionKeys'),
+    refactorCandidateRegionKeys: mergeMetricsFeedbackKeys(entries, 'refactorCandidateRegionKeys')
+  };
+  const eventCount = mergeMetricsSummaryNumber(entries, 'eventCount');
+  const correlatedRegionCount = mergeMetricsSummaryNumber(entries, 'correlatedRegionCount') || topRegions.length;
+  const correlatedPairCount = mergeMetricsSummaryNumber(entries, 'correlatedPairCount');
+  const suggestionCount = mergeMetricsSummaryNumber(entries, 'suggestionCount') || suggestions.length;
+  const highSeveritySuggestionCount = mergeMetricsSummaryNumber(entries, 'highSeveritySuggestionCount') ||
+    suggestions.filter((suggestion) => textValue(suggestion.severity, '') === 'high').length;
+  const summary = {
+    eventCount,
+    correlatedRegionCount,
+    correlatedPairCount,
+    suggestionCount,
+    highSeveritySuggestionCount,
+    preferredLeaseKeyCount: feedback.preferredLeaseKeys.length,
+    avoidConcurrentRegionKeyCount: feedback.avoidConcurrentRegionKeys.length,
+    splitTaskRegionKeyCount: feedback.splitTaskRegionKeys.length,
+    refactorCandidateRegionKeyCount: feedback.refactorCandidateRegionKeys.length,
+    semanticLeaseHintCount: semanticLeaseHints.length,
+    taskSplitHintCount: taskSplitHints.length,
+    routingHintCount: routingHints.length
+  };
+  const sourceFiles = uniquePaths(entries.map((entry) => entry.sourceFile));
+  return {
+    kind: 'frontier.loom-ui.merge-metrics-projection',
+    version: 1,
+    generatedAt: Math.max(Date.now(), ...entries.map((entry) => entry.generatedAt)),
+    sourceCount: entries.length,
+    sourceFiles,
+    ...summary,
+    summary,
+    topRegions,
+    suggestions,
+    semanticLeaseHints,
+    taskSplitHints,
+    routingHints,
+    feedback,
+    summaryLine: `${eventCount} work events, ${correlatedRegionCount} correlated regions, ${suggestionCount} suggestions`
+  };
+}
+
+function mergeMetricsSummaryFields(mergeMetrics: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!mergeMetrics) return {};
+  const summary = recordValue(mergeMetrics.summary);
+  return {
+    mergeMetricEventCount: numberValue(summary.eventCount),
+    mergeMetricCorrelatedRegionCount: numberValue(summary.correlatedRegionCount),
+    mergeMetricSuggestionCount: numberValue(summary.suggestionCount),
+    mergeMetricHighSeveritySuggestionCount: numberValue(summary.highSeveritySuggestionCount),
+    mergeMetricPreferredLeaseKeyCount: numberValue(summary.preferredLeaseKeyCount),
+    mergeMetricSplitTaskRegionKeyCount: numberValue(summary.splitTaskRegionKeyCount)
+  };
+}
+
+function mergeMetricsSourceFields(mergeMetrics: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!mergeMetrics) return {};
+  return {
+    mergeMetricsFeedbackSourceCount: numberValue(mergeMetrics.sourceCount),
+    mergeMetricsFeedbackFiles: stringArray(mergeMetrics.sourceFiles)
+  };
+}
+
+function mergeMetricsGeneratedAt(feedback: Record<string, unknown>): number {
+  const report = recordValue(feedback.report);
+  return firstNumber(feedback.generatedAt, Date.parse(textValue(report.generatedAt, '')));
+}
+
+function mergeMetricsSummaryNumber(entries: MergeMetricsFeedbackEntry[], key: string): number {
+  return entries.reduce((sum, entry) => {
+    const report = recordValue(entry.feedback.report);
+    const reportSummary = recordValue(report.summary);
+    const summary = recordValue(entry.feedback.summary);
+    return sum + firstNumber(summary[key], reportSummary[key], entry.feedback[key]);
+  }, 0);
+}
+
+function mergeMetricsRegionRows(entry: MergeMetricsFeedbackEntry): Array<Record<string, unknown>> {
+  const report = recordValue(entry.feedback.report);
+  return recordArray(report.regions).map((region) => ({
+    ...region,
+    sourceLabels: [entry.sourceLabel],
+    sourceFiles: [entry.sourceFile]
+  }));
+}
+
+function aggregateMergeMetricsRegions(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const byKey = new Map<string, Record<string, unknown> & {
+    failureWeight: number;
+    conflictWeight: number;
+    staleWeight: number;
+    gateFailureWeight: number;
+    humanNeededWeight: number;
+  }>();
+  for (const row of rows) {
+    const key = textValue(row.key, textValue(row.label, 'region'));
+    const touches = Math.max(1, numberValue(row.touches));
+    const current = byKey.get(key) ?? {
+      key,
+      kind: textValue(row.kind, 'region'),
+      file: textValue(row.file, ''),
+      symbol: textValue(row.symbol, ''),
+      label: textValue(row.label, key),
+      touches: 0,
+      taskCount: 0,
+      agentCount: 0,
+      runCount: 0,
+      lanes: [],
+      paths: [],
+      outcomeCounts: {},
+      pressureScore: 0,
+      sourceLabels: [],
+      sourceFiles: [],
+      failureWeight: 0,
+      conflictWeight: 0,
+      staleWeight: 0,
+      gateFailureWeight: 0,
+      humanNeededWeight: 0
+    };
+    current.touches = numberValue(current.touches) + touches;
+    current.taskCount = numberValue(current.taskCount) + numberValue(row.taskCount);
+    current.agentCount = numberValue(current.agentCount) + numberValue(row.agentCount);
+    current.runCount = numberValue(current.runCount) + numberValue(row.runCount);
+    current.pressureScore = Math.max(numberValue(current.pressureScore), numberValue(row.pressureScore));
+    current.lanes = uniquePaths([...stringArray(current.lanes), ...stringArray(row.lanes)]);
+    current.paths = uniquePaths([...stringArray(current.paths), ...stringArray(row.paths)]);
+    current.sourceLabels = uniquePaths([...stringArray(current.sourceLabels), ...stringArray(row.sourceLabels)]);
+    current.sourceFiles = uniquePaths([...stringArray(current.sourceFiles), ...stringArray(row.sourceFiles)]);
+    current.outcomeCounts = mergeNumberRecords(recordValue(current.outcomeCounts), recordValue(row.outcomeCounts));
+    current.failureWeight += numberValue(row.failureRate) * touches;
+    current.conflictWeight += numberValue(row.conflictRate) * touches;
+    current.staleWeight += numberValue(row.staleRate) * touches;
+    current.gateFailureWeight += numberValue(row.gateFailureRate) * touches;
+    current.humanNeededWeight += numberValue(row.humanNeededRate) * touches;
+    byKey.set(key, current);
+  }
+  return Array.from(byKey.values())
+    .map((row) => {
+      const touches = Math.max(1, numberValue(row.touches));
+      return {
+        key: row.key,
+        label: row.label,
+        kind: row.kind,
+        ...(row.file ? { file: row.file } : {}),
+        ...(row.symbol ? { symbol: row.symbol } : {}),
+        touches: row.touches,
+        taskCount: row.taskCount,
+        agentCount: row.agentCount,
+        runCount: row.runCount,
+        lanes: row.lanes,
+        paths: row.paths,
+        outcomeCounts: row.outcomeCounts,
+        pressureScore: row.pressureScore,
+        failureRate: row.failureWeight / touches,
+        conflictRate: row.conflictWeight / touches,
+        staleRate: row.staleWeight / touches,
+        gateFailureRate: row.gateFailureWeight / touches,
+        humanNeededRate: row.humanNeededWeight / touches,
+        sourceLabels: row.sourceLabels,
+        sourceFiles: row.sourceFiles
+      };
+    })
+    .sort((left, right) => numberValue(right.pressureScore) - numberValue(left.pressureScore) ||
+      numberValue(right.touches) - numberValue(left.touches) ||
+      textValue(left.label, '').localeCompare(textValue(right.label, '')));
+}
+
+function mergeNumberRecords(left: Record<string, unknown>, right: Record<string, unknown>): Record<string, number> {
+  const out = { ...numberRecordValue(left) };
+  for (const [key, value] of Object.entries(numberRecordValue(right))) out[key] = (out[key] ?? 0) + value;
+  return out;
+}
+
+function mergeMetricsSuggestionRows(entries: MergeMetricsFeedbackEntry[]): Array<Record<string, unknown>> {
+  const byKey = new Map<string, Record<string, unknown>>();
+  for (const entry of entries) {
+    const report = recordValue(entry.feedback.report);
+    const rows = recordArray(report.suggestions).length ? recordArray(report.suggestions) : recordArray(entry.feedback.routingHints);
+    for (const row of rows) {
+      const regionKeys = stringArray(row.regionKeys);
+      const key = textValue(row.id, `${textValue(row.action, 'suggestion')}:${textValue(row.title, '')}:${regionKeys.join('|')}`);
+      const current = byKey.get(key);
+      const next = {
+        id: key,
+        title: textValue(row.title, textValue(row.action, 'suggestion')),
+        action: textValue(row.action, 'observe'),
+        severity: mergeMetricsSeverity(row.severity),
+        regionKeys,
+        reason: textValue(row.reason, ''),
+        ...(textValue(row.taskHint, '') ? { taskHint: textValue(row.taskHint, '') } : {}),
+        ...(stringArray(row.leaseKeys).length ? { leaseKeys: stringArray(row.leaseKeys) } : {}),
+        sourceLabels: [entry.sourceLabel],
+        sourceFiles: [entry.sourceFile]
+      };
+      if (!current) {
+        byKey.set(key, next);
+        continue;
+      }
+      byKey.set(key, {
+        ...current,
+        severity: mergeMetricsSeverityRank(next.severity) > mergeMetricsSeverityRank(current.severity) ? next.severity : current.severity,
+        sourceLabels: uniquePaths([...stringArray(current.sourceLabels), entry.sourceLabel]),
+        sourceFiles: uniquePaths([...stringArray(current.sourceFiles), entry.sourceFile])
+      });
+    }
+  }
+  return Array.from(byKey.values()).sort((left, right) =>
+    mergeMetricsSeverityRank(right.severity) - mergeMetricsSeverityRank(left.severity) ||
+    textValue(left.title, '').localeCompare(textValue(right.title, '')));
+}
+
+function mergeMetricsHintRows(entries: MergeMetricsFeedbackEntry[], key: 'semanticLeaseHints' | 'taskSplitHints' | 'routingHints'): Array<Record<string, unknown>> {
+  const byKey = new Map<string, Record<string, unknown>>();
+  for (const entry of entries) {
+    for (const row of recordArray(entry.feedback[key])) {
+      const regionKeys = stringArray(row.regionKeys);
+      const id = `${textValue(row.action, key)}:${textValue(row.leaseKey, '')}:${regionKeys.join('|')}:${textValue(row.reason, '')}`;
+      const current = byKey.get(id);
+      const next = {
+        ...(textValue(row.leaseKey, '') ? { leaseKey: textValue(row.leaseKey, '') } : {}),
+        ...(textValue(row.action, '') ? { action: textValue(row.action, '') } : {}),
+        severity: mergeMetricsSeverity(row.severity),
+        regionKeys,
+        reason: textValue(row.reason, ''),
+        ...(textValue(row.taskHint, '') ? { taskHint: textValue(row.taskHint, '') } : {}),
+        sourceLabels: [entry.sourceLabel],
+        sourceFiles: [entry.sourceFile]
+      };
+      if (!current) {
+        byKey.set(id, next);
+        continue;
+      }
+      byKey.set(id, {
+        ...current,
+        severity: mergeMetricsSeverityRank(next.severity) > mergeMetricsSeverityRank(current.severity) ? next.severity : current.severity,
+        sourceLabels: uniquePaths([...stringArray(current.sourceLabels), entry.sourceLabel]),
+        sourceFiles: uniquePaths([...stringArray(current.sourceFiles), entry.sourceFile])
+      });
+    }
+  }
+  return Array.from(byKey.values()).sort((left, right) => mergeMetricsSeverityRank(right.severity) - mergeMetricsSeverityRank(left.severity));
+}
+
+function mergeMetricsFeedbackKeys(entries: MergeMetricsFeedbackEntry[], key: string): string[] {
+  return uniquePaths(entries.flatMap((entry) => {
+    const reportFeedback = recordValue(recordValue(entry.feedback.report).feedback);
+    const feedback = recordValue(entry.feedback.feedback);
+    return [...stringArray(feedback[key]), ...stringArray(reportFeedback[key])];
+  }));
+}
+
+function mergeMetricsSeverity(value: unknown): string {
+  const severity = textValue(value, 'low');
+  return severity === 'high' || severity === 'medium' || severity === 'low' ? severity : 'low';
+}
+
+function mergeMetricsSeverityRank(value: unknown): number {
+  const severity = textValue(value, '');
+  if (severity === 'high') return 3;
+  if (severity === 'medium') return 2;
+  if (severity === 'low') return 1;
   return 0;
 }
 

@@ -17,6 +17,7 @@ type Dashboard = {
   backlog?: Record<string, unknown>;
   capacity?: Record<string, unknown>;
   semantic?: Record<string, unknown>;
+  mergeMetrics?: Record<string, unknown>;
   graph?: DecisionGraphSummary;
   sources: Record<string, unknown>;
   raw?: Record<string, unknown>;
@@ -180,6 +181,21 @@ type SemanticMetricsSummary = {
   admissionRows: Array<{ label: string; value: number; detail?: string; tone?: ChartTone }>;
   admissionTotal: number;
   health: SemanticHealthSummary;
+};
+
+type MergeMetricsDashboardSummary = {
+  eventCount: number;
+  correlatedRegionCount: number;
+  suggestionCount: number;
+  highSeveritySuggestionCount: number;
+  preferredLeaseKeyCount: number;
+  splitTaskRegionKeyCount: number;
+  summaryLine: string;
+  topRegions: Array<Record<string, unknown>>;
+  suggestions: Array<Record<string, unknown>>;
+  semanticLeaseHints: Array<Record<string, unknown>>;
+  taskSplitHints: Array<Record<string, unknown>>;
+  routingHints: Array<Record<string, unknown>>;
 };
 
 type OptimizationBehaviorCard = {
@@ -764,6 +780,8 @@ function dashboardSignature(dashboard: Dashboard): string {
     backlog: dashboard.backlog,
     capacity: dashboard.capacity,
     semantic: dashboard.semantic,
+    mergeMetrics: dashboard.mergeMetrics,
+    graph: dashboard.graph,
     sources: dashboard.sources
   });
 }
@@ -2682,6 +2700,8 @@ function MergeView({ dashboard, jobs, success, attention }: {
   attention: AttentionSummary;
 }): Node {
   const semantic = semanticMetrics(dashboard.semantic);
+  const mergeMetrics = mergeMetricsDashboardSummary(dashboard.mergeMetrics);
+  const mergeMetricHints = mergeMetricHintRows(mergeMetrics);
   const stages = [
     { id: 'workers', label: 'Worker outputs', value: jobs.length, tone: 'neutral' as ChartTone },
     { id: 'review', label: 'Coordinator review', value: attention.needsCoordinatorReviewCount, tone: attention.needsCoordinatorReviewCount ? 'warn' as ChartTone : 'neutral' as ChartTone },
@@ -2708,6 +2728,27 @@ function MergeView({ dashboard, jobs, success, attention }: {
         { label: 'Expected imports satisfied', value: `${formatNumber(semantic.satisfied)}/${formatNumber(semantic.expected)}`, detail: 'semantic import coverage' }
       ]} />
     </section>
+    {mergeMetrics.eventCount || mergeMetrics.suggestionCount ? <section className="work-section" data-smoke-marker="merge-metrics-feedback">
+      <div className="metric-section-head">
+        <h3>Correlated work feedback</h3>
+        <span>{formatNumber(mergeMetrics.suggestionCount)} suggestions</span>
+      </div>
+      <SimpleRows rows={mergeMetricOverviewRows(mergeMetrics)} />
+    </section> : null}
+    {mergeMetrics.topRegions.length ? <section className="work-section">
+      <div className="metric-section-head">
+        <h3>Top correlated regions</h3>
+        <span>{formatNumber(mergeMetrics.correlatedRegionCount)} regions</span>
+      </div>
+      <SimpleRows rows={mergeMetrics.topRegions.slice(0, 6).map(mergeMetricRegionSimpleRow)} />
+    </section> : null}
+    {mergeMetricHints.length ? <section className="work-section">
+      <div className="metric-section-head">
+        <h3>Lease and routing hints</h3>
+        <span>{formatNumber(mergeMetrics.highSeveritySuggestionCount)} high severity</span>
+      </div>
+      <SimpleRows rows={mergeMetricHints.slice(0, 8)} />
+    </section> : null}
     <section className="work-section">
       <div className="metric-section-head">
         <h3>Patch/version tree</h3>
@@ -6342,6 +6383,72 @@ function semanticMetrics(value: unknown): SemanticMetricsSummary {
     admissionTotal: admissionRows.reduce((sum, row) => sum + row.value, 0),
     health: semanticHealth
   };
+}
+
+function mergeMetricsDashboardSummary(value: unknown): MergeMetricsDashboardSummary {
+  const input = recordValue(value);
+  const summary = recordValue(input.summary);
+  return {
+    eventCount: firstNumber(summary.eventCount, input.eventCount),
+    correlatedRegionCount: firstNumber(summary.correlatedRegionCount, input.correlatedRegionCount),
+    suggestionCount: firstNumber(summary.suggestionCount, input.suggestionCount),
+    highSeveritySuggestionCount: firstNumber(summary.highSeveritySuggestionCount, input.highSeveritySuggestionCount),
+    preferredLeaseKeyCount: firstNumber(summary.preferredLeaseKeyCount, input.preferredLeaseKeyCount),
+    splitTaskRegionKeyCount: firstNumber(summary.splitTaskRegionKeyCount, input.splitTaskRegionKeyCount),
+    summaryLine: textValue(input.summaryLine, ''),
+    topRegions: arrayRecords(input.topRegions),
+    suggestions: arrayRecords(input.suggestions),
+    semanticLeaseHints: arrayRecords(input.semanticLeaseHints),
+    taskSplitHints: arrayRecords(input.taskSplitHints),
+    routingHints: arrayRecords(input.routingHints)
+  };
+}
+
+function mergeMetricOverviewRows(metrics: MergeMetricsDashboardSummary): Array<{ label: string; value: string; detail: string }> {
+  return [
+    { label: 'Work events', value: formatNumber(metrics.eventCount), detail: metrics.summaryLine || 'completed work records that produced merge evidence' },
+    { label: 'Correlated regions', value: formatNumber(metrics.correlatedRegionCount), detail: 'symbols, files, selectors, or layout regions repeatedly touched together' },
+    { label: 'Preferred lease keys', value: formatNumber(metrics.preferredLeaseKeyCount), detail: 'regions that should be claimed before parallel work starts' },
+    { label: 'Split-task regions', value: formatNumber(metrics.splitTaskRegionKeyCount), detail: 'regions where the next task should be narrowed or separated' }
+  ];
+}
+
+function mergeMetricRegionSimpleRow(region: Record<string, unknown>): { label: string; value: string; detail: string } {
+  const label = textValue(region.label, textValue(region.key, 'region'));
+  const taskCount = numberValue(region.taskCount);
+  const conflictRate = numberValue(region.conflictRate);
+  const staleRate = numberValue(region.staleRate);
+  const lanes = stringArray(region.lanes);
+  const paths = stringArray(region.paths);
+  return {
+    label,
+    value: formatNumber(numberValue(region.touches)),
+    detail: `${formatNumber(taskCount)} tasks · conflict ${formatPercent(conflictRate)} · stale ${formatPercent(staleRate)}${lanes.length ? ` · ${lanes.slice(0, 2).join(', ')}` : ''}${paths.length ? ` · ${paths[0]}` : ''}`
+  };
+}
+
+function mergeMetricHintRows(metrics: MergeMetricsDashboardSummary): Array<{ label: string; value: string; detail: string }> {
+  const rows = [
+    ...metrics.suggestions,
+    ...metrics.semanticLeaseHints,
+    ...metrics.taskSplitHints,
+    ...metrics.routingHints
+  ];
+  const seen = new Set<string>();
+  return rows.map((row) => {
+    const action = textValue(row.action, textValue(row.leaseKey, 'hint'));
+    const label = textValue(row.title, action);
+    const regionKeys = stringArray(row.regionKeys);
+    const detail = textValue(row.reason, textValue(row.taskHint, regionKeys.slice(0, 2).join(', ')));
+    const key = `${label}:${detail}:${regionKeys.join('|')}`;
+    if (seen.has(key)) return undefined;
+    seen.add(key);
+    return {
+      label,
+      value: textValue(row.severity, 'low'),
+      detail: detail || regionKeys.slice(0, 2).join(', ') || 'feedback hint'
+    };
+  }).filter((row): row is { label: string; value: string; detail: string } => Boolean(row));
 }
 
 function decisionGraphSummary(dashboard: Dashboard): DecisionGraphSummary | undefined {

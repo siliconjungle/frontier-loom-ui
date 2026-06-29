@@ -194,6 +194,113 @@ await fs.writeFile(path.join(collectionDir, 'collection.json'), JSON.stringify({
     'stale-against-head': []
   }
 }, null, 2) + '\n');
+await fs.writeFile(path.join(collectionDir, 'merge-metrics-feedback.json'), JSON.stringify({
+  kind: 'frontier.swarm-codex.merge-metrics-feedback',
+  version: 1,
+  generatedAt: Date.now(),
+  runId: 'ui-run',
+  eventCount: 3,
+  events: [],
+  report: {
+    kind: 'frontier.mergeMetrics.correlatedWorkReport',
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    events: [],
+    regions: [{
+      key: 'src/board.ts#semanticOwnershipRegion:function:renderBoard',
+      kind: 'function',
+      file: 'src/board.ts',
+      symbol: 'renderBoard',
+      label: 'src/board.ts#renderBoard',
+      touches: 4,
+      taskCount: 3,
+      agentCount: 2,
+      runCount: 1,
+      lanes: ['ui', 'runtime'],
+      paths: ['src/board.ts'],
+      outcomeCounts: { conflict: 1, 'clean-apply': 2 },
+      pressureScore: 8.5,
+      failureRate: 0.25,
+      conflictRate: 0.25,
+      staleRate: 0,
+      gateFailureRate: 0,
+      humanNeededRate: 0
+    }],
+    pairs: [{
+      leftKey: 'src/board.ts#semanticOwnershipRegion:function:renderBoard',
+      rightKey: 'src/theme.css#semanticOwnershipRegion:css-selector:.board',
+      leftLabel: 'src/board.ts#renderBoard',
+      rightLabel: 'src/theme.css#.board',
+      taskCount: 2,
+      runCount: 1,
+      touches: 3,
+      outcomeCounts: { conflict: 1 },
+      pressureScore: 7.2
+    }],
+    suggestions: [{
+      id: 'lease-render-board',
+      title: 'Lease renderBoard before parallel UI work',
+      action: 'lease',
+      severity: 'high',
+      regionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+      reason: 'Multiple workers touched renderBoard with a conflict outcome.',
+      leaseKeys: ['merge:semantic:src/board.ts#semanticOwnershipRegion:function:renderBoard']
+    }],
+    feedback: {
+      avoidConcurrentRegionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+      preferredLeaseKeys: ['merge:semantic:src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+      splitTaskRegionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+      refactorCandidateRegionKeys: []
+    },
+    summary: {
+      eventCount: 3,
+      runCount: 1,
+      taskCount: 3,
+      agentCount: 2,
+      regionTouchCount: 4,
+      correlatedRegionCount: 1,
+      correlatedPairCount: 1,
+      suggestionCount: 1,
+      highSeveritySuggestionCount: 1,
+      outcomeCounts: { conflict: 1, 'clean-apply': 2 }
+    }
+  },
+  semanticLeaseHints: [{
+    leaseKey: 'merge:semantic:src/board.ts#semanticOwnershipRegion:function:renderBoard',
+    regionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    severity: 'high',
+    reason: 'Multiple workers touched renderBoard with a conflict outcome.'
+  }],
+  taskSplitHints: [{
+    regionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    severity: 'medium',
+    reason: 'Split board rendering work by semantic region.',
+    taskHint: 'Split board rendering edits into separate render and style tasks.'
+  }],
+  routingHints: [{
+    action: 'lease',
+    severity: 'high',
+    regionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    reason: 'Prefer a semantic lease for renderBoard before concurrent UI edits.'
+  }],
+  feedback: {
+    avoidConcurrentRegionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    preferredLeaseKeys: ['merge:semantic:src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    splitTaskRegionKeys: ['src/board.ts#semanticOwnershipRegion:function:renderBoard'],
+    refactorCandidateRegionKeys: []
+  },
+  summary: {
+    eventCount: 3,
+    correlatedRegionCount: 1,
+    correlatedPairCount: 1,
+    suggestionCount: 1,
+    highSeveritySuggestionCount: 1,
+    preferredLeaseKeyCount: 1,
+    avoidConcurrentRegionKeyCount: 1,
+    splitTaskRegionKeyCount: 1,
+    refactorCandidateRegionKeyCount: 0
+  }
+}, null, 2) + '\n');
 await fs.writeFile(path.join(collectionDir, 'run-graph.json'), JSON.stringify({
   kind: 'frontier.swarm-codex.run-graph',
   version: 1,
@@ -1021,6 +1128,15 @@ try {
   assert.equal(dashboard.semantic.health.htmlCss.cssSelectorTargetConflictFileCount, 1);
   assert.equal(dashboard.semantic.health.htmlCss.cssSelectorTargetRebasedFileCount, 1);
   assert.equal(dashboard.semantic.health.htmlCss.browserRuntimeProofCount, 1);
+  assert.equal(dashboard.summary.mergeMetricEventCount, 3);
+  assert.equal(dashboard.mergeMetrics.kind, 'frontier.loom-ui.merge-metrics-projection');
+  assert.equal(dashboard.mergeMetrics.summary.eventCount, 3);
+  assert.equal(dashboard.mergeMetrics.summary.correlatedRegionCount, 1);
+  assert.equal(dashboard.mergeMetrics.summary.preferredLeaseKeyCount, 1);
+  assert.equal(dashboard.mergeMetrics.topRegions[0].label, 'src/board.ts#renderBoard');
+  assert.equal(dashboard.mergeMetrics.suggestions[0].title, 'Lease renderBoard before parallel UI work');
+  assert.equal(dashboard.sources.mergeMetricsFeedbackSourceCount >= 1, true);
+  assert.equal(dashboard.sources.mergeMetricsFeedbackFiles.some((file) => file.endsWith('merge-metrics-feedback.json')), true);
   assert.equal(dashboard.graph.sourceKind, 'lifetime-rollup');
   assert.ok(dashboard.graph.nodeCount >= 4);
   assert.ok(dashboard.graph.safeMergeCandidateCount >= 1);
